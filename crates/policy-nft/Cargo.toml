@@ -1,0 +1,16 @@
+[package]
+name = "microcrop-policy-nft"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "MicroCrop PolicyNFT — on-chain policy certificate + ownership registry (soulbound while active)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+microcrop-shared = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
