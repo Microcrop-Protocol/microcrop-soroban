@@ -1,0 +1,20 @@
+[package]
+name = "microcrop-payout-receiver"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "MicroCrop PayoutReceiver — verifies PKP-signed parametric determinations and triggers payouts."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+microcrop-shared = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+# Host-side (std) secp256k1 signer used ONLY in unit tests to produce a real recoverable
+# signature over the on-chain digest, which the contract then recovers with
+# `env.crypto().secp256k1_recover`. Not part of the WASM contract build.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
