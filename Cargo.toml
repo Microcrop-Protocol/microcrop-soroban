@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared",
+    "crates/policy-manager",
+    "crates/treasury",
+    "crates/payout-receiver",
+    "crates/policy-nft",
+]
+
+# Pinned to the current stable soroban-sdk (27.0.2, published 2026-07-23 on crates.io).
+# MSRV for this SDK is Rust 1.91.0; contracts target `wasm32v1-none`.
+[workspace.dependencies]
+soroban-sdk = "=27.0.2"
+microcrop-shared = { path = "crates/shared" }
+
+# Release profile tuned for small, deterministic Soroban WASM.
+# opt-level "z" + lto + strip minimise code size; overflow-checks stay ON because all
+# money math (i128 USDC) must trap on overflow rather than wrap. panic = "abort" removes
+# unwinding machinery (contracts trap on panic). Applied to release/wasm builds only —
+# `cargo test` uses the dev profile (unwind) so #[should_panic] tests still work.
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = false
+panic = "abort"
+codegen-units = 1
+lto = true
+strip = "symbols"

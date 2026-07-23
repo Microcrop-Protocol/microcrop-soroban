@@ -1,0 +1,6 @@
+# soroban-sdk 27.0.2 requires Rust >= 1.91.0 (MSRV). Soroban contracts compile to the
+# `wasm32v1-none` target (NOT the legacy `wasm32-unknown-unknown`), which requires Rust >= 1.84.
+[toolchain]
+channel = "1.91.0"
+targets = ["wasm32v1-none"]
+profile = "minimal"
