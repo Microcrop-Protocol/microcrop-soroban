@@ -1,0 +1,15 @@
+[package]
+name = "microcrop-shared"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shared types, errors, roles, cross-contract client traits and the canonical determination encoder for the MicroCrop Soroban contracts."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
