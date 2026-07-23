@@ -1,0 +1,24 @@
+[package]
+name = "microcrop-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Cross-contract integration tests: deploys all four real MicroCrop contracts on ONE Env and drives the full premium -> signed determination -> payout money flow with a real secp256k1 round-trip."
+
+[lib]
+# Plain test-only lib (no cdylib): this crate ships no contract, it only wires the real
+# contract crates together under a shared test Env.
+crate-type = ["rlib"]
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+microcrop-shared = { workspace = true }
+# The four REAL contract crates (rlib halves of their cdylib/rlib builds). NO mocks here.
+microcrop-policy-manager = { path = "../policy-manager" }
+microcrop-treasury = { path = "../treasury" }
+microcrop-payout-receiver = { path = "../payout-receiver" }
+microcrop-policy-nft = { path = "../policy-nft" }
+# Host-side (std) secp256k1 signer used ONLY in tests to produce a real recoverable signature
+# over the on-chain digest, which the PayoutReceiver recovers via `secp256k1_recover`.
+# Version + features pinned to match crates/payout-receiver/Cargo.toml.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }

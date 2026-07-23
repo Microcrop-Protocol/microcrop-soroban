@@ -6,6 +6,7 @@ members = [
     "crates/treasury",
     "crates/payout-receiver",
     "crates/policy-nft",
+    "crates/integration-tests",
 ]
 
 # Pinned to the current stable soroban-sdk (27.0.2, published 2026-07-23 on crates.io).
