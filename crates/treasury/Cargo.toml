@@ -1,0 +1,16 @@
+[package]
+name = "microcrop-treasury"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "MicroCrop Treasury — USDC reserves, per-org solvency, premiums and payouts."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+microcrop-shared = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
