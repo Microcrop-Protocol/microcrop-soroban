@@ -6,6 +6,15 @@ WASM, and pass their unit suites (66 tests). They have **not** been deployed, in
 with the off-chain stack, security-audited on Soroban, or reconciled with live state.
 The [DEFERRED](#deferred--not-yet-done) section is the load-bearing part of this document.
 
+**Product-architecture decision (2026-08-21):** the faithful Treasury port is now a
+legacy/reference implementation, not the target mainnet design. The carrier will keep
+its statutory reserve and investments off-platform. Soroban should record a
+local-currency policy and verified payout obligation, while a bounded funding facility
+and regulated settlement adapter execute the last-mile payment. The obligation should
+also commit to a CID/content hash for an encrypted evidence bundle stored through Logos
+Storage. Preserve the existing port for parity tests, but do not wire it into a live
+carrier pilot as mandatory reserve custody.
+
 Source of truth for the port: `microcrop-contracts/microcrop/src/*.sol` (Solidity 0.8.28,
 PolicyManager/Treasury v3.1.0, PayoutReceiver v2.1.0).
 
@@ -171,6 +180,12 @@ preparation build into a real migration.
       pass is deferred.
 
 **Product parity not ported**
+- [ ] **Non-custodial target contracts** — replace mandatory `Treasury` custody with
+      `PolicyRegistry`, `PayoutObligation`, `FundingFacility`, and `SettlementAdapter`.
+      Policy and benefit amounts must be denominated in the market's local currency;
+      any USDC amount belongs to a short-lived provider quote/settlement record.
+- [ ] **Logos Storage manifest** — add CID, content hash, schema version, encryption-key
+      reference, and retention class to the evidence commitment used by the obligation.
 - [ ] On-chain `tokenURI` rendering (intentionally off-chain now) — needs an off-chain
       renderer before any NFT marketplace/explorer integration.
 - [ ] Legacy migration shims (`setLegacyPolicyOrg`, storage `__gap`) — intentionally omitted;
@@ -180,9 +195,10 @@ preparation build into a real migration.
 
 ## 6. Bottom line
 
-The Rust/Soroban re-implementation is **complete and green** for a first version: it builds
-to WASM on the correct target and all 66 unit tests pass, with the five security-critical
-invariants preserved. It is **ready to be deployed to testnet and integrated next** — it is
-**not** yet a live migration. Do the DEFERRED §5 work (starting with the shared
-`network_domain` + Lit PKP signer agreement and an all-four integration test) before any
-mainnet consideration.
+The Rust/Soroban re-implementation is **complete and green** as a parity/reference
+version: it builds to WASM on the correct target and its tests preserve the old model's
+security invariants. It is suitable for testnet experiments, but the custody Treasury
+must not be treated as the final carrier architecture. Freeze and implement the
+non-custodial obligation/facility interfaces, local-currency model, Logos Storage
+commitment, shared `network_domain`, and Lit PKP signer agreement before any live pilot
+or mainnet consideration.

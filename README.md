@@ -11,6 +11,16 @@ contracts in `microcrop-contracts/microcrop/src/`.
 > backend, indexer). See [`docs/MIGRATION_NOTES.md`](docs/MIGRATION_NOTES.md) for the
 > EVM→Soroban mapping and the honest DEFERRED list.
 
+> **Target architecture update (2026-08-21):** This repository faithfully preserves
+> the old per-org USDC custody model so it can be tested and migrated safely, but that
+> model is no longer the intended commercial architecture. Do **not** deploy the
+> `Treasury` port as the final carrier-funding design. The next contract iteration will
+> be local-currency-first and separate `PolicyRegistry`, `PayoutObligation`,
+> `FundingFacility`, and `SettlementAdapter`. Carrier statutory reserves remain on the
+> carrier's books; only a bounded payout facility funds verified obligations. Logos
+> Storage is planned for encrypted evidence bundles, with CID/hash commitments recorded
+> in the obligation layer.
+
 ## Contract overview
 
 | Solidity source (v)        | Soroban crate              | Contract struct  | Role |
