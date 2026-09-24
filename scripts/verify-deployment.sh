@@ -8,10 +8,10 @@
 # policy, or PayoutReceiver cannot draw a payout — and you discover it on the first real
 # claim. This reads the deployed state back and says so before that happens.
 #
-# HOW IT CHECKS ROLES. The contracts expose no `has_role` view (see the note at the end), so
-# roles cannot be queried through the interface. They ARE persistent storage entries, so this
-# dumps contract storage and looks for them. That is indirect, and it is why the last section
-# recommends adding proper view functions.
+# HOW IT CHECKS ROLES. Each contract exposes `has_role(role, who) -> bool` as a read-only
+# view, so role checks are EXACT: the contract is asked directly rather than its storage being
+# dumped and matched on addresses. An earlier version did the latter and could false-pass when
+# an address appeared in storage for an unrelated reason.
 #
 # Usage: ./scripts/verify-deployment.sh --network testnet
 #
@@ -85,19 +85,40 @@ has "$TMP/pr"       "$PM"       && ok "PayoutReceiver -> PolicyManager"  || bad 
 echo
 
 echo "3. Roles (the ones whose absence kills the money path)"
-# PM must hold Minter on the NFT, PR must hold Oracle on PM and Payout on Treasury.
-has "$TMP/nft"      "$PM" && ok "PolicyManager holds Minter on PolicyNft" \
-                          || bad "PolicyManager has NO Minter role — policy activation cannot mint a certificate"
-has "$TMP/pm"       "$PR" && ok "PayoutReceiver holds Oracle on PolicyManager" \
-                          || bad "PayoutReceiver has NO Oracle role — determinations cannot mark a policy claimed"
-has "$TMP/treasury" "$PR" && ok "PayoutReceiver holds Payout on Treasury" \
-                          || bad "PayoutReceiver has NO Payout role — NO PAYOUT CAN EVER BE DRAWN"
-[[ -n "${BACKEND_ADDR:-}" ]] && {
-  has "$TMP/pm"       "$BACKEND_ADDR" && ok "backend holds Backend on PolicyManager" \
-                                      || bad "backend has NO Backend role — it cannot create policies"
-  has "$TMP/treasury" "$BACKEND_ADDR" && ok "backend holds Backend on Treasury" \
-                                      || bad "backend has NO Backend role — it cannot receive premiums"
-} || echo "  (set BACKEND_ADDR to also check the backend's roles)"
+# Exact queries against each contract's has_role view. Three of these are held by CONTRACTS,
+# not people - the set most often missed, and none of them fails at deploy time.
+role_is() {                     # role_is <label> <contract> <Role> <who> <consequence>
+  local label="$1" contract="$2" role="$3" who="$4" why="$5" out
+  out="$(stellar contract invoke --id "$contract" --network "$NETWORK" --source "${ADMIN_KEY:-default}" \
+          -- has_role --role "$role" --who "$who" 2>/dev/null | tr -d '"' | tail -1)"
+  case "$out" in
+    true)  ok "$label" ;;
+    false) bad "$label - NOT GRANTED. $why" ;;
+    *)     bad "$label - could not query has_role (got: '${out:-<empty>}')" ;;
+  esac
+}
+
+role_is "PolicyManager holds Minter on PolicyNft"      "$NFT"      Minter  "$PM" \
+        "Policy activation cannot mint a certificate."
+role_is "PayoutReceiver holds Oracle on PolicyManager" "$PM"       Oracle  "$PR" \
+        "Determinations cannot mark a policy claimed."
+role_is "PayoutReceiver holds Payout on Treasury"      "$TREASURY" Payout  "$PR" \
+        "NO PAYOUT CAN EVER BE DRAWN."
+
+if [[ -n "${BACKEND_ADDR:-}" ]]; then
+  role_is "backend holds Backend on PolicyManager" "$PM"       Backend "$BACKEND_ADDR" \
+          "The backend cannot create policies."
+  role_is "backend holds Backend on Treasury"      "$TREASURY" Backend "$BACKEND_ADDR" \
+          "The backend cannot receive premiums."
+else
+  echo "  (set BACKEND_ADDR to also check the backend's roles)"
+fi
+if [[ -n "${RELAYER_ADDR:-}" ]]; then
+  role_is "relayer holds Relayer on PayoutReceiver" "$PR" Relayer "$RELAYER_ADDR" \
+          "Determinations cannot be submitted."
+else
+  echo "  (set RELAYER_ADDR to also check the relayer role)"
+fi
 echo
 
 echo "4. Payout authority"
@@ -123,12 +144,6 @@ if [[ "$FAIL" -gt 0 ]]; then
 Some checks failed. Re-running deploy.sh is SAFE and resumable: it skips every step already
 recorded in the state file. If a step is recorded but the on-chain state disagrees, delete
 that key from the state file and re-run to redo just that step.
-
-NOTE ON ROLE CHECKS: the contracts expose no `has_role` view, so the checks above read raw
-contract storage and match on addresses. That is indirect and can produce a false PASS when
-an address appears in storage for an unrelated reason. Adding `has_role(role, who) -> bool`
-as a view to each contract would make this verification exact, and is recommended before
-mainnet.
 EOF
   exit 1
 fi

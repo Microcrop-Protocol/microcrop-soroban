@@ -132,6 +132,8 @@ fn determination(policy_id: u64, sum_insured: i128, payout: i128) -> CropDetermi
 
 struct World<'a> {
     env: Env,
+    // the deploying admin — holds Admin + Upgrader on all four contracts
+    admin: Address,
     // clients
     pm: PolicyManagerClient<'a>,
     nft: PolicyNftClient<'a>,
@@ -225,6 +227,7 @@ fn deploy<'a>() -> World<'a> {
 
     World {
         env,
+        admin: admin.clone(),
         pm,
         nft,
         treasury,
@@ -429,4 +432,57 @@ fn wrong_signer_determination_rejected() {
     assert_eq!(w.treasury.org_reserve(&w.org), premium - premium / 10);
     assert!(!w.pr.is_policy_paid(&policy_id));
     assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Active);
+}
+
+// ============ 5. has_role reports the wiring a deployment depends on ============
+//
+// These are the grants that produce a SILENTLY BROKEN deployment when missed: none of them
+// fails at deploy time, and three of them go to CONTRACTS rather than people. Before
+// has_role() existed there was no way to ask a deployed contract whether they had been made,
+// so scripts/verify-deployment.sh had to read raw storage and match on addresses — indirect,
+// and able to false-pass. This pins the exact queries that verifier now relies on.
+#[test]
+fn has_role_reports_the_money_path_grants() {
+    let w = deploy();
+
+    // Granted to CONTRACTS. Missing #1 -> activation cannot mint a certificate; #2 ->
+    // determinations cannot mark a policy claimed; #3 -> NO PAYOUT CAN EVER BE DRAWN.
+    assert!(w.nft.has_role(&Role::Minter, &w.pm.address), "PolicyManager must hold Minter on PolicyNft");
+    assert!(w.pm.has_role(&Role::Oracle, &w.pr_addr), "PayoutReceiver must hold Oracle on PolicyManager");
+    assert!(w.treasury.has_role(&Role::Payout, &w.pr_addr), "PayoutReceiver must hold Payout on Treasury");
+
+    // Granted to accounts.
+    assert!(w.pm.has_role(&Role::Backend, &w.backend));
+    assert!(w.treasury.has_role(&Role::Backend, &w.backend));
+    assert!(w.pr.has_role(&Role::Relayer, &w.relayer));
+}
+
+#[test]
+fn has_role_is_false_for_non_holders_and_is_per_contract() {
+    let w = deploy();
+
+    // An address holding a role in one contract does not hold it in another. The registry is
+    // namespaced per contract, and a verifier that assumed otherwise would false-pass.
+    assert!(w.pm.has_role(&Role::Backend, &w.backend));
+    assert!(!w.nft.has_role(&Role::Backend, &w.backend), "Backend on PolicyManager must not leak into PolicyNft");
+
+    // Holding one role does not imply another.
+    assert!(!w.pm.has_role(&Role::Oracle, &w.backend));
+    assert!(!w.treasury.has_role(&Role::Payout, &w.backend));
+
+    // A never-granted address holds nothing.
+    assert!(!w.treasury.has_role(&Role::Payout, &w.farmer));
+    assert!(!w.pr.has_role(&Role::Relayer, &w.farmer));
+}
+
+#[test]
+fn revoking_a_role_is_visible_through_has_role() {
+    let w = deploy();
+    let admin = w.pm.has_role(&Role::Backend, &w.backend);
+    assert!(admin);
+
+    // Revocation must be observable, or an operator cannot confirm an emergency lockout
+    // actually took effect.
+    w.treasury.revoke_role(&w.admin, &Role::Payout, &w.pr_addr);
+    assert!(!w.treasury.has_role(&Role::Payout, &w.pr_addr), "revoke must be visible via has_role");
 }

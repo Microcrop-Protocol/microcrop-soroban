@@ -135,19 +135,18 @@ failure.
 Set `BACKEND_ADDR` and `AUTHORIZED_SIGNER_PUBKEY` in the environment to enable the backend
 role and signer checks too.
 
-### Known weakness in the role checks
+### How the role checks work
 
-**The contracts expose no `has_role` view.** `has_role` exists in `microcrop_shared::roles`
-but is not a public contract function on any of the four, so roles cannot be queried through
-the interface. The verifier therefore reads raw contract storage and matches on addresses,
-which is indirect and **can produce a false pass** when an address appears in storage for an
-unrelated reason.
+Each contract exposes `has_role(role, who) -> bool` as a read-only view, so role checks are
+**exact** — the contract is asked directly. Role membership is not secret: every grant is
+already a public persistent-storage entry on a public ledger. What was missing was a way to
+*ask*.
 
-**Recommendation: add `has_role(role, who) -> bool` as a view to each contract before
-mainnet.** It is a small change that makes deployment verification exact, and the cost of not
-having it is discovering a missing grant on a live claim.
+An earlier version of this script dumped raw contract storage and matched on addresses, which
+was indirect and could **false-pass** when an address appeared in storage for an unrelated
+reason. That is fixed.
 
----
+Set `BACKEND_ADDR` and `RELAYER_ADDR` in the environment to check those grants too.
 
 ## Mainnet
 
