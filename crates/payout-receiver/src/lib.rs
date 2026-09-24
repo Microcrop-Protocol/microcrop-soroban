@@ -196,6 +196,18 @@ impl PayoutReceiver {
         roles::revoke_role(&env, role, &who);
     }
 
+    /// True if `who` holds `role` in this contract. READ-ONLY view, no auth required.
+    ///
+    /// Role membership is not a secret: every grant is already a public persistent-storage
+    /// entry on a public ledger. What was missing was a way to ASK. Without this, a deployment
+    /// could not be verified through the interface — a missed cross-contract grant (the ones
+    /// that make PolicyManager a Minter, or PayoutReceiver a Payout drawer) produces a
+    /// deployment that looks complete and is dead on the money path, and the failure surfaces
+    /// on the first real claim rather than at deploy time.
+    pub fn has_role(env: Env, role: Role, who: Address) -> bool {
+        roles::has_role(&env, role, &who)
+    }
+
     /// Port of the UUPS `_authorizeUpgrade` path (UPGRADER only).
     pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
         roles::require_role(&env, &caller, Role::Upgrader);
