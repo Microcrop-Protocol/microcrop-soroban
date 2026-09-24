@@ -147,10 +147,11 @@ preparation build into a real migration.
 
 **Integration & deployment**
 - [ ] **Not deployed** anywhere (no testnet, no mainnet). No contract addresses exist.
-- [ ] **No end-to-end / cross-contract integration test.** Each crate tests in isolation
-      with *in-file mock* siblings (PolicyManager mocks the NFT; PayoutReceiver mocks
-      Treasury + PolicyManager). A real deploy-all-four → premium → determination → payout
-      integration test on a shared `Env` is not yet written.
+- [x] ~~**No end-to-end / cross-contract integration test.**~~ DONE — `crates/integration-tests`
+      registers all four REAL contracts on one `Env` (no mocks) and covers the full
+      premium → determination → payout lifecycle, plus determination replay, wrong-signer
+      rejection and the per-org reserve bound. Still HOST-SIDE only: running this flow against
+      live testnet, with real transaction hashes, remains open.
 - [ ] **USDC SAC address** for each target network is not wired; deploy scripts/aliases,
       role-granting runbook, and the wiring sequence are documented in the README but not
       automated (no `Makefile`/deploy script).
