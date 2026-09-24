@@ -2,3 +2,7 @@ target/
 *.wasm
 Cargo.lock
 .DS_Store
+
+# Deployment state written by scripts/deploy.sh. Contains live contract addresses and is
+# environment-specific; record addresses in the runbook/PR instead of committing state.
+deployments/
