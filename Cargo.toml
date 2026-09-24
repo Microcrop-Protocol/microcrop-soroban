@@ -9,6 +9,19 @@ members = [
     "crates/integration-tests",
 ]
 
+# `cargo build --target wasm32v1-none` builds these and ONLY these. integration-tests is a
+# std, host-side test crate: pulling it into a wasm build fails with "cannot resolve a prelude
+# import", because wasm32v1-none has no std. Excluding it here means the plain deploy-time
+# build command just works, while `cargo test --workspace` still includes it (--workspace
+# overrides default-members).
+default-members = [
+    "crates/shared",
+    "crates/policy-manager",
+    "crates/treasury",
+    "crates/payout-receiver",
+    "crates/policy-nft",
+]
+
 # Pinned to the current stable soroban-sdk (27.0.2, published 2026-07-23 on crates.io).
 # MSRV for this SDK is Rust 1.91.0; contracts target `wasm32v1-none`.
 [workspace.dependencies]
