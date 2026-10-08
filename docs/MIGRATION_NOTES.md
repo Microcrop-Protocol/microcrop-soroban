@@ -152,16 +152,40 @@ preparation build into a real migration.
       premium → determination → payout lifecycle, plus determination replay, wrong-signer
       rejection and the per-org reserve bound. Still HOST-SIDE only: running this flow against
       live testnet, with real transaction hashes, remains open.
-- [ ] **USDC SAC address** for each target network is not wired; deploy scripts/aliases,
-      role-granting runbook, and the wiring sequence are documented in the README but not
-      automated (no `Makefile`/deploy script).
-- [ ] **`network_domain` value not chosen**, and the **Lit PKP off-chain signer has not been
-      updated** to produce Soroban-format digests (keccak over `shared::encoding`,
-      `network_domain` instead of chainid, XDR contract address instead of `address(this)`).
-      Until both sides agree byte-for-byte, no real determination will verify.
+- [x] ~~deploy script / role-granting runbook not automated~~ DONE — `scripts/deploy.sh`
+      (idempotent, resumable, dry-run, mainnet-gated) and `scripts/verify-deployment.sh`
+      (exact role checks via the new `has_role` view) plus `docs/DEPLOYMENT_RUNBOOK.md`.
+- [ ] **USDC SAC address** for each target network is still not wired. It is a required
+      constructor argument for Treasury, supplied via `USDC_SAC` to the deploy script.
+- [x] ~~`network_domain` value not chosen~~ DECIDED — derived as `sha256(network passphrase)`:
+      testnet `cee0302d…ecd472`, mainnet `7ac33997…45a979`. It does what `block.chainid` did
+      (binds a determination to one network) and both sides compute it from a public constant,
+      so no magic number has to be shipped. Set by `scripts/deploy.sh`; overridable.
+- [ ] **The Lit PKP off-chain signer has not been updated** to produce Soroban-format digests
+      (keccak over `shared::encoding`, `network_domain` instead of chainid, XDR contract address
+      instead of `address(this)`). Until both sides agree byte-for-byte, nothing verifies. Note
+      the signer needs the PKP's 65-byte SEC-1 PUBLIC KEY, not its 0x address — the deploy
+      script rejects an address, because passing one silently fails every signature check.
 - [ ] **Backend / indexer / relayer integration** untouched — the EVM stack (ethers.js
       listeners, Ponder indexer, relayer) still targets Base. Ledger events, XDR decoding,
       and Stellar RPC are not wired.
+
+- [ ] **The signed preimage is hardcoded to ONE methodology and ONE evidence schema.**
+      `METHODOLOGY_CROP = b"crop-dualindex-1.0"` is a keccak domain constant, and the ten
+      `encode_inputs` evidence fields are dual-index-shaped (`ndvi_scaled`, `weather_temp_c_e2`,
+      `weather_precip_e2`, `weather_humidity`, `weather_wind_e2`). The drought methodology's
+      actual evidence is completely different (`rainW1_e2`, `rainW2_e2`, `rainRefW1_e2`,
+      `rainRefW2_e2`, `cddW2Days`, `lgpDays`, `seasonStartEpoch`), which is why adding drought
+      needed a separate PayoutReceiver path. **Every new methodology therefore costs a contract
+      upgrade plus an audit.** Parameterising the methodology domain and generalising the
+      evidence encoding is nearly free before deployment and an upgrade afterwards.
+- [ ] **There is no observation-source field anywhere in the signed preimage** — no dataset, no
+      product version, no served grid cell. The determination-stability work
+      (microcrop-context/docs/DETERMINATION_STABILITY.md) found the same farmer gets a different
+      payout band on 39% of seasons under RDI, and 86% under CDD, purely from the choice of
+      rainfall product. The leading remedy is to declare a canonical source and SIGN it — which
+      the current on-chain schema cannot express at all. The off-chain canonical determination
+      can (it carries `methodologyVersion` and `provenance.url`); the on-chain verifier cannot.
 
 **Verification & safety**
 - [ ] **No Soroban security audit.** The Solidity was audited; this Rust port has not been.
