@@ -294,6 +294,9 @@ pub enum DataKey {
     TotalOrgReserves,
     /// Paused flag.
     Paused,
+    /// Number of unsettled pending payouts across all orgs (u64). `set_payout_receiver`
+    /// refuses to switch while it is above zero.
+    PendingPayoutTotalCount,
     // ----- persistent (per-policy / per-org) -----
     /// policy_id -> premium received?
     PremiumReceived(u64),
@@ -377,8 +380,15 @@ impl Treasury {
 
     /// Port of `setPayoutReceiver` (ADMIN). Once set, `request_payout` also requires
     /// `caller == payout_receiver`.
+    ///
+    /// Reverts `PayoutsStillPending` while any pending payout is unsettled: each one's claim
+    /// marker lives in the current PayoutReceiver, so a switch would strand it and block its
+    /// org's first-in-first-out queue. Settle first, or upgrade the PayoutReceiver in place.
     pub fn set_payout_receiver(env: Env, caller: Address, payout_receiver: Address) {
         roles::require_role(&env, &caller, Role::Admin);
+        if pending_total_count(&env) > 0 {
+            panic_with_error!(&env, TreasuryError::PayoutsStillPending);
+        }
         env.storage()
             .instance()
             .set(&DataKey::PayoutReceiver, &payout_receiver);
@@ -638,6 +648,7 @@ impl Treasury {
             DataKey::OrgPendingPayouts(pending.org.clone()),
             &(org_pending_payouts_of(&env, &pending.org) - pending.amount),
         );
+        set_pending_total_count(&env, pending_total_count(&env) - 1);
         if !pay_out(&env, policy_id, &pending.org, pending.amount, available) {
             panic_with_error!(&env, TreasuryError::PayoutTransferFailed);
         }
@@ -839,6 +850,12 @@ impl Treasury {
         queue_tail(&env, &org) - queue_head(&env, &org)
     }
 
+    /// Number of unsettled pending payouts across all orgs. `set_payout_receiver` reverts
+    /// while this is above zero.
+    pub fn total_pending_payout_count(env: Env) -> u64 {
+        pending_total_count(&env)
+    }
+
     /// PERMISSIONLESS keep-alive: extend every Treasury entry of `policy_id`
     /// (`PremiumReceived`, `PayoutProcessed`, `PendingPayout` and its queue slot) and the
     /// instance to the network maximum TTL. Absent entries are skipped. Called by
@@ -853,7 +870,32 @@ impl Treasury {
             .get(&DataKey::PendingPayout(policy_id));
         if let Some(p) = pending {
             ttl::extend_persistent(&env, &DataKey::PendingPayout(policy_id));
-            ttl::extend_persistent_if_present(&env, &DataKey::OrgQueueAt(p.org, p.queue_index));
+            ttl::extend_persistent_if_present(
+                &env,
+                &DataKey::OrgQueueAt(p.org.clone(), p.queue_index),
+            );
+            // The org-level entries a pending claim needs in order to settle.
+            let org = p.org;
+            for key in [
+                DataKey::OrgQueueHead(org.clone()),
+                DataKey::OrgQueueTail(org.clone()),
+                DataKey::OrgPendingPayouts(org.clone()),
+                DataKey::OrgReserve(org.clone()),
+            ] {
+                ttl::extend_persistent_if_present(&env, &key);
+            }
+        }
+        // The org's admin-set fee and reserve ratio, and its reserve, for any known policy.
+        if let Some(org) = try_policy_org(&env, policy_id) {
+            for key in [
+                DataKey::OrgReserve(org.clone()),
+                DataKey::OrgRatioSet(org.clone()),
+                DataKey::OrgReserveRatioBps(org.clone()),
+                DataKey::OrgFeeSet(org.clone()),
+                DataKey::OrgFeeBps(org.clone()),
+            ] {
+                ttl::extend_persistent_if_present(&env, &key);
+            }
         }
     }
 
@@ -982,6 +1024,16 @@ fn resolve_org(env: &Env, policy_id: u64) -> Address {
     PolicyManagerClient::new(env, &require_policy_manager(env)).policy_org(&policy_id)
 }
 
+/// Best-effort org lookup for the keep-alive: `None` when PolicyManager is unset or the policy
+/// is unknown, so `extend_policy_ttl` never reverts on a lookup.
+fn try_policy_org(env: &Env, policy_id: u64) -> Option<Address> {
+    let pm: Address = env.storage().instance().get(&DataKey::PolicyManager)?;
+    match PolicyManagerClient::new(env, &pm).try_policy_org(&policy_id) {
+        Ok(Ok(org)) => Some(org),
+        _ => None,
+    }
+}
+
 /// `Role::Payout` AND (when wired) `caller == payout_receiver` — defense-in-depth on every
 /// path that moves reserve money out to a claim.
 fn require_payout_receiver(env: &Env, caller: &Address) {
@@ -1082,6 +1134,7 @@ fn record_pending(env: &Env, policy_id: u64, org: &Address, amount: i128, availa
         DataKey::OrgPendingPayouts(org.clone()),
         &(org_pending_payouts_of(env, org) + amount),
     );
+    set_pending_total_count(env, pending_total_count(env) + 1);
     PayoutPending {
         policy_id,
         org: org.clone(),
@@ -1089,6 +1142,19 @@ fn record_pending(env: &Env, policy_id: u64, org: &Address, amount: i128, availa
         available,
     }
     .publish(env);
+}
+
+fn pending_total_count(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PendingPayoutTotalCount)
+        .unwrap_or(0)
+}
+
+fn set_pending_total_count(env: &Env, v: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingPayoutTotalCount, &v);
 }
 
 fn queue_head(env: &Env, org: &Address) -> u64 {
@@ -1166,17 +1232,10 @@ fn set_persistent_bool(env: &Env, key: DataKey, v: bool) {
 /// Effective reserve ratio for an org (explicit per-org value if set — including 0 — else the
 /// default). Returned as `i128` for the reserve math.
 fn reserve_ratio_bps(env: &Env, org: &Address) -> i128 {
-    let set: bool = env
-        .storage()
-        .persistent()
-        .get(&DataKey::OrgRatioSet(org.clone()))
-        .unwrap_or(false);
+    // Read through `get_persistent` so the admin-set entries are extended on every touch.
+    let set: bool = get_persistent(env, &DataKey::OrgRatioSet(org.clone())).unwrap_or(false);
     if set {
-        let r: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OrgReserveRatioBps(org.clone()))
-            .unwrap_or(0);
+        let r: u32 = get_persistent(env, &DataKey::OrgReserveRatioBps(org.clone())).unwrap_or(0);
         r as i128
     } else {
         DEFAULT_RESERVE_RATIO_BPS as i128
@@ -1186,17 +1245,9 @@ fn reserve_ratio_bps(env: &Env, org: &Address) -> i128 {
 /// Effective fee bps for an org (explicit per-org value if set — including 0 — else the global
 /// `platform_fee_percent * 100`). Returned as `i128` for the fee math.
 fn fee_bps(env: &Env, org: &Address) -> i128 {
-    let set: bool = env
-        .storage()
-        .persistent()
-        .get(&DataKey::OrgFeeSet(org.clone()))
-        .unwrap_or(false);
+    let set: bool = get_persistent(env, &DataKey::OrgFeeSet(org.clone())).unwrap_or(false);
     if set {
-        let f: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OrgFeeBps(org.clone()))
-            .unwrap_or(0);
+        let f: u32 = get_persistent(env, &DataKey::OrgFeeBps(org.clone())).unwrap_or(0);
         f as i128
     } else {
         let percent: u32 = env

@@ -1242,6 +1242,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "PendingPayoutTotalCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "PlatformFeePercent"
                           }
                         ]

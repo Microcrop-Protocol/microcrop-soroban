@@ -295,6 +295,13 @@ impl PolicyManager {
             panic_with_error!(&env, PolicyError::InvalidCoordinates);
         }
 
+        // Only all-cause cover is sold: the crop-damage methodology cannot attribute a loss to
+        // one peril, so any other coverage type could take a premium and never pay
+        // (PayoutReceiver step 6c keeps the same check as defence in depth).
+        if coverage_type != CoverageType::Comprehensive {
+            panic_with_error!(&env, PolicyError::CoverageNotOffered);
+        }
+
         // Cap open policies (ACTIVE + PENDING) PLUS claims already paid in the rolling window.
         // Each open policy can become at most one claim, so keeping this sum <= the claim cap
         // means every policy the farmer pays for can still pay out (audit finding 3).
@@ -651,8 +658,18 @@ impl PolicyManager {
     /// Reverts `PolicyDoesNotExist` for an unknown policy.
     pub fn extend_policy_ttl(env: Env, policy_id: u64) {
         // load_policy extends the Policy entry.
-        Self::load_policy(&env, policy_id);
+        let policy = Self::load_policy(&env, policy_id);
         ttl::extend_persistent_if_present(&env, &DataKey::PendingCounted(policy_id));
+        // The per-farmer and per-org entries this policy's create, claim and release paths read.
+        for key in [
+            DataKey::FarmerClaimTimes(policy.farmer.clone()),
+            DataKey::FarmerActiveCount(policy.farmer.clone()),
+            DataKey::FarmerPendingCount(policy.farmer.clone()),
+            DataKey::FarmerPolicyCount(policy.farmer.clone()),
+            DataKey::OrgOutstanding(policy.org.clone()),
+        ] {
+            ttl::extend_persistent_if_present(&env, &key);
+        }
         Self::bump_instance(&env);
         let policy_nft: Option<Address> = env.storage().instance().get(&DataKey::PolicyNft);
         if let Some(addr) = policy_nft {

@@ -135,7 +135,7 @@ fn create_default(c: &Ctx) -> u64 {
         &MIN_SUM_INSURED, // sum_insured (100 USDC)
         &100_000_000i128, // premium (10 USDC)
         &30u32,           // duration_days
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     )
 }
@@ -230,7 +230,7 @@ fn create_rejects_sum_too_low() {
         &(MIN_SUM_INSURED - 1),
         &100_000_000i128,
         &30u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     );
     assert_err(res, PolicyError::SumInsuredTooLow as u32);
@@ -248,7 +248,7 @@ fn create_rejects_sum_too_high() {
         &(MAX_SUM_INSURED + 1),
         &100_000_000i128,
         &30u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     );
     assert_err(res, PolicyError::SumInsuredTooHigh as u32);
@@ -266,7 +266,7 @@ fn create_rejects_zero_premium() {
         &MIN_SUM_INSURED,
         &0i128,
         &30u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     );
     assert_err(res, PolicyError::ZeroPremium as u32);
@@ -285,7 +285,7 @@ fn create_rejects_bad_duration() {
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &29u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     );
     assert_err(res, PolicyError::InvalidDuration as u32);
@@ -299,7 +299,7 @@ fn create_rejects_bad_duration() {
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &366u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     );
     assert_err(res, PolicyError::InvalidDuration as u32);
@@ -323,7 +323,7 @@ fn create_enforces_open_policy_cap() {
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     );
     assert_err(res, PolicyError::TooManyActivePolicies as u32);
@@ -342,7 +342,7 @@ fn create_requires_backend_role() {
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     );
     assert_err(res, CommonError::Unauthorized as u32);
@@ -402,7 +402,7 @@ fn cancel_pending_releases_slot() {
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     );
     assert_err(res, PolicyError::TooManyActivePolicies as u32);
@@ -537,7 +537,7 @@ fn create_counts_recent_claims_against_the_open_cap() {
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &c.org,
     );
     assert_err(res, PolicyError::TooManyActivePolicies as u32);
@@ -570,7 +570,7 @@ fn activate_without_nft_set_reverts() {
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &org,
     );
     // PolicyNFT never wired -> activation reverts PolicyNftNotSet.
@@ -602,7 +602,7 @@ fn sum_insured_bounds_are_seven_decimal_usdc() {
             &sum,
             &100_000_000i128,
             &30u32,
-            &CoverageType::Drought,
+            &CoverageType::Comprehensive,
             &c.org,
         )
     };
@@ -879,7 +879,7 @@ fn stale_pending_policy_expires_and_releases_exposure_once() {
             &MIN_SUM_INSURED,
             &100_000_000i128,
             &30u32,
-            &CoverageType::Drought,
+            &CoverageType::Comprehensive,
             &c.org,
         ),
         PolicyError::TooManyActivePolicies as u32,
@@ -1127,4 +1127,31 @@ fn extend_policy_ttl_restores_the_policy_entry_to_the_network_max() {
         c.client.try_extend_policy_ttl(&999),
         PolicyError::PolicyDoesNotExist as u32,
     );
+}
+
+#[test]
+fn create_rejects_cover_the_methodology_cannot_settle() {
+    let c = setup();
+    for coverage in [
+        CoverageType::Drought,
+        CoverageType::Flood,
+        CoverageType::Both,
+        CoverageType::ExcessRain,
+    ] {
+        let r = c.client.try_create_policy(
+            &c.backend,
+            &Address::generate(&c.env),
+            &1u64,
+            &PLOT_LAT_E6,
+            &PLOT_LON_E6,
+            &MIN_SUM_INSURED,
+            &100_000_000i128,
+            &30u32,
+            &coverage,
+            &c.org,
+        );
+        assert_err(r, PolicyError::CoverageNotOffered as u32);
+    }
+    // Nothing was written: the counter did not move.
+    assert_eq!(c.client.get_total_policies(), 0);
 }

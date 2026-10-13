@@ -950,8 +950,8 @@ fn deauthorized_backend_wallet_records_the_claim_as_pending() {
     c.token_admin.mint(&c.backend, &1_000_000);
     c.treasury.receive_premium(&c.backend, &1u64, &1_000_000); // reserve 900_000
 
-    // Circle's Stellar USDC issuer has AUTH_REVOCABLE (checked on mainnet and testnet,
-    // 2026-10-13), so it can deauthorize the backend wallet's USDC balance.
+    // Circle's Stellar USDC issuers have AUTH_REVOCABLE (checked 2026-10-13: mainnet
+    // GA5ZSEJ..., testnet GBBD47IF...), so they can deauthorize the backend wallet's USDC.
     c.sac
         .issuer()
         .set_flag(soroban_sdk::testutils::IssuerFlags::RevocableFlag);
@@ -1035,4 +1035,33 @@ fn extend_policy_ttl_bumps_the_policy_flags_and_pending_record() {
     }
     // A policy with no Treasury entries is a no-op, not a revert.
     c.treasury.extend_policy_ttl(&42u64);
+}
+
+#[test]
+fn payout_receiver_cannot_be_switched_while_a_claim_is_pending() {
+    use microcrop_shared::errors::TreasuryError;
+    let c = setup_with_pending();
+    assert_eq!(c.treasury.total_pending_payout_count(), 1);
+
+    // Switching now would strand the claim (its marker lives in the current receiver) and
+    // block the org's queue behind it.
+    let new_pr = Address::generate(&c.env);
+    assert_eq!(
+        c.treasury.try_set_payout_receiver(&c.admin, &new_pr),
+        Err(Ok(TreasuryError::PayoutsStillPending.into()))
+    );
+
+    // Once the claim settles, the switch goes through.
+    c.token_admin.mint(&c.org, &1_100_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &1_100_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    assert_eq!(c.treasury.total_pending_payout_count(), 0);
+    c.treasury.set_payout_receiver(&c.admin, &new_pr);
+}
+
+#[test]
+fn total_pending_count_tracks_every_org_queue() {
+    let c = setup_with_two_pending();
+    assert_eq!(c.treasury.total_pending_payout_count(), 2);
+    assert_eq!(c.treasury.pending_payout_count(&c.org), 2);
 }

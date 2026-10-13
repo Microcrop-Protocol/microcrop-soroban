@@ -439,7 +439,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 3110400
+        "live_until": 5702400
       },
       {
         "entry": {
@@ -496,7 +496,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 3110400
+        "live_until": 5702400
       },
       {
         "entry": {
@@ -523,7 +523,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 3110400
+        "live_until": 5702400
       },
       {
         "entry": {
@@ -799,6 +799,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "PendingPayoutTotalCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "PlatformFeePercent"
                           }
                         ]
@@ -1006,7 +1018,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 2596095
       },
       {
         "entry": {
@@ -1029,7 +1041,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 2596095
       },
       {
         "entry": {

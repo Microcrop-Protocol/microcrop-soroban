@@ -56,7 +56,7 @@ use k256::ecdsa::SigningKey;
 
 use microcrop_shared::{
     encoding::determination_digest,
-    errors::{PayoutError, TreasuryError},
+    errors::{PayoutError, PolicyError, TreasuryError},
     types::{CoverageType, CropDetermination, PolicyStatus, Role},
 };
 
@@ -821,37 +821,36 @@ fn frozen_backend_wallet_queues_the_claim_until_the_wallet_is_rotated() {
 // ============ Coverage type and plot binding, end to end ============
 
 #[test]
-fn crop_damage_does_not_settle_single_peril_cover() {
+fn single_peril_cover_cannot_be_sold() {
+    // Crop damage settles only all-cause cover, so single-peril cover is refused at sale:
+    // no policy, no exposure, no farmer slot, no premium.
     let w = deploy();
     let premium: i128 = 10_000_000_000;
-    let policy_id = w.pm.create_policy(
-        &w.backend,
-        &w.farmer,
-        &7u64,
-        &PLOT_LAT_E6,
-        &PLOT_LON_E6,
-        &SUM_INSURED,
-        &premium,
-        &DURATION_DAYS,
-        &CoverageType::Flood,
-        &w.org,
-    );
-    w.pm.activate_policy(
-        &w.backend,
-        &policy_id,
-        &w.distributor,
-        &String::from_str(&w.env, "Acme Distributor"),
-        &String::from_str(&w.env, "Rift Valley"),
-    );
-    w.pay_premium(policy_id, premium);
-
-    let d = determination(policy_id, SUM_INSURED, PAYOUT);
-    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
-    assert_eq!(
-        w.pr.try_submit_determination(&w.relayer, &d, &sig, &recid),
-        Err(Ok(PayoutError::CoverageNotSettledByMethodology.into()))
-    );
-    assert_eq!(w.token.balance(&w.backend_wallet), 0);
+    for coverage in [
+        CoverageType::Drought,
+        CoverageType::Flood,
+        CoverageType::Both,
+        CoverageType::ExcessRain,
+    ] {
+        assert_eq!(
+            w.pm.try_create_policy(
+                &w.backend,
+                &w.farmer,
+                &7u64,
+                &PLOT_LAT_E6,
+                &PLOT_LON_E6,
+                &SUM_INSURED,
+                &premium,
+                &DURATION_DAYS,
+                &coverage,
+                &w.org,
+            ),
+            Err(Ok(PolicyError::CoverageNotOffered.into()))
+        );
+    }
+    assert_eq!(w.pm.get_total_policies(), 0);
+    assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), 0);
+    assert_eq!(w.pm.get_farmer_policy_count(&w.farmer), 0);
 }
 
 #[test]
@@ -916,4 +915,64 @@ fn extend_policy_ttl_reaches_every_contract() {
         ttl_in(&w.nft.address, &nft_cert),
         NETWORK_MAX_ENTRY_TTL_LEDGERS
     );
+}
+
+#[test]
+fn extend_policy_ttl_keeps_org_and_farmer_entries_alive() {
+    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    use soroban_sdk::testutils::storage::Persistent as _;
+    use soroban_sdk::IntoVal;
+
+    let w = deploy();
+    w.env
+        .ledger()
+        .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    // Admin-set org terms (the same values as the defaults, so the claim math is unchanged).
+    w.treasury.set_org_fee_bps(&w.admin, &w.org, &1_000u32);
+    w.treasury
+        .set_org_reserve_ratio_bps(&w.admin, &w.org, &3_000u32);
+    let policy_id = record_short_claim(&w);
+
+    let ttl_in = |contract: &Address, k: soroban_sdk::Val| {
+        w.env
+            .as_contract(contract, || w.env.storage().persistent().get_ttl(&k))
+    };
+    use microcrop_policy_manager::DataKey as Pm;
+    use microcrop_treasury::DataKey as Tr;
+    // (`OrgQueueHead` is first written when the head advances, so it is absent here.)
+    let treasury_keys = [
+        Tr::OrgQueueTail(w.org.clone()),
+        Tr::OrgPendingPayouts(w.org.clone()),
+        Tr::OrgReserve(w.org.clone()),
+        Tr::OrgFeeSet(w.org.clone()),
+        Tr::OrgFeeBps(w.org.clone()),
+        Tr::OrgRatioSet(w.org.clone()),
+        Tr::OrgReserveRatioBps(w.org.clone()),
+    ];
+    let pm_keys = [
+        Pm::OrgOutstanding(w.org.clone()),
+        Pm::FarmerPolicyCount(w.farmer.clone()),
+    ];
+
+    // 150 days of silence: every entry has aged.
+    let seq = w.env.ledger().sequence();
+    w.env.ledger().set_sequence_number(seq + 150 * 17_280);
+    for k in treasury_keys.iter() {
+        assert!(ttl_in(&w.treasury_id, k.clone().into_val(&w.env)) < NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    }
+
+    w.env.set_auths(&[]);
+    w.pr.extend_policy_ttl(&policy_id);
+    for k in treasury_keys.iter() {
+        assert_eq!(
+            ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
+            NETWORK_MAX_ENTRY_TTL_LEDGERS
+        );
+    }
+    for k in pm_keys.iter() {
+        assert_eq!(
+            ttl_in(&w.pm.address, k.clone().into_val(&w.env)),
+            NETWORK_MAX_ENTRY_TTL_LEDGERS
+        );
+    }
 }

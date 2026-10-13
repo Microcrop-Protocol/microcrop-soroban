@@ -48,6 +48,10 @@ pub enum PolicyError {
     CancelActiveRequiresAdmin = 116,
     /// `create_policy` with `|lat_e6| > 90_000_000` or `|lon_e6| > 180_000_000`.
     InvalidCoordinates = 117,
+    /// `create_policy` with a coverage type other than `Comprehensive`. The only claim
+    /// methodology (crop damage) measures loss, not its cause, so single-peril cover could
+    /// never pay out. Rejected at sale so no premium is taken for it.
+    CoverageNotOffered = 118,
 }
 
 /// `Treasury` domain errors. Range 200..=299.
@@ -96,6 +100,11 @@ pub enum TreasuryError {
     /// missing or deauthorized by the issuer). The claim stays recorded; rotate the wallet
     /// with `set_backend_wallet` and settle again.
     PayoutTransferFailed = 225,
+    /// `set_payout_receiver` while any org has an unsettled pending payout. Each pending
+    /// claim's marker lives in the current PayoutReceiver, so switching would strand it and,
+    /// with first-in-first-out settlement, block the org's whole queue. Settle first, or
+    /// upgrade the PayoutReceiver in place.
+    PayoutsStillPending = 226,
 }
 
 /// `PayoutReceiver` domain errors. Range 300..=399. Order mirrors the 12 validation steps.
