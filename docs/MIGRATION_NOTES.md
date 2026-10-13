@@ -66,7 +66,8 @@ transitions can never be bricked. Changed by the 2026-10 audit fixes (§6): sum 
 7dp; exposure accrues at **create** (release on cancel/expire/claim); open cap is
 `open (ACTIVE+PENDING) + claims in the rolling window ≤ 3`; claim cap is 3 per rolling
 365 days (not a calendar-year bucket); farmer index is paginated; new `ClaimPending`
-status. Roles: create/activate = `Backend`; cancel PENDING = `Backend` or `Admin`, cancel
+status. Changed by §7: `create_policy` takes the plot coordinates (`lat_e6`, `lon_e6`,
+degrees x 1e6) and stores them on `Policy`; permissionless `extend_policy_ttl(policy_id)`. Roles: create/activate = `Backend`; cancel PENDING = `Backend` or `Admin`, cancel
 ACTIVE = `Admin` only; expire = anyone after `end_date`;
 mark_as_claimed/mark_claim_pending/increment_claim_count = `Oracle`; setters = `Admin`;
 upgrade = `Upgrader`.
@@ -80,7 +81,12 @@ per-org reserve credit; `receive_premium` pulls USDC from caller (`TokenClient::
 payout** instead of reverting (`settle_pending_payout` pays it later);
 `reserve_required = outstanding × ratio + pending payouts`; reserve ratio default and
 floor 30%; `receive_premium` only for PENDING, or ACTIVE-and-not-ended, policies; the
-constructor refuses a token whose `decimals() != 7`. CEI ordering (effects before the USDC interaction)
+constructor refuses a token whose `decimals() != 7`. Changed by §7: `receive_premium`
+requires `amount == policy.premium`; pending payouts form a per-org first-in-first-out
+queue and only the head settles; a failed USDC transfer to the backend wallet records the
+claim as pending instead of reverting (`try_transfer`), so the transfer now runs before
+the payout bookkeeping (safe: Soroban has no re-entrancy, and nothing is written when it
+fails). CEI ordering (effects before the USDC interaction)
 kept. Solvency invariant `balance ≥ total_org_reserves + accumulated_fees` asserted in tests.
 Roles: `receive_premium` = `Backend`; `request_payout` = `Payout` **and** `caller ==
 payout_receiver`; reserve/fee setters = `Admin`.
@@ -96,7 +102,10 @@ determination_digest`; `secp256k1_recover` byte-compared to the stored SEC-1 65-
 **triple replay guard** (temporary `ConsumedDetermination` + persistent `PolicyPaid` +
 Treasury `PayoutProcessed`). Added by §6: when Treasury reports a short reserve the policy
 becomes `ClaimPending` and the permissionless `settle_pending_claim(policy_id)` pays it in
-full later. The contract passes `env.current_contract_address()` as the
+full later. Added by §7: step 6c rejects any coverage type but `Comprehensive`, step 6d
+binds the signed coordinates to the policy's plot, `settle_pending_claim` accepts only the
+org's queue head, and the permissionless `extend_policy_ttl(policy_id)` bumps the policy's
+entries in all four contracts. The contract passes `env.current_contract_address()` as the
 `caller` to its Treasury/PolicyManager sub-invocations (a contract auto-authorizes its own
 sub-calls).
 
@@ -133,10 +142,18 @@ distributor index preserved but stored one entry per token and read in pages
 5. **PolicyNFT is not upgradeable.** The Solidity `PolicyNFT` is plain AccessControl (no
    UUPS), so there is no `upgrade` fn — matching source. The other three keep `upgrade`.
 6. **Explicit `caller` + `require_auth`** everywhere replaces implicit `msg.sender`.
-7. **Storage TTL / rent.** Every persistent/instance/temporary entry gets an explicit
-   `extend_ttl` bump (persistent ~400d requested, clamped by the host to the network
-   maximum; roles ~90d; instance ~7–30d; temporary short) — there is no EVM equivalent;
-   entries can be archived if TTL lapses. Paged index reads extend each entry they read.
+7. **Storage TTL / rent.** No EVM equivalent: an entry whose TTL lapses is archived and
+   must be restored before use. Every persistent and instance entry (policies, premium /
+   payout flags, pending claims and their queue, role grants, each contract instance) is
+   extended to the network maximum on every touch, read through `Storage::max_ttl()` so it
+   follows the live network config. Measured 2026-10-13 (`getLedgerEntries` on
+   `ConfigSettingStateArchival`, protocol 29): `max_entry_ttl` = **3,110,400 ledgers
+   (~180 days at 5 s)** on both mainnet and testnet; `min_persistent_ttl` is 2,073,600
+   (mainnet) / 120,960 (testnet). A 365-day policy therefore outlives one TTL; the
+   permissionless `PayoutReceiver::extend_policy_ttl(policy_id)` bumps that policy's entries
+   in all four contracts (runbook: call it at least every ~150 days). The temporary replay
+   marker stays at ~7 days (it only has to outlive the 1-hour freshness window). Paged index
+   reads extend each entry they read.
 8. **Events use `#[contractevent]`.** `env.events().publish(...)` is deprecated in SDK 27;
    `#[topic]` fields replace Solidity `indexed`. Some zero-value "previous value" event
    fields were dropped (no zero Address to emit).
@@ -210,9 +227,10 @@ preparation build into a real migration.
 - [ ] **No Soroban security audit.** The Solidity was audited; this Rust port has not been.
       The secp256k1 signature path, replay guards, and per-org solvency need fresh review on
       Soroban semantics (auth trees, TTL/archival edge cases).
-- [ ] **TTL/rent policy is placeholder.** Extend-thresholds were chosen for tests, not
-      tuned to real ledger economics; an archived `PolicyPaid`/`ConsumedDetermination` entry
-      has replay-safety implications that must be analysed before mainnet.
+- [x] ~~**TTL/rent policy is placeholder.**~~ Long-lived entries now go to the measured
+      network maximum on every touch, with a keep-alive helper (§3.7, §7). An archived
+      persistent entry fails the read rather than reading as absent, so archival does not
+      open a replay; the cost is a restore.
 - [ ] **Shared paused-code fragmentation** (§3.9): recommend adding one shared paused error
       to `microcrop_shared::errors` so all contracts share a code, instead of three local
       enums. Deferred to avoid touching the frozen shared crate mid-port.
@@ -227,14 +245,16 @@ preparation build into a real migration.
       scales `sumInsured` by `1e6`. The Stellar path must scale by `1e7` while the Base path
       stays at `1e6`, so the change has to be chain-aware. Until it ships, every Stellar
       determination fails `SumInsuredMismatch`.
-- [ ] **TTL against real network limits.** Per-policy flags now request ~400 days, roles
-      ~90 days on grant and use, but the host clamps to the network `max_entry_ttl`, which
-      on mainnet is shorter than a 365-day policy. Entries then archive and are restored on
-      access; measure the restore cost inside the relayer's 3600 s freshness window.
-- [ ] **Order among pending claims.** A new claim is paid at once only from the part of
-      the reserve not owed to pending claims, so it queues behind them. Pending claims
-      themselves can be settled in any order by anyone; strict first-come order would need
-      a per-org queue index.
+- [x] ~~**TTL against real network limits.**~~ Measured (180 days on both networks) and
+      handled by extend-to-max plus `extend_policy_ttl` (§7). Still open: measure the
+      restore cost of an archived entry inside the relayer's 3600 s freshness window if the
+      keep-alive is missed.
+- [x] ~~**Order among pending claims.**~~ Per-org first-in-first-out queue (§7).
+- [ ] **Signer rule: one determination per policy per assessment window.** Operational
+      requirement on the Lit action, not enforced on-chain (§7, item 7).
+- [ ] **Backend plot coordinates.** The Stellar backend must pass `lat_e6`/`lon_e6` to
+      `create_policy` computed exactly as the Lit action does (`Math.round(deg * 1e6)` from
+      the same plot record), and create policies as `Comprehensive`.
 
 **Product parity not ported**
 - [ ] **Non-custodial target contracts** — replace mandatory `Treasury` custody with
@@ -281,7 +301,20 @@ Review follow-ups in the same PR:
 - `settle_pending_payout` reverts `NotConfigured` (3) unless the PayoutReceiver is wired.
 - `scripts/deploy.sh` checks `decimals() == 7` on `USDC_SAC` before deploying anything.
 
-## 7. Bottom line
+## 7. Review follow-ups (2026-10-13)
+
+| # | Lead | Fix | Behaviour change for callers |
+|---|---|---|---|
+| 1 | pending claims settled in any order; whoever called first chose which claim a partial top-up paid | Treasury keeps a per-org queue (`OrgQueueHead`, `OrgQueueTail`, one `OrgQueueAt(org, i)` entry per claim; no `Vec`). `PendingPayout.queue_index` records the slot; `settle_pending_payout` accepts only the head. Still permissionless and idempotent (a settled claim reverts `NoPendingPayout` / `NoPendingClaim`). New claims still wait behind pending ones | `settle_pending_claim(non-head)` reverts `NotPendingQueueHead` (224). New views `pending_payout_head(org) -> Option<u64>`, `pending_payout_count(org)` |
+| 2 | every payout goes to one backend wallet the USDC issuer can freeze | `pay_out` uses `try_transfer`; on failure nothing is written, `PayoutTransferFailed` is emitted, and `request_payout` records the claim as pending (same queue) and returns `false`, so the determination is consumed and the policy goes `ClaimPending` instead of reverting. Settling into a still-frozen wallet reverts `PayoutTransferFailed` (225) and keeps the claim; after `set_backend_wallet` it settles | a claim can be pending while the reserve covers it. Checked 2026-10-13: Circle's Stellar USDC issuer `GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN` has `auth_revocable = true`, `auth_clawback_enabled = false` on mainnet and testnet |
+| — | issuer clawback leaves reserves unbacked | **no code**: clawback is not enabled on the USDC issuer. A SAC balance (the Treasury's included) takes its clawback flag from the issuer when the balance is created, so a balance created while the flag is off stays non-clawbackable even if the issuer later enables it. Re-check the issuer flags before any redeploy | none |
+| 3 | TTL requests (~400 d) were clamped to a network maximum shorter than a policy | every touch extends to `max_ttl()`; reads on the Treasury money path extend too; PolicyNft instance no longer ~7 d; new permissionless `extend_policy_ttl(policy_id)` on PayoutReceiver (fans out to Treasury, PolicyManager, and best effort PolicyNft), each also callable directly | see §3.7 and the runbook keep-alive |
+| 4 | a crop-damage determination settled a policy of any coverage type | step 6c: only `Comprehensive` | `CoverageNotSettledByMethodology` (320). Mapping: CROP_DAMAGE (`crop-dualindex-1.0`) measures loss (60% weather, 40% NDVI), not its cause, so it can settle only all-cause cover. `Drought`, `Flood`, `Both`, `ExcessRain` name a peril the index cannot attribute. The EVM backend already writes every on-chain policy as `COMPREHENSIVE` (4) |
+| 5 | signed coordinates not bound to the insured plot | `Policy.lat_e6` / `lon_e6` (i64, degrees x 1e6) set by Backend at `create_policy` (range-checked: `InvalidCoordinates`, 117); step 6d requires `|signed − stored| <= 1` per axis. One micro-degree (~0.11 m) absorbs a rounding-mode difference between the backend's and the signer's conversion of the same plot record and is far below any plot size | **ABI**: `create_policy(caller, farmer, plot_id, lat_e6, lon_e6, sum_insured, premium, duration_days, coverage_type, org)`; `Policy` gains two fields; `PlotLocationMismatch` (321) |
+| 6 | `receive_premium` accepted any amount | `amount == policy.premium` | `PremiumAmountMismatch` (223) |
+| 7 | the relayer chooses which of two signed determinations settles a policy | **signer-side rule, no contract change**: the Lit action issues at most one determination per policy per assessment window: no new signature for a policy while an earlier one is within `MAX_REPORT_AGE` (3600 s) or the policy is paid. No clean contract-side rule exists: "highest `assessed_at` consumed" cannot help because the first valid submission already pays, and any rule that lets a later determination win needs a dispute window, which delays every payout. The preimage is unchanged | none on-chain; operational requirement on the signer |
+
+## 8. Bottom line
 
 The Rust/Soroban re-implementation is **complete and green** as a parity/reference
 version: it builds to WASM on the correct target and its tests preserve the old model's
