@@ -61,8 +61,9 @@ pub const CLAIM_WINDOW_SECS: u64 = 365 * SECONDS_PER_DAY;
 const DAY_IN_LEDGERS: u32 = 17_280;
 /// Bump when remaining TTL drops below ~30 days...
 const BUMP_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
-/// ...extending the entry to ~90 days out (< test-env `max_entry_ttl`).
-const BUMP_EXTEND_TO: u32 = 90 * DAY_IN_LEDGERS;
+/// ...extending the entry to ~400 days out, longer than a 365-day policy and the 365-day
+/// claim window. The host clamps this to the network `max_entry_ttl` (it does not error).
+const BUMP_EXTEND_TO: u32 = 400 * DAY_IN_LEDGERS;
 
 /// Storage keys. `PolicyNft`/`PolicyCounter` are instance; the rest are persistent.
 #[contracttype]
@@ -387,6 +388,11 @@ impl PolicyManager {
         if policy.status != PolicyStatus::Pending {
             panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
         }
+        // A PENDING policy past its end date is expirable by anyone; activating it instead
+        // would revive cover the org's exposure may already have been released for.
+        if env.ledger().timestamp() > policy.end_date {
+            panic_with_error!(&env, PolicyError::PolicyExpired);
+        }
 
         // The backing org is always set by create_policy on a fresh chain; the guard is kept for
         // parity (Finding 7). `Policy.org` can never be address(0) in this port.
@@ -407,20 +413,7 @@ impl PolicyManager {
 
         // Move the farmer's slot PENDING -> ACTIVE.
         Self::set_farmer_active_count(&env, &policy.farmer, current_active + 1);
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingCounted(policy_id))
-            .unwrap_or(false)
-        {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::PendingCounted(policy_id));
-            let pending = Self::farmer_pending_count(&env, &policy.farmer);
-            if pending > 0 {
-                Self::set_farmer_pending_count(&env, &policy.farmer, pending - 1);
-            }
-        }
+        Self::release_pending_slot(&env, policy_id, &policy.farmer);
 
         // (The org's outstanding exposure was already counted at create_policy.)
 
@@ -451,7 +444,9 @@ impl PolicyManager {
     }
 
     /// Port of `markAsClaimed` (ORACLE = PayoutReceiver). ACTIVE or CLAIM_PENDING -> CLAIMED,
-    /// decrements active count, releases org exposure, deactivates NFT (best-effort).
+    /// deactivates NFT (best-effort). From ACTIVE it also decrements the active count and
+    /// releases the org exposure; from CLAIM_PENDING those were already released by
+    /// `mark_claim_pending`, so they are not released twice.
     ///
     /// An ACTIVE policy must still be within its coverage window. A CLAIM_PENDING policy is
     /// not checked against `end_date`: its determination was verified inside the window and
@@ -461,21 +456,24 @@ impl PolicyManager {
 
         let mut policy = Self::load_policy(&env, policy_id);
 
-        match policy.status {
+        let was_active = match policy.status {
             PolicyStatus::Active => {
                 if env.ledger().timestamp() > policy.end_date {
                     panic_with_error!(&env, PolicyError::PolicyExpired);
                 }
+                true
             }
-            PolicyStatus::ClaimPending => {}
+            PolicyStatus::ClaimPending => false,
             _ => panic_with_error!(&env, PolicyError::InvalidPolicyStatus),
-        }
+        };
 
         policy.status = PolicyStatus::Claimed;
         Self::save_policy(&env, &policy);
 
-        Self::decrement_active(&env, &policy.farmer);
-        Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
+        if was_active {
+            Self::decrement_active(&env, &policy.farmer);
+            Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
+        }
         Self::deactivate_policy_nft(&env, policy_id);
 
         Self::bump_instance(&env);
@@ -487,9 +485,14 @@ impl PolicyManager {
     }
 
     /// ORACLE (PayoutReceiver). ACTIVE -> CLAIM_PENDING: a valid determination was verified
-    /// but the org reserve cannot pay it yet. The policy keeps its active slot, its org
-    /// exposure and its soulbound certificate until `mark_as_claimed` settles it; it cannot
-    /// be expired or cancelled meanwhile. No port equivalent in Solidity (audit findings 9/11).
+    /// but the org reserve cannot pay it yet. The policy keeps its soulbound certificate until
+    /// `mark_as_claimed` settles it, and it cannot be expired or cancelled meanwhile. No port
+    /// equivalent in Solidity (audit findings 9/11).
+    ///
+    /// The active slot and the org exposure are released HERE, not at settlement. The claim
+    /// itself already counts against the farmer's cap (as a claim in the window) and against
+    /// the org's required reserve (as a pending payout of the full amount, in Treasury), so
+    /// keeping the slot and the exposure too would count the same policy twice.
     pub fn mark_claim_pending(env: Env, caller: Address, policy_id: u64) {
         roles::require_role(&env, &caller, Role::Oracle);
 
@@ -503,6 +506,9 @@ impl PolicyManager {
 
         policy.status = PolicyStatus::ClaimPending;
         Self::save_policy(&env, &policy);
+
+        Self::decrement_active(&env, &policy.farmer);
+        Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
 
         Self::bump_instance(&env);
         PolicyClaimPending {
@@ -571,20 +577,7 @@ impl PolicyManager {
             Self::deactivate_policy_nft(&env, policy_id);
         } else {
             // PENDING: release its reserved open-policy slot (only if it was counted — Finding 8).
-            if env
-                .storage()
-                .persistent()
-                .get(&DataKey::PendingCounted(policy_id))
-                .unwrap_or(false)
-            {
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::PendingCounted(policy_id));
-                let pending = Self::farmer_pending_count(&env, &policy.farmer);
-                if pending > 0 {
-                    Self::set_farmer_pending_count(&env, &policy.farmer, pending - 1);
-                }
-            }
+            Self::release_pending_slot(&env, policy_id, &policy.farmer);
         }
 
         policy.status = PolicyStatus::Cancelled;
@@ -598,28 +591,35 @@ impl PolicyManager {
         .publish(&env);
     }
 
-    /// Port of `expirePolicy`. ACTIVE -> EXPIRED once past end date.
+    /// Port of `expirePolicy`. ACTIVE or PENDING -> EXPIRED once past end date.
     ///
     /// Permissionless: the `now > end_date` check is the only gate, so the org's reserve and
     /// the farmer's slot are not held hostage to the backend acting (audit finding 7).
+    /// A PENDING policy's `end_date` is its creation time plus its duration, so one that was
+    /// never activated also lapses: its org exposure (counted at `create_policy`) and its
+    /// pending slot are released, and it can no longer be activated.
     /// Idempotent: expiring an already-EXPIRED policy is a no-op (no second release, no
-    /// event); any other non-ACTIVE status reverts `InvalidPolicyStatus`.
+    /// event); any other status reverts `InvalidPolicyStatus`.
     pub fn expire_policy(env: Env, policy_id: u64) {
         let mut policy = Self::load_policy(&env, policy_id);
 
         if policy.status == PolicyStatus::Expired {
             return;
         }
-        if policy.status != PolicyStatus::Active {
+        if policy.status != PolicyStatus::Active && policy.status != PolicyStatus::Pending {
             panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
         }
         if env.ledger().timestamp() <= policy.end_date {
             panic_with_error!(&env, PolicyError::PolicyNotYetExpired);
         }
 
-        Self::decrement_active(&env, &policy.farmer);
+        if policy.status == PolicyStatus::Active {
+            Self::decrement_active(&env, &policy.farmer);
+            Self::deactivate_policy_nft(&env, policy_id);
+        } else {
+            Self::release_pending_slot(&env, policy_id, &policy.farmer);
+        }
         Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
-        Self::deactivate_policy_nft(&env, policy_id);
 
         policy.status = PolicyStatus::Expired;
         Self::save_policy(&env, &policy);
@@ -651,9 +651,12 @@ impl PolicyManager {
         let mut out = Vec::new(&env);
         let mut i = start;
         while i < end {
+            let key = DataKey::FarmerPolicyAt(farmer.clone(), i);
             let id: u64 = p
-                .get(&DataKey::FarmerPolicyAt(farmer.clone(), i))
+                .get(&key)
                 .unwrap_or_else(|| panic_with_error!(&env, PolicyError::PolicyDoesNotExist));
+            // Reads keep old index entries live, so paging never hits an archived entry.
+            Self::bump_persistent(&env, &key);
             out.push_back(id);
             i += 1;
         }
@@ -816,6 +819,19 @@ impl PolicyManager {
         let c = Self::farmer_active_count(env, farmer);
         if c > 0 {
             Self::set_farmer_active_count(env, farmer, c - 1);
+        }
+    }
+
+    /// Release a PENDING policy's slot in the farmer's pending count, only if `create_policy`
+    /// counted it (Finding 8). Removes the marker so the slot is released at most once.
+    fn release_pending_slot(env: &Env, policy_id: u64, farmer: &Address) {
+        let key = DataKey::PendingCounted(policy_id);
+        if env.storage().persistent().get(&key).unwrap_or(false) {
+            env.storage().persistent().remove(&key);
+            let pending = Self::farmer_pending_count(env, farmer);
+            if pending > 0 {
+                Self::set_farmer_pending_count(env, farmer, pending - 1);
+            }
         }
     }
 

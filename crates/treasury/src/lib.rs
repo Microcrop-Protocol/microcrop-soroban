@@ -33,7 +33,7 @@ use soroban_sdk::{
 };
 
 use microcrop_shared::{
-    errors::TreasuryError,
+    errors::{CommonError, TreasuryError},
     interfaces::PolicyManagerClient,
     roles,
     types::{PolicyStatus, Role},
@@ -157,6 +157,7 @@ pub struct PayoutPending {
     #[topic]
     pub org: Address,
     pub amount: i128,
+    /// The org reserve not already owed to earlier pending claims.
     pub available: i128,
 }
 
@@ -538,9 +539,14 @@ impl Treasury {
             panic_with_error!(&env, TreasuryError::PremiumNotReceived);
         }
 
-        // Per-org solvency: the payout is funded ONLY by the policy's org's own reserve.
+        // Per-org solvency: the payout is funded ONLY by the policy's org's own reserve, and
+        // only by the part of it not already owed to the org's pending claims. Otherwise a new
+        // claim that fits would be paid from money `reserve_required` holds for an older
+        // pending claim, and a large pending claim could wait behind new ones indefinitely.
+        // New claims therefore queue behind unpaid ones.
         let org = resolve_org(&env, policy_id);
-        let available = org_reserve_of(&env, &org);
+        let reserve = org_reserve_of(&env, &org);
+        let available = reserve - org_pending_payouts_of(&env, &org);
         if available < amount {
             // Record the claim instead of reverting. The farmer is owed money; the backend
             // must alert the org + admin, and anyone may settle once the reserve is topped up.
@@ -565,7 +571,7 @@ impl Treasury {
             return false;
         }
 
-        pay_out(&env, policy_id, &org, amount, available);
+        pay_out(&env, policy_id, &org, amount, reserve);
         true
     }
 
@@ -575,6 +581,12 @@ impl Treasury {
     /// is still short. Marks the payout processed exactly as the immediate path does. Returns
     /// the amount paid.
     pub fn settle_pending_payout(env: Env, caller: Address, policy_id: u64) -> i128 {
+        // Only the wired PayoutReceiver may settle: it clears its own pending marker and marks
+        // the policy claimed in the same call. Settled any other way, the Treasury record would
+        // be gone while the policy stays CLAIM_PENDING forever.
+        if !env.storage().instance().has(&DataKey::PayoutReceiver) {
+            panic_with_error!(&env, CommonError::NotConfigured);
+        }
         require_payout_receiver(&env, &caller);
         require_not_paused(&env);
         instance_bump(&env);

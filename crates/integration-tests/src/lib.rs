@@ -424,12 +424,15 @@ fn short_reserve_records_pending_claim_then_settles_in_full() {
         PolicyStatus::ClaimPending
     );
     assert_eq!(w.pm.get_farmer_claim_count(&w.farmer), 1);
+    // Counted once each: the claim holds the farmer's slot (as a claim in the window) and the
+    // org's reserve (as the full pending payout), so the active slot and the 30% exposure on
+    // the policy are released when it goes CLAIM_PENDING.
+    assert_eq!(w.pm.get_farmer_active_count(&w.farmer), 0);
+    assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), 0);
+    assert!(w.nft.get_certificate(&policy_id).is_active);
 
-    // Reserve lock: the requirement includes the whole pending payout.
-    assert_eq!(
-        w.treasury.reserve_required(&w.org),
-        SUM_INSURED * 3_000 / 10_000 + PAYOUT
-    );
+    // Reserve lock: the requirement is the whole pending payout, and nothing on top of it.
+    assert_eq!(w.treasury.reserve_required(&w.org), PAYOUT);
     let to = Address::generate(&w.env);
     assert!(w
         .treasury
@@ -450,9 +453,9 @@ fn short_reserve_records_pending_claim_then_settles_in_full() {
     assert!(w.pm.try_expire_policy(&policy_id).is_err());
     assert!(w.pm.try_cancel_policy(&w.admin, &policy_id).is_err());
 
-    // The org tops up: enough for the claim plus its remaining 30% floor. Before settlement
-    // it still cannot withdraw the claim money.
-    let top_up = PAYOUT + SUM_INSURED * 3_000 / 10_000;
+    // The org tops up exactly the claim. Before settlement it still cannot withdraw the
+    // claim money.
+    let top_up = PAYOUT;
     w.token_admin.mint(&w.org, &top_up);
     w.treasury.deposit_reserve(&w.org, &w.org, &top_up);
     assert!(w
@@ -517,6 +520,40 @@ fn pending_claim_blocks_replay_and_other_determinations() {
         PAYOUT
     );
     assert_eq!(w.token.balance(&w.backend_wallet), 0);
+}
+
+#[test]
+fn new_claim_queues_behind_an_older_pending_claim() {
+    let w = deploy();
+    let first = record_short_claim(&w); // reserve 90 USDC, 500 USDC pending.
+
+    // Same farmer (one claim in the window + one open policy is under the cap of 3).
+    let premium: i128 = 1_000_000_000;
+    let second = w.create_and_activate(premium);
+    w.pay_premium(second, premium);
+    // Reserve 600 USDC: the second 500 USDC claim fits the reserve, but only 100 USDC of it
+    // is not already owed to the first claim.
+    let top_up: i128 = 4_200_000_000;
+    w.token_admin.mint(&w.org, &top_up);
+    w.treasury.deposit_reserve(&w.org, &w.org, &top_up);
+    assert_eq!(w.treasury.org_reserve(&w.org), 6_000_000_000);
+
+    let d = determination(second, SUM_INSURED, PAYOUT);
+    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
+    w.pr.submit_determination(&w.relayer, &d, &sig, &recid);
+
+    // Queued, not paid ahead of the first claim.
+    assert_eq!(w.token.balance(&w.backend_wallet), 0);
+    assert_eq!(w.pm.get_policy(&second).status, PolicyStatus::ClaimPending);
+    assert_eq!(w.treasury.org_pending_payouts(&w.org), 2 * PAYOUT);
+
+    // The first claim settles from the reserve it was waiting on.
+    w.env.set_auths(&[]);
+    w.pr.settle_pending_claim(&first);
+    assert_eq!(w.token.balance(&w.backend_wallet), PAYOUT);
+    assert_eq!(w.pm.get_policy(&first).status, PolicyStatus::Claimed);
+    assert!(w.pr.is_claim_pending(&second));
+    w.assert_solvent();
 }
 
 #[test]

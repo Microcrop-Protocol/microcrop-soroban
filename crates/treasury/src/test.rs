@@ -730,3 +730,80 @@ fn premium_flag_ttl_covers_the_longest_policy() {
         ttl
     );
 }
+
+// ---------------- New claims queue behind pending ones ----------------
+
+#[test]
+fn new_claim_cannot_be_paid_from_money_owed_to_a_pending_claim() {
+    // Policy 1: 900_000 reserve, 2_000_000 pending.
+    let c = setup_with_pending();
+    // Policy 2 (same org): another 900_000 net, then the org tops up 1_200_000.
+    c.pm().set_org(&2u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &2u64, &1_000_000);
+    c.token_admin.mint(&c.org, &1_200_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &1_200_000);
+    assert_eq!(c.treasury.org_reserve(&c.org), 3_000_000);
+
+    // 1_500_000 fits the reserve (3_000_000) but not the part not owed to policy 1
+    // (1_000_000), so it is recorded pending instead of being paid ahead of policy 1.
+    assert!(!c
+        .treasury
+        .request_payout(&c.payout_receiver, &2u64, &1_500_000));
+    assert_eq!(c.token.balance(&c.backend_wallet), 0);
+    assert_eq!(c.treasury.org_pending_payouts(&c.org), 3_500_000);
+
+    // A claim that fits the unowed part is still paid at once.
+    c.pm().set_org(&3u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &3u64, &1_000_000);
+    c.token_admin.mint(&c.org, &3_600_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &3_600_000);
+    // reserve 7_500_000, pending 3_500_000, unowed 4_000_000.
+    assert!(c
+        .treasury
+        .request_payout(&c.payout_receiver, &3u64, &4_000_000));
+    assert_eq!(c.token.balance(&c.backend_wallet), 4_000_000);
+
+    // The two pending claims are both still fully covered.
+    assert_eq!(c.treasury.org_reserve(&c.org), 3_500_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &2u64);
+    assert_eq!(c.token.balance(&c.backend_wallet), 7_500_000);
+    assert_eq!(c.treasury.org_reserve(&c.org), 0);
+    assert_eq!(c.treasury.org_pending_payouts(&c.org), 0);
+    c.assert_solvent();
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // CommonError::NotConfigured
+fn settle_pending_payout_requires_a_wired_payout_receiver() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let backend = Address::generate(&env);
+    let payout = Address::generate(&env);
+    let org = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_admin = StellarAssetClient::new(&env, &sac.address());
+    let treasury_id = env.register(
+        Treasury,
+        (sac.address(), Address::generate(&env), admin.clone()),
+    );
+    let treasury = TreasuryClient::new(&env, &treasury_id);
+    let pm_id = env.register(MockPm, ());
+    treasury.set_policy_manager(&admin, &pm_id);
+    // No set_payout_receiver.
+    treasury.grant_role(&admin, &Role::Backend, &backend);
+    treasury.grant_role(&admin, &Role::Payout, &payout);
+    MockPmClient::new(&env, &pm_id).set_org(&1u64, &org);
+    token_admin.mint(&backend, &1_000_000);
+    treasury.receive_premium(&backend, &1u64, &1_000_000);
+    assert!(!treasury.request_payout(&payout, &1u64, &2_000_000));
+    token_admin.mint(&org, &2_000_000);
+    treasury.deposit_reserve(&org, &org, &2_000_000);
+
+    // Settling from a bare Payout-role holder would clear the Treasury record while the
+    // PayoutReceiver marker and the CLAIM_PENDING status stay behind; refuse it.
+    treasury.settle_pending_payout(&payout, &1u64);
+}

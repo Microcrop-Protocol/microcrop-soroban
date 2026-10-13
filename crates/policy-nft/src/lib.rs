@@ -48,12 +48,13 @@ use microcrop_shared::{
 
 // ============ Storage TTL policy ============
 // ~5s ledgers => 17,280 ledgers/day. Certificates are long-lived registry records, so
-// persistent entries are bumped ~30 days on every touch; the instance (name/symbol/wiring)
-// ~7 days. Thresholds sit one day below the bump so a bump only happens when actually needed.
+// persistent entries are bumped ~400 days on every touch (longer than a 365-day policy; the
+// host clamps to the network `max_entry_ttl`); the instance (name/symbol/wiring) ~7 days.
+// Thresholds sit one day below the bump so a bump only happens when actually needed.
 const DAY_IN_LEDGERS: u32 = 17_280;
 const INSTANCE_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
-const PERSISTENT_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
+const PERSISTENT_BUMP_AMOUNT: u32 = 400 * DAY_IN_LEDGERS;
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = PERSISTENT_BUMP_AMOUNT - DAY_IN_LEDGERS;
 
 /// Hard maximum page size for the paginated index views. Each id is its own ledger entry,
@@ -372,9 +373,12 @@ impl PolicyNft {
         let mut out = Vec::new(&env);
         let mut i = start;
         while i < end {
+            let key = DataKey::DistributorPolicy(distributor.clone(), i);
             let id: u64 = p
-                .get(&DataKey::DistributorPolicy(distributor.clone(), i))
+                .get(&key)
                 .unwrap_or_else(|| panic_with_error!(&env, NftError::TokenNotFound));
+            // Reads keep old index entries live, so paging never hits an archived entry.
+            Self::bump_persistent(&env, &key);
             out.push_back(id);
             i += 1;
         }

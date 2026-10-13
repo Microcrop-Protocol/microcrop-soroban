@@ -691,6 +691,55 @@ fn admin_can_cancel_pending_and_active() {
 }
 
 #[test]
+fn backend_signature_cannot_cancel_active_as_admin() {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    let c = setup();
+    let id = create_default(&c);
+    activate_default(&c, id);
+
+    // Only the Backend signs, but the call names `admin` as the caller: admin.require_auth()
+    // must fail, so the Admin escape hatch cannot be borrowed without Admin's signature.
+    let res = c
+        .client
+        .mock_auths(&[MockAuth {
+            address: &c.backend,
+            invoke: &MockAuthInvoke {
+                contract: &c.client.address,
+                fn_name: "cancel_policy",
+                args: (c.admin.clone(), id).into_val(&c.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_cancel_policy(&c.admin, &id);
+    // The host reports a missing authorization as a host error, never as a contract error.
+    match res {
+        Err(Ok(e)) => assert!(
+            !e.is_type(soroban_sdk::xdr::ScErrorType::Contract),
+            "expected a missing-auth host error, got {:?}",
+            e
+        ),
+        other => panic!("expected a missing-auth host error, got {:?}", other),
+    }
+    assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Active);
+
+    // Control: the same call with Admin's own signature succeeds, so the failure above was
+    // the missing signature and nothing else.
+    c.client
+        .mock_auths(&[MockAuth {
+            address: &c.admin,
+            invoke: &MockAuthInvoke {
+                contract: &c.client.address,
+                fn_name: "cancel_policy",
+                args: (c.admin.clone(), id).into_val(&c.env),
+                sub_invokes: &[],
+            },
+        }])
+        .cancel_policy(&c.admin, &id);
+    assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Cancelled);
+}
+
+#[test]
 fn stranger_cannot_cancel() {
     let c = setup();
     let id = create_default(&c);
@@ -740,20 +789,98 @@ fn expire_is_idempotent() {
 }
 
 #[test]
-fn expire_rejects_pending_and_closed_policies() {
+fn expire_rejects_live_pending_and_closed_policies() {
     let c = setup();
     let pending = create_default(&c);
+    // A PENDING policy inside its window cannot be expired.
+    assert_err(
+        c.client.try_expire_policy(&pending),
+        PolicyError::PolicyNotYetExpired as u32,
+    );
+    // A cancelled one cannot be expired at any time.
+    c.client.cancel_policy(&c.backend, &pending);
     let p = c.client.get_policy(&pending);
     c.env.ledger().set_timestamp(p.end_date + 1);
     assert_err(
         c.client.try_expire_policy(&pending),
         PolicyError::InvalidPolicyStatus as u32,
     );
-    c.client.cancel_policy(&c.backend, &pending);
-    assert_err(
-        c.client.try_expire_policy(&pending),
-        PolicyError::InvalidPolicyStatus as u32,
+}
+
+#[test]
+fn stale_pending_policy_expires_and_releases_exposure_once() {
+    let c = setup();
+    let stale = create_default(&c);
+    let other = create_default(&c);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        2 * MIN_SUM_INSURED
     );
+    let p = c.client.get_policy(&stale);
+    c.env.ledger().set_timestamp(p.end_date + 1);
+
+    // Anyone may expire it: no role, no auth.
+    c.env.set_auths(&[]);
+    c.client.expire_policy(&stale);
+    assert_eq!(c.client.get_policy(&stale).status, PolicyStatus::Expired);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
+
+    // A repeat expiry releases nothing more.
+    c.client.expire_policy(&stale);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
+
+    // The pending slot came back: with `other` still PENDING, two more fit under the cap.
+    c.env.mock_all_auths();
+    create_default(&c);
+    create_default(&c);
+    assert_err(
+        c.client.try_create_policy(
+            &c.backend,
+            &c.farmer,
+            &1u64,
+            &MIN_SUM_INSURED,
+            &100_000_000i128,
+            &30u32,
+            &CoverageType::Drought,
+            &c.org,
+        ),
+        PolicyError::TooManyActivePolicies as u32,
+    );
+
+    // An expired policy can no longer be activated.
+    let res = c.client.try_activate_policy(
+        &c.backend,
+        &stale,
+        &c.distributor,
+        &String::from_str(&c.env, "Acme Distributor"),
+        &String::from_str(&c.env, "Nakuru"),
+    );
+    assert_err(res, PolicyError::InvalidPolicyStatus as u32);
+    // `other` is untouched by its sibling's expiry.
+    assert_eq!(c.client.get_policy(&other).status, PolicyStatus::Pending);
+}
+
+#[test]
+fn lapsed_pending_policy_cannot_be_activated() {
+    let c = setup();
+    let id = create_default(&c);
+    let p = c.client.get_policy(&id);
+    c.env.ledger().set_timestamp(p.end_date + 1);
+    let res = c.client.try_activate_policy(
+        &c.backend,
+        &id,
+        &c.distributor,
+        &String::from_str(&c.env, "Acme Distributor"),
+        &String::from_str(&c.env, "Nakuru"),
+    );
+    assert_err(res, PolicyError::PolicyExpired as u32);
+    assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Pending);
 }
 
 // ---------------- Findings 9/11: CLAIM_PENDING ----------------
@@ -767,12 +894,11 @@ fn claim_pending_policy_cannot_lapse_or_be_cancelled_and_settles_after_end_date(
 
     c.client.mark_claim_pending(&c.oracle, &id);
     assert_eq!(c.client.get_policy(&id).status, PolicyStatus::ClaimPending);
-    // Still holds its slot and its exposure until settled.
-    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 1);
-    assert_eq!(
-        c.client.org_outstanding_sum_insured(&c.org),
-        MIN_SUM_INSURED
-    );
+    // The active slot and the exposure are released now: the claim already counts against
+    // the farmer (claim window) and the org (pending payout in Treasury), so keeping them
+    // would count the same policy twice.
+    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
+    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
 
     // Past end_date: cannot be expired, cannot be cancelled (not even by Admin).
     c.env.ledger().set_timestamp(p.end_date + 1_000);
@@ -790,11 +916,19 @@ fn claim_pending_policy_cannot_lapse_or_be_cancelled_and_settles_after_end_date(
         PolicyError::InvalidPolicyStatus as u32,
     );
 
-    // Settlement after end_date still works and releases slot + exposure exactly once.
+    // Settlement after end_date still works and releases nothing a second time: another
+    // ACTIVE policy's slot and exposure are untouched.
+    c.env.ledger().set_timestamp(p.created_at);
+    let other = create_default(&c);
+    activate_default(&c, other);
+    c.env.ledger().set_timestamp(p.end_date + 1_000);
     c.client.mark_as_claimed(&c.oracle, &id);
     assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Claimed);
-    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
-    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
+    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 1);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
     assert_err(
         c.client.try_mark_as_claimed(&c.oracle, &id),
         PolicyError::InvalidPolicyStatus as u32,
