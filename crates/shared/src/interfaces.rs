@@ -24,13 +24,19 @@ pub trait IPolicyManager {
     fn policy_org(env: Env, policy_id: u64) -> Address;
     fn org_outstanding_sum_insured(env: Env, org: Address) -> i128;
     fn mark_as_claimed(env: Env, caller: Address, policy_id: u64);
+    fn mark_claim_pending(env: Env, caller: Address, policy_id: u64);
     fn increment_claim_count(env: Env, caller: Address, farmer: Address);
 }
 
 /// Client for `Treasury` — used by `PayoutReceiver` to disburse an authorized payout.
 #[contractclient(name = "TreasuryClient")]
 pub trait ITreasury {
-    fn request_payout(env: Env, caller: Address, policy_id: u64, amount: i128);
+    /// Pays `amount` from the policy's org reserve and returns `true`, or, if the reserve is
+    /// short, records a pending payout for the full amount and returns `false`.
+    fn request_payout(env: Env, caller: Address, policy_id: u64, amount: i128) -> bool;
+    /// Pays a recorded pending payout in full once the org reserve covers it. Returns the
+    /// amount paid.
+    fn settle_pending_payout(env: Env, caller: Address, policy_id: u64) -> i128;
 }
 
 /// Client for `PolicyNft` — used by `PolicyManager` on activation (mint) and lifecycle

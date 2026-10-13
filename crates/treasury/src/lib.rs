@@ -144,6 +144,29 @@ pub struct ReserveBelowRequirement {
     pub required: i128,
 }
 
+/// A verified claim could not be paid from the org reserve and was recorded as pending.
+#[contractevent]
+#[derive(Clone)]
+pub struct PayoutPending {
+    #[topic]
+    pub policy_id: u64,
+    #[topic]
+    pub org: Address,
+    pub amount: i128,
+    pub available: i128,
+}
+
+/// A pending payout was paid in full.
+#[contractevent]
+#[derive(Clone)]
+pub struct PendingPayoutSettled {
+    #[topic]
+    pub policy_id: u64,
+    #[topic]
+    pub org: Address,
+    pub amount: i128,
+}
+
 /// Reserve capital was deposited into an org's reserve.
 #[contractevent]
 #[derive(Clone)]
@@ -276,6 +299,21 @@ pub enum DataKey {
     OrgFeeBps(Address),
     /// org -> fee presence flag (honor explicit 0).
     OrgFeeSet(Address),
+    /// policy_id -> a verified claim the org reserve could not pay yet.
+    PendingPayout(u64),
+    /// org -> sum of its pending payouts (counted in `reserve_required`).
+    OrgPendingPayouts(Address),
+}
+
+/// A verified claim waiting for the org reserve. Recorded by `request_payout` when the reserve
+/// is short; paid in full by `settle_pending_payout`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPayout {
+    pub org: Address,
+    /// The full payout owed (USDC base units, 7dp) — never a partial amount.
+    pub amount: i128,
+    pub recorded_at: u64,
 }
 
 #[contract]
@@ -464,29 +502,32 @@ impl Treasury {
         .publish(&env);
     }
 
-    /// Port of `requestPayout` (PAYOUT + caller == payout_receiver, when-not-paused). Debits
-    /// ONLY the policy's org reserve (revert `InsufficientOrgReserve` if short); transfers to
-    /// backend wallet; emits a solvency signal if remaining < required.
-    pub fn request_payout(env: Env, caller: Address, policy_id: u64, amount: i128) {
-        roles::require_role(&env, &caller, Role::Payout);
+    /// Port of `requestPayout` (PAYOUT + caller == payout_receiver, when-not-paused). Funded
+    /// ONLY from the policy's org reserve; transfers to the backend wallet and emits a solvency
+    /// signal if remaining < required.
+    ///
+    /// Returns `true` when the payout was made now. When the org reserve is short it no longer
+    /// reverts (which lost the claim once the determination aged out or the policy ended):
+    /// it records a pending payout for the FULL `amount`, adds it to the org's pending total
+    /// (which `reserve_required` includes, so the org cannot withdraw it), emits
+    /// `PayoutPending`, and returns `false`. `settle_pending_payout` pays it later.
+    pub fn request_payout(env: Env, caller: Address, policy_id: u64, amount: i128) -> bool {
+        require_payout_receiver(&env, &caller);
         require_not_paused(&env);
         instance_bump(&env);
 
-        if amount == 0 {
+        if amount <= 0 {
             panic_with_error!(&env, TreasuryError::ZeroAmount);
-        }
-        // Defense-in-depth: when the PayoutReceiver is wired, restrict callers to it.
-        if let Some(pr) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::PayoutReceiver)
-        {
-            if caller != pr {
-                panic_with_error!(&env, TreasuryError::NotPayoutReceiver);
-            }
         }
         if is_payout_processed(&env, policy_id) {
             panic_with_error!(&env, TreasuryError::PayoutAlreadyProcessed);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingPayout(policy_id))
+        {
+            panic_with_error!(&env, TreasuryError::PayoutAlreadyPending);
         }
         // Never pay out a policy whose premium was never collected.
         if !is_premium_received(&env, policy_id) {
@@ -497,57 +538,69 @@ impl Treasury {
         let org = resolve_org(&env, policy_id);
         let available = org_reserve_of(&env, &org);
         if available < amount {
-            // LOUD: the farmer is owed money and the backend must alert the org + admin.
+            // Record the claim instead of reverting. The farmer is owed money; the backend
+            // must alert the org + admin, and anyone may settle once the reserve is topped up.
+            let pending = PendingPayout {
+                org: org.clone(),
+                amount,
+                recorded_at: env.ledger().timestamp(),
+            };
+            set_persistent(&env, DataKey::PendingPayout(policy_id), &pending);
+            set_persistent(
+                &env,
+                DataKey::OrgPendingPayouts(org.clone()),
+                &(org_pending_payouts_of(&env, &org) + amount),
+            );
+            PayoutPending {
+                policy_id,
+                org,
+                amount,
+                available,
+            }
+            .publish(&env);
+            return false;
+        }
+
+        pay_out(&env, policy_id, &org, amount, available);
+        true
+    }
+
+    /// Pays a pending payout recorded by `request_payout`, in full, once the org reserve covers
+    /// it (PAYOUT + caller == payout_receiver, when-not-paused). Reverts `NoPendingPayout` if
+    /// none is recorded (never, or already settled) and `InsufficientOrgReserve` if the reserve
+    /// is still short. Marks the payout processed exactly as the immediate path does. Returns
+    /// the amount paid.
+    pub fn settle_pending_payout(env: Env, caller: Address, policy_id: u64) -> i128 {
+        require_payout_receiver(&env, &caller);
+        require_not_paused(&env);
+        instance_bump(&env);
+
+        let key = DataKey::PendingPayout(policy_id);
+        let pending: PendingPayout = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TreasuryError::NoPendingPayout));
+        let available = org_reserve_of(&env, &pending.org);
+        if available < pending.amount {
             panic_with_error!(&env, TreasuryError::InsufficientOrgReserve);
         }
 
-        // Update state BEFORE the external transfer (CEI).
-        set_payout_processed(&env, policy_id);
-        set_scalar(
+        // Clear the pending record and the org's pending total BEFORE paying (CEI).
+        env.storage().persistent().remove(&key);
+        set_persistent(
             &env,
-            &DataKey::TotalPayouts,
-            get_total_payouts(&env) + amount,
+            DataKey::OrgPendingPayouts(pending.org.clone()),
+            &(org_pending_payouts_of(&env, &pending.org) - pending.amount),
         );
-        let remaining = available - amount;
-        set_org_reserve(&env, &org, remaining);
-        set_scalar(
-            &env,
-            &DataKey::TotalOrgReserves,
-            get_total_org_reserves(&env) - amount,
-        );
-
-        // Transfer USDC to backend wallet (M-Pesa offramp). A contract auto-authorizes its own
-        // balance moves.
-        let backend: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::BackendWallet)
-            .unwrap();
-        usdc(&env).transfer(&env.current_contract_address(), &backend, &amount);
-
-        PayoutSent {
+        pay_out(&env, policy_id, &pending.org, pending.amount, available);
+        PendingPayoutSettled {
             policy_id,
-            recipient: backend,
-            amount,
+            org: pending.org,
+            amount: pending.amount,
         }
         .publish(&env);
-        OrgReserveDebited {
-            org: org.clone(),
-            policy_id,
-            amount,
-        }
-        .publish(&env);
-
-        // Non-reverting solvency signal.
-        let required = Self::reserve_required(env.clone(), org.clone());
-        if remaining < required {
-            ReserveBelowRequirement {
-                org,
-                remaining,
-                required,
-            }
-            .publish(&env);
-        }
+        pending.amount
     }
 
     /// Port of `depositReserve` (`from.require_auth()`, when-not-paused). Credits an org's
@@ -699,10 +752,26 @@ impl Treasury {
     // ---- views ----
 
     /// Port of `reserveRequired` = `outstanding * ratio_bps / 10000`.
+    ///
+    /// Plus the org's pending payouts: a claim already verified but not yet paid is owed in
+    /// full, so `withdraw_org_surplus` must not be able to take that money.
     pub fn reserve_required(env: Env, org: Address) -> i128 {
         let outstanding = PolicyManagerClient::new(&env, &require_policy_manager(&env))
             .org_outstanding_sum_insured(&org);
         outstanding * reserve_ratio_bps(&env, &org) / BPS_DENOMINATOR
+            + org_pending_payouts_of(&env, &org)
+    }
+
+    /// The pending payout recorded for `policy_id`, if any.
+    pub fn get_pending_payout(env: Env, policy_id: u64) -> Option<PendingPayout> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingPayout(policy_id))
+    }
+
+    /// Sum of `org`'s pending payouts.
+    pub fn org_pending_payouts(env: Env, org: Address) -> i128 {
+        org_pending_payouts_of(&env, &org)
     }
 
     /// Port of `getBalance` (USDC balance of this contract).
@@ -830,6 +899,86 @@ fn require_policy_manager(env: &Env) -> Address {
 /// no zero address, so `OrgNotResolved` is unreachable here — the callee raises on a missing org.
 fn resolve_org(env: &Env, policy_id: u64) -> Address {
     PolicyManagerClient::new(env, &require_policy_manager(env)).policy_org(&policy_id)
+}
+
+/// `Role::Payout` AND (when wired) `caller == payout_receiver` — defense-in-depth on every
+/// path that moves reserve money out to a claim.
+fn require_payout_receiver(env: &Env, caller: &Address) {
+    roles::require_role(env, caller, Role::Payout);
+    if let Some(pr) = env
+        .storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::PayoutReceiver)
+    {
+        if *caller != pr {
+            panic_with_error!(env, TreasuryError::NotPayoutReceiver);
+        }
+    }
+}
+
+/// Debit `amount` from `org`'s reserve (which holds `available`), mark the policy's payout
+/// processed, transfer to the backend wallet, and emit the payout events + solvency signal.
+/// Shared by the immediate and the pending-settlement paths so both settle identically.
+fn pay_out(env: &Env, policy_id: u64, org: &Address, amount: i128, available: i128) {
+    // Update state BEFORE the external transfer (CEI).
+    set_payout_processed(env, policy_id);
+    set_scalar(env, &DataKey::TotalPayouts, get_total_payouts(env) + amount);
+    let remaining = available - amount;
+    set_org_reserve(env, org, remaining);
+    set_scalar(
+        env,
+        &DataKey::TotalOrgReserves,
+        get_total_org_reserves(env) - amount,
+    );
+
+    // Transfer USDC to backend wallet (M-Pesa offramp). A contract auto-authorizes its own
+    // balance moves.
+    let backend: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::BackendWallet)
+        .unwrap();
+    usdc(env).transfer(&env.current_contract_address(), &backend, &amount);
+
+    PayoutSent {
+        policy_id,
+        recipient: backend,
+        amount,
+    }
+    .publish(env);
+    OrgReserveDebited {
+        org: org.clone(),
+        policy_id,
+        amount,
+    }
+    .publish(env);
+
+    // Non-reverting solvency signal.
+    let required = Treasury::reserve_required(env.clone(), org.clone());
+    if remaining < required {
+        ReserveBelowRequirement {
+            org: org.clone(),
+            remaining,
+            required,
+        }
+        .publish(env);
+    }
+}
+
+fn org_pending_payouts_of(env: &Env, org: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::OrgPendingPayouts(org.clone()))
+        .unwrap_or(0)
+}
+
+fn set_persistent<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: DataKey, v: &V) {
+    env.storage().persistent().set(&key, v);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
 }
 
 // ----- persistent per-org / per-policy accessors (with TTL bump on write) -----

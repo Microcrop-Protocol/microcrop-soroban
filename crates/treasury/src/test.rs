@@ -269,15 +269,25 @@ fn explicit_zero_fee_bps_is_honored_over_global() {
 // ---------------- Guards ----------------
 
 #[test]
-#[should_panic(expected = "#204")] // InsufficientOrgReserve
-fn payout_exceeding_org_reserve_reverts() {
+fn payout_exceeding_org_reserve_is_recorded_pending_not_paid() {
     let c = setup();
     c.pm().set_org(&1u64, &c.org);
     c.token_admin.mint(&c.backend, &1_000_000);
     c.treasury.receive_premium(&c.backend, &1u64, &1_000_000); // org reserve = 900_000
-                                                               // Ask for more than the org holds.
-    c.treasury
+
+    // Ask for more than the org holds: no revert, nothing paid, the full amount recorded.
+    let paid_now = c
+        .treasury
         .request_payout(&c.payout_receiver, &1u64, &900_001);
+    assert!(!paid_now);
+    assert_eq!(c.token.balance(&c.backend_wallet), 0);
+    assert_eq!(c.treasury.org_reserve(&c.org), 900_000);
+    assert!(!c.treasury.is_payout_processed(&1u64));
+    let pending = c.treasury.get_pending_payout(&1u64).unwrap();
+    assert_eq!(pending.amount, 900_001);
+    assert_eq!(pending.org, c.org);
+    assert_eq!(c.treasury.org_pending_payouts(&c.org), 900_001);
+    c.assert_solvent();
 }
 
 #[test]
@@ -589,4 +599,109 @@ fn premium_accepted_for_active_policy_on_its_end_date() {
     c.token_admin.mint(&c.backend, &1_000_000);
     c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
     assert!(c.treasury.is_premium_received(&1u64));
+}
+
+// ---------------- Pending payouts (findings 9 and 11) ----------------
+
+/// Premium of 1_000_000 for policy 1 (net 900_000 reserve), then a 2_000_000 payout that
+/// the reserve cannot cover, so it is recorded as pending.
+fn setup_with_pending<'a>() -> Ctx<'a> {
+    let c = setup();
+    c.pm().set_org(&1u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+    assert!(!c
+        .treasury
+        .request_payout(&c.payout_receiver, &1u64, &2_000_000));
+    c
+}
+
+#[test]
+fn pending_payout_is_part_of_reserve_required() {
+    let c = setup_with_pending();
+    c.pm().set_outstanding(&c.org, &1_000_000);
+    // 30% of outstanding + the full pending payout.
+    assert_eq!(c.treasury.reserve_required(&c.org), 300_000 + 2_000_000);
+    assert!(!c.treasury.meets_reserve_requirements(&c.org));
+
+    // Top up to exactly the requirement: still nothing withdrawable.
+    c.token_admin.mint(&c.org, &1_400_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &1_400_000);
+    assert_eq!(c.treasury.org_reserve(&c.org), 2_300_000);
+    let to = Address::generate(&c.env);
+    assert!(c
+        .treasury
+        .try_withdraw_org_surplus(&c.org, &1, &to)
+        .is_err());
+}
+
+#[test]
+fn settle_pending_payout_pays_the_full_amount_once() {
+    let c = setup_with_pending();
+
+    // Still short: reverts and keeps the record.
+    assert!(c
+        .treasury
+        .try_settle_pending_payout(&c.payout_receiver, &1u64)
+        .is_err());
+    assert!(c.treasury.get_pending_payout(&1u64).is_some());
+
+    // Top up and settle: exactly the recorded amount leaves, to the backend wallet.
+    c.token_admin.mint(&c.org, &1_100_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &1_100_000);
+    let paid = c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    assert_eq!(paid, 2_000_000);
+    assert_eq!(c.token.balance(&c.backend_wallet), 2_000_000);
+    assert_eq!(c.treasury.org_reserve(&c.org), 0);
+    assert!(c.treasury.is_payout_processed(&1u64));
+    assert!(c.treasury.get_pending_payout(&1u64).is_none());
+    assert_eq!(c.treasury.org_pending_payouts(&c.org), 0);
+    assert_eq!(c.treasury.get_total_payouts(), 2_000_000);
+    c.assert_solvent();
+}
+
+#[test]
+#[should_panic(expected = "#221")] // NoPendingPayout
+fn settle_pending_payout_twice_reverts() {
+    let c = setup_with_pending();
+    c.token_admin.mint(&c.org, &2_000_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &2_000_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+}
+
+#[test]
+#[should_panic(expected = "#222")] // PayoutAlreadyPending
+fn second_request_while_pending_reverts() {
+    let c = setup_with_pending();
+    c.treasury.request_payout(&c.payout_receiver, &1u64, &100);
+}
+
+#[test]
+#[should_panic(expected = "#203")] // PayoutAlreadyProcessed
+fn request_after_settlement_reverts() {
+    let c = setup_with_pending();
+    c.token_admin.mint(&c.org, &2_000_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &2_000_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    c.treasury.request_payout(&c.payout_receiver, &1u64, &100);
+}
+
+#[test]
+#[should_panic(expected = "#211")] // NotPayoutReceiver
+fn settle_pending_payout_only_from_payout_receiver() {
+    let c = setup_with_pending();
+    let rogue = Address::generate(&c.env);
+    c.treasury.grant_role(&c.admin, &Role::Payout, &rogue);
+    c.treasury.settle_pending_payout(&rogue, &1u64);
+}
+
+#[test]
+#[should_panic(expected = "#215")] // Paused
+fn settle_pending_payout_blocked_while_paused() {
+    let c = setup_with_pending();
+    c.token_admin.mint(&c.org, &2_000_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &2_000_000);
+    c.treasury.pause(&c.admin);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
 }

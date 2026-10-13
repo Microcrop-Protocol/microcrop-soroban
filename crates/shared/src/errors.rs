@@ -80,6 +80,11 @@ pub enum TreasuryError {
     PolicyNotOpenForPremium = 219,
     /// `receive_premium` for an ACTIVE policy whose coverage already ended (`now > end_date`).
     PolicyCoverageEnded = 220,
+    /// `settle_pending_payout` for a policy with no recorded pending payout (never recorded,
+    /// or already settled).
+    NoPendingPayout = 221,
+    /// `request_payout` for a policy that already has a recorded pending payout.
+    PayoutAlreadyPending = 222,
 }
 
 /// `PayoutReceiver` domain errors. Range 300..=399. Order mirrors the 12 validation steps.
@@ -105,6 +110,9 @@ pub enum PayoutError {
     FarmerClaimLimitExceeded = 315,
     DeterminationAlreadyConsumed = 316,
     InvalidSignature = 317,
+    // 318 is the crate-local `payout_receiver::PausedError::ContractPaused`.
+    /// `settle_pending_claim` for a policy with no claim awaiting funding.
+    NoPendingClaim = 319,
 }
 
 /// `PolicyNft` domain errors. Range 400..=499.

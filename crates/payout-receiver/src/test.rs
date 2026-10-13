@@ -84,6 +84,22 @@ impl MockPolicyManager {
             .instance()
             .set(&symbol_short!("claimed"), &(n + 1));
     }
+    pub fn mark_claim_pending(env: Env, _caller: Address, _policy_id: u64) {
+        let n: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("pending"))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("pending"), &(n + 1));
+    }
+    pub fn pending_calls(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("pending"))
+            .unwrap_or(0)
+    }
     pub fn increment_claim_count(env: Env, _caller: Address, _farmer: Address) {
         let n: u32 = env
             .storage()
@@ -114,7 +130,12 @@ pub struct MockTreasury;
 #[contractimpl]
 impl MockTreasury {
     pub fn __constructor(_env: Env) {}
-    pub fn request_payout(env: Env, _caller: Address, policy_id: u64, amount: i128) {
+    /// Simulate a short org reserve: `request_payout` records a pending payout and returns
+    /// false, and `settle_pending_payout` reverts while this stays true.
+    pub fn set_short(env: Env, v: bool) {
+        env.storage().instance().set(&symbol_short!("short"), &v);
+    }
+    pub fn request_payout(env: Env, _caller: Address, policy_id: u64, amount: i128) -> bool {
         env.storage()
             .instance()
             .set(&symbol_short!("pid"), &policy_id);
@@ -125,6 +146,48 @@ impl MockTreasury {
             .get(&symbol_short!("n"))
             .unwrap_or(0);
         env.storage().instance().set(&symbol_short!("n"), &(n + 1));
+        let short: bool = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("short"))
+            .unwrap_or(false);
+        if short {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("pamt"), &amount);
+        }
+        !short
+    }
+    pub fn settle_pending_payout(env: Env, _caller: Address, _policy_id: u64) -> i128 {
+        let short: bool = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("short"))
+            .unwrap_or(false);
+        if short {
+            panic!("reserve still short");
+        }
+        let amt: i128 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("pamt"))
+            .expect("no pending payout");
+        env.storage().instance().remove(&symbol_short!("pamt"));
+        let n: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("settled"))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("settled"), &(n + 1));
+        amt
+    }
+    pub fn settled_calls(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("settled"))
+            .unwrap_or(0)
     }
     pub fn last_pid(env: Env) -> u64 {
         env.storage()
@@ -155,6 +218,8 @@ struct Fixture {
     env: Env,
     client: PayoutReceiverClient<'static>,
     pr_addr: Address,
+    admin: Address,
+    pm: MockPolicyManagerClient<'static>,
     treasury: MockTreasuryClient<'static>,
     relayer: Address,
     sk: SigningKey,
@@ -252,10 +317,14 @@ fn setup() -> Fixture {
 
     let treasury = MockTreasuryClient::new(&env, &treasury_id);
 
+    let pm = MockPolicyManagerClient::new(&env, &pm_id);
+
     Fixture {
         env,
         client,
         pr_addr,
+        admin,
+        pm,
         treasury,
         relayer,
         sk,
@@ -640,4 +709,141 @@ fn signer_not_configured_rejected() {
     let (sig, recid) = sign(&env, &sk, &pr_addr, &domain, &d);
     let res = client.try_submit_determination(&relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::SignerNotConfigured.into())));
+}
+
+// ============ Pending claims (findings 9 and 11) ============
+
+#[test]
+fn short_reserve_records_a_pending_claim_instead_of_reverting() {
+    let f = setup();
+    f.treasury.set_short(&true);
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+
+    // Treasury was asked for the full amount and recorded it as pending.
+    assert_eq!(f.treasury.calls(), 1);
+    assert_eq!(f.treasury.last_amt(), 5_000_000_000);
+    // Policy marked CLAIM_PENDING, not CLAIMED; the claim still counts for the farmer.
+    assert_eq!(f.pm.pending_calls(), 1);
+    assert_eq!(f.pm.claimed_calls(), 0);
+    assert_eq!(f.pm.inc_calls(), 1);
+    // The determination is consumed and the claim is visible.
+    assert!(f.client.is_policy_paid(&1));
+    assert!(f.client.is_claim_pending(&1));
+    assert_eq!(f.client.get_report(&1).payout_amount, 5_000_000_000);
+}
+
+#[test]
+fn pending_claim_blocks_any_other_determination() {
+    let f = setup();
+    f.treasury.set_short(&true);
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+
+    // A different, validly signed determination for the same policy (higher damage, later
+    // assessment) cannot settle it.
+    f.env.ledger().set_timestamp(NOW + 60);
+    let mut d2 = base_det();
+    d2.weather_damage = 100;
+    d2.satellite_damage = 100;
+    d2.damage_percent_bp = 10_000;
+    d2.payout_amount = SUM_INSURED;
+    d2.assessed_at = NOW + 60;
+    let (sig2, recid2) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d2);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d2, &sig2, &recid2);
+    assert_eq!(res, Err(Ok(PayoutError::PolicyAlreadyPaid.into())));
+    assert_eq!(f.treasury.calls(), 1);
+}
+
+#[test]
+fn pending_claim_settles_in_full_after_report_age_and_end_date() {
+    let f = setup();
+    f.treasury.set_short(&true);
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+
+    // Long after MAX_REPORT_AGE and the policy's end_date, the reserve is topped up.
+    f.env.ledger().set_timestamp(NOW + 2_000_000);
+    f.treasury.set_short(&false);
+
+    // Permissionless: no auth at all.
+    f.env.set_auths(&[]);
+    f.client.settle_pending_claim(&1);
+
+    assert_eq!(f.treasury.settled_calls(), 1);
+    assert_eq!(f.pm.claimed_calls(), 1);
+    assert!(!f.client.is_claim_pending(&1));
+    assert!(f.client.is_policy_paid(&1));
+    // The claim was counted once, at approval; settlement does not count it again.
+    assert_eq!(f.pm.inc_calls(), 1);
+}
+
+#[test]
+fn pending_claim_cannot_be_settled_twice() {
+    let f = setup();
+    f.treasury.set_short(&true);
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+    f.treasury.set_short(&false);
+
+    f.client.settle_pending_claim(&1);
+    let res = f.client.try_settle_pending_claim(&1);
+    assert_eq!(res, Err(Ok(PayoutError::NoPendingClaim.into())));
+    assert_eq!(f.treasury.settled_calls(), 1);
+    assert_eq!(f.pm.claimed_calls(), 1);
+}
+
+#[test]
+fn settle_without_a_pending_claim_reverts() {
+    let f = setup();
+    let res = f.client.try_settle_pending_claim(&1);
+    assert_eq!(res, Err(Ok(PayoutError::NoPendingClaim.into())));
+
+    // A claim that paid at once leaves nothing to settle either.
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f.client.try_settle_pending_claim(&1);
+    assert_eq!(res, Err(Ok(PayoutError::NoPendingClaim.into())));
+}
+
+#[test]
+fn settle_while_reserve_still_short_reverts_and_keeps_the_claim() {
+    let f = setup();
+    f.treasury.set_short(&true);
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+
+    assert!(f.client.try_settle_pending_claim(&1).is_err());
+    // Atomic revert: the marker is still there and nothing was settled.
+    assert!(f.client.is_claim_pending(&1));
+    assert_eq!(f.treasury.settled_calls(), 0);
+    assert_eq!(f.pm.claimed_calls(), 0);
+}
+
+#[test]
+fn settle_is_blocked_while_paused() {
+    let f = setup();
+    f.treasury.set_short(&true);
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+    f.treasury.set_short(&false);
+
+    f.client.pause(&f.admin);
+    let res = f.client.try_settle_pending_claim(&1);
+    assert_eq!(res, Err(Ok(PausedError::ContractPaused.into())));
+    assert!(f.client.is_claim_pending(&1));
+
+    f.client.unpause(&f.admin);
+    f.client.settle_pending_claim(&1);
+    assert!(!f.client.is_claim_pending(&1));
 }

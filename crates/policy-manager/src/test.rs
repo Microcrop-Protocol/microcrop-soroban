@@ -755,3 +755,70 @@ fn expire_rejects_pending_and_closed_policies() {
         PolicyError::InvalidPolicyStatus as u32,
     );
 }
+
+// ---------------- Findings 9/11: CLAIM_PENDING ----------------
+
+#[test]
+fn claim_pending_policy_cannot_lapse_or_be_cancelled_and_settles_after_end_date() {
+    let c = setup();
+    let id = create_default(&c);
+    activate_default(&c, id);
+    let p = c.client.get_policy(&id);
+
+    c.client.mark_claim_pending(&c.oracle, &id);
+    assert_eq!(c.client.get_policy(&id).status, PolicyStatus::ClaimPending);
+    // Still holds its slot and its exposure until settled.
+    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 1);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
+
+    // Past end_date: cannot be expired, cannot be cancelled (not even by Admin).
+    c.env.ledger().set_timestamp(p.end_date + 1_000);
+    assert_err(
+        c.client.try_expire_policy(&id),
+        PolicyError::InvalidPolicyStatus as u32,
+    );
+    assert_err(
+        c.client.try_cancel_policy(&c.admin, &id),
+        PolicyError::InvalidPolicyStatus as u32,
+    );
+    // A second mark_claim_pending is refused.
+    assert_err(
+        c.client.try_mark_claim_pending(&c.oracle, &id),
+        PolicyError::InvalidPolicyStatus as u32,
+    );
+
+    // Settlement after end_date still works and releases slot + exposure exactly once.
+    c.client.mark_as_claimed(&c.oracle, &id);
+    assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Claimed);
+    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
+    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
+    assert_err(
+        c.client.try_mark_as_claimed(&c.oracle, &id),
+        PolicyError::InvalidPolicyStatus as u32,
+    );
+}
+
+#[test]
+fn mark_claim_pending_requires_oracle_and_live_active_cover() {
+    let c = setup();
+    let id = create_default(&c);
+    // PENDING (not activated) cannot become claim-pending.
+    assert_err(
+        c.client.try_mark_claim_pending(&c.oracle, &id),
+        PolicyError::InvalidPolicyStatus as u32,
+    );
+    activate_default(&c, id);
+    assert_err(
+        c.client.try_mark_claim_pending(&c.backend, &id),
+        CommonError::Unauthorized as u32,
+    );
+    let p = c.client.get_policy(&id);
+    c.env.ledger().set_timestamp(p.end_date + 1);
+    assert_err(
+        c.client.try_mark_claim_pending(&c.oracle, &id),
+        PolicyError::PolicyExpired as u32,
+    );
+}

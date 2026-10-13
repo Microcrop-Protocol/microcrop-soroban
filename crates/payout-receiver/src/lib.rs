@@ -34,7 +34,14 @@
 //! 12. signature: `secp256k1_recover(digest, sig, recovery_id) == authorized_signer`
 //!
 //! Effects before interactions (CEI): mark consumed + paid + store report, THEN
-//! `treasury.request_payout`, `pm.mark_as_claimed`, `pm.increment_claim_count`.
+//! `treasury.request_payout`, then `pm.mark_as_claimed` (paid now) or `pm.mark_claim_pending`
+//! (org reserve short: Treasury recorded a pending payout), then `pm.increment_claim_count`.
+//!
+//! ## Pending claims (audit findings 9 and 11)
+//! A valid determination is never lost to a short org reserve. Treasury records the full
+//! amount as a pending payout (counted in the org's `reserve_required`, so the org cannot
+//! withdraw it), the policy becomes CLAIM_PENDING, and the permissionless
+//! [`PayoutReceiver::settle_pending_claim`] pays it once the reserve is topped up.
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
@@ -122,6 +129,25 @@ pub struct PayoutInitiated {
     pub amount: i128,
 }
 
+/// A verified claim could not be paid from the org reserve; it is recorded and settles via
+/// `settle_pending_claim` once the reserve covers it.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimAwaitingFunding {
+    #[topic]
+    pub policy_id: u64,
+    pub amount: i128,
+}
+
+/// A pending claim was paid in full.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingClaimSettled {
+    #[topic]
+    pub policy_id: u64,
+    pub amount: i128,
+}
+
 /// Storage keys. Config + signer + domain + paused are instance; report/paid persistent;
 /// the replay guard is temporary (freshness window makes long-lived persistence unnecessary).
 #[contracttype]
@@ -139,8 +165,12 @@ pub enum DataKey {
     Paused,
     /// policy_id -> DamageReport.
     Report(u64),
-    /// policy_id -> paid?
+    /// policy_id -> settled? Set when a determination is accepted, whether the payout went
+    /// out at once or was recorded as pending, so no second determination can settle the
+    /// policy. (`is_policy_paid` reads this; `is_claim_pending` tells the two apart.)
     PolicyPaid(u64),
+    /// policy_id -> verified claim waiting for the org reserve (see `settle_pending_claim`).
+    ClaimPending(u64),
     /// reconstructed preimage hash -> consumed? (temporary storage; guards distinct-preimage
     /// replay within the unpaid freshness window).
     ConsumedDetermination(BytesN<32>),
@@ -418,12 +448,30 @@ impl PayoutReceiver {
         // enforce `caller == payout_receiver` / role checks; a contract auto-authorizes calls
         // it makes under its own address. Treasury.request_payout is the third replay layer
         // (its `PayoutProcessed(policy_id)` guard).
-        TreasuryClient::new(&env, &treasury).request_payout(
+        //
+        // A short org reserve no longer reverts the determination (audit findings 9/11):
+        // Treasury records a pending payout for the full amount and returns false, the policy
+        // moves to CLAIM_PENDING (so it cannot expire, be cancelled, or be settled by another
+        // determination), and `settle_pending_claim` pays it once the reserve covers it. The
+        // replay guards above are already set, so the determination is consumed either way.
+        let paid_now = TreasuryClient::new(&env, &treasury).request_payout(
             &this,
             &d.on_chain_policy_id,
             &d.payout_amount,
         );
-        pm.mark_as_claimed(&this, &d.on_chain_policy_id);
+        if paid_now {
+            pm.mark_as_claimed(&this, &d.on_chain_policy_id);
+        } else {
+            pm.mark_claim_pending(&this, &d.on_chain_policy_id);
+            s.persistent()
+                .set(&DataKey::ClaimPending(d.on_chain_policy_id), &true);
+            s.persistent().extend_ttl(
+                &DataKey::ClaimPending(d.on_chain_policy_id),
+                PERSIST_THRESHOLD,
+                PERSIST_BUMP,
+            );
+        }
+        // The claim counts against the farmer's window when it is approved, paid or not.
         pm.increment_claim_count(&this, &policy.farmer);
 
         // Events (mirror Solidity DeterminationVerified / DamageReportReceived / PayoutInitiated).
@@ -439,14 +487,76 @@ impl PayoutReceiver {
             payout_amount: d.payout_amount,
         }
         .publish(&env);
-        PayoutInitiated {
-            policy_id: d.on_chain_policy_id,
-            amount: d.payout_amount,
+        if paid_now {
+            PayoutInitiated {
+                policy_id: d.on_chain_policy_id,
+                amount: d.payout_amount,
+            }
+            .publish(&env);
+        } else {
+            ClaimAwaitingFunding {
+                policy_id: d.on_chain_policy_id,
+                amount: d.payout_amount,
+            }
+            .publish(&env);
         }
-        .publish(&env);
+    }
+
+    /// Settle a claim that `submit_determination` verified but the org reserve could not pay.
+    /// PERMISSIONLESS: anyone (the org, a keeper, the farmer's agent) may call it once the org
+    /// reserve covers the claim. Pays the FULL recorded amount through
+    /// `Treasury::settle_pending_payout`, then marks the policy CLAIMED exactly as the normal
+    /// path does. Not re-verified: the signature, freshness and coverage window were checked
+    /// when the claim was recorded, so neither `MAX_REPORT_AGE` nor `end_date` can lapse it.
+    ///
+    /// Reverts `NoPendingClaim` if nothing is pending for `policy_id` (never recorded, or
+    /// already settled), `ContractPaused` while paused, and Treasury's
+    /// `InsufficientOrgReserve` while the reserve is still short.
+    pub fn settle_pending_claim(env: Env, policy_id: u64) {
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, PausedError::ContractPaused);
+        }
+        let s = env.storage();
+        s.instance().extend_ttl(INSTANCE_THRESHOLD, INSTANCE_BUMP);
+
+        let key = DataKey::ClaimPending(policy_id);
+        if !s.persistent().get(&key).unwrap_or(false) {
+            panic_with_error!(&env, PayoutError::NoPendingClaim);
+        }
+        // Effects before interactions: clear the marker first.
+        s.persistent().remove(&key);
+
+        let policy_manager: Address = s
+            .instance()
+            .get(&DataKey::PolicyManager)
+            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
+        let treasury: Address = s
+            .instance()
+            .get(&DataKey::Treasury)
+            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
+        let this = env.current_contract_address();
+
+        let amount = TreasuryClient::new(&env, &treasury).settle_pending_payout(&this, &policy_id);
+        PolicyManagerClient::new(&env, &policy_manager).mark_as_claimed(&this, &policy_id);
+
+        PendingClaimSettled { policy_id, amount }.publish(&env);
+        PayoutInitiated { policy_id, amount }.publish(&env);
     }
 
     // ---- views ----
+
+    /// True while a verified claim for `policy_id` is waiting for the org reserve.
+    pub fn is_claim_pending(env: Env, policy_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClaimPending(policy_id))
+            .unwrap_or(false)
+    }
 
     /// Port of `getReport`. Returns a zeroed report for an unknown policy (Solidity mapping
     /// default-value semantics).

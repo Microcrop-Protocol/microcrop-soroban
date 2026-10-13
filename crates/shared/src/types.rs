@@ -24,7 +24,8 @@ pub enum CoverageType {
     Comprehensive = 4,
 }
 
-/// Policy lifecycle states — ordinals 0..4 preserved from `PolicyManager.PolicyStatus`.
+/// Policy lifecycle states — ordinals 0..4 preserved from `PolicyManager.PolicyStatus`;
+/// `ClaimPending` (5) is Soroban-only.
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -34,6 +35,11 @@ pub enum PolicyStatus {
     Expired = 2,
     Cancelled = 3,
     Claimed = 4,
+    /// A valid determination was verified but the org reserve could not pay it in full. The
+    /// claim is recorded in Treasury and settles via `PayoutReceiver::settle_pending_claim`
+    /// once the reserve covers it. The policy cannot expire, be cancelled, or be settled by
+    /// another determination while in this state; it moves to `Claimed` on settlement.
+    ClaimPending = 5,
 }
 
 /// Access-control roles. Replaces the `keccak256("..._ROLE")` `bytes32` role ids of

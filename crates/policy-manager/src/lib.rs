@@ -133,6 +133,15 @@ pub struct PolicyClaimed {
     pub claimed_at: u64,
 }
 
+/// A verified claim is waiting for the org reserve (ACTIVE -> CLAIM_PENDING).
+#[contractevent]
+#[derive(Clone)]
+pub struct PolicyClaimPending {
+    #[topic]
+    pub policy_id: u64,
+    pub recorded_at: u64,
+}
+
 /// `PolicyCancelled(policyId, cancelledAt)`.
 #[contractevent]
 #[derive(Clone)]
@@ -441,18 +450,25 @@ impl PolicyManager {
         .publish(&env);
     }
 
-    /// Port of `markAsClaimed` (ORACLE = PayoutReceiver). ACTIVE->CLAIMED, decrements active
-    /// count, releases org exposure, deactivates NFT (best-effort).
+    /// Port of `markAsClaimed` (ORACLE = PayoutReceiver). ACTIVE or CLAIM_PENDING -> CLAIMED,
+    /// decrements active count, releases org exposure, deactivates NFT (best-effort).
+    ///
+    /// An ACTIVE policy must still be within its coverage window. A CLAIM_PENDING policy is
+    /// not checked against `end_date`: its determination was verified inside the window and
+    /// the claim is only waiting for the org reserve, so it must not lapse.
     pub fn mark_as_claimed(env: Env, caller: Address, policy_id: u64) {
         roles::require_role(&env, &caller, Role::Oracle);
 
         let mut policy = Self::load_policy(&env, policy_id);
 
-        if policy.status != PolicyStatus::Active {
-            panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
-        }
-        if env.ledger().timestamp() > policy.end_date {
-            panic_with_error!(&env, PolicyError::PolicyExpired);
+        match policy.status {
+            PolicyStatus::Active => {
+                if env.ledger().timestamp() > policy.end_date {
+                    panic_with_error!(&env, PolicyError::PolicyExpired);
+                }
+            }
+            PolicyStatus::ClaimPending => {}
+            _ => panic_with_error!(&env, PolicyError::InvalidPolicyStatus),
         }
 
         policy.status = PolicyStatus::Claimed;
@@ -466,6 +482,32 @@ impl PolicyManager {
         PolicyClaimed {
             policy_id,
             claimed_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// ORACLE (PayoutReceiver). ACTIVE -> CLAIM_PENDING: a valid determination was verified
+    /// but the org reserve cannot pay it yet. The policy keeps its active slot, its org
+    /// exposure and its soulbound certificate until `mark_as_claimed` settles it; it cannot
+    /// be expired or cancelled meanwhile. No port equivalent in Solidity (audit findings 9/11).
+    pub fn mark_claim_pending(env: Env, caller: Address, policy_id: u64) {
+        roles::require_role(&env, &caller, Role::Oracle);
+
+        let mut policy = Self::load_policy(&env, policy_id);
+        if policy.status != PolicyStatus::Active {
+            panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
+        }
+        if env.ledger().timestamp() > policy.end_date {
+            panic_with_error!(&env, PolicyError::PolicyExpired);
+        }
+
+        policy.status = PolicyStatus::ClaimPending;
+        Self::save_policy(&env, &policy);
+
+        Self::bump_instance(&env);
+        PolicyClaimPending {
+            policy_id,
+            recorded_at: env.ledger().timestamp(),
         }
         .publish(&env);
     }
