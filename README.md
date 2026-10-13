@@ -93,12 +93,12 @@ cargo build --target wasm32v1-none --release   ->  4/4 WASM contracts built
     microcrop_payout_receiver.wasm   ~52 KB
     microcrop_policy_nft.wasm        ~32 KB
 
-cargo test --workspace                         ->  118/118 passed, 0 failed
-    microcrop-treasury          38 passed   (premium split, per-org solvency, pending payouts, 7dp)
-    microcrop-policy-manager    31 passed   (lifecycle, caps, claim window, exposure, roles)
+cargo test --workspace                         ->  124/124 passed, 0 failed
+    microcrop-treasury          40 passed   (premium split, per-org solvency, pending payouts, 7dp)
+    microcrop-policy-manager    34 passed   (lifecycle, caps, claim window, exposure, roles)
     microcrop-payout-receiver   27 passed   (real secp256k1 sign→recover round-trip, pending claims)
     microcrop-policy-nft        12 passed   (mint, soulbound transfer, PM-only status, paging)
-    microcrop-integration-tests 10 passed   (all four real contracts on one Env)
+    microcrop-integration-tests 11 passed   (all four real contracts on one Env)
     microcrop-shared             0 tests    (types/errors only)
 ```
 
@@ -117,6 +117,7 @@ cargo test --workspace                         ->  118/118 passed, 0 failed
 4. **Per-org solvency.** Payouts debit only the policy's org reserve. If it is short, the
    verified claim is recorded as a pending payout for the full amount (never dropped,
    never paid partially) and `settle_pending_claim` pays it once the reserve covers it;
+   a new claim is paid at once only from the reserve not owed to pending claims;
    `reserve_required = outstanding_sum_insured * ratio_bps / 10_000 + pending payouts`,
    with a 30% ratio floor; withdrawals are surplus-only; the invariant
    `usdc.balance(this) >= Σ org_reserve + accumulated_fees` holds after every op.

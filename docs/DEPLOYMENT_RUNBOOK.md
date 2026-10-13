@@ -182,11 +182,20 @@ stellar contract invoke --id "$PR" --network testnet --source <any funded key> \
 ```
 
 Watch for `PayoutPending` / `ClaimAwaitingFunding` events, alert the org, and settle after
-the top-up. Settlement works after the policy's `end_date` and after `MAX_REPORT_AGE`; it is
+the top-up. While an org has pending claims, a new claim is paid at once only from the
+reserve not already owed to them; otherwise it is recorded as pending too. Settlement works after the policy's `end_date` and after `MAX_REPORT_AGE`; it is
 blocked only while PayoutReceiver or Treasury is paused.
 
 **Expiry is permissionless.** `expire_policy(policy_id)` needs no role once
 `now > end_date`; a keeper can run it to release the org's reserve and the farmer's slot.
+This includes PENDING policies that were never activated (their `end_date` is creation time
+plus duration); a lapsed PENDING policy can no longer be activated. A premium already paid on
+it stays in the org reserve, so any refund is off-chain.
+
+**Every farmer needs their own address.** The open-policy cap (3, counting claims in the
+last 365 days) is per farmer `Address`. If the backend falls back to one shared wallet for
+farmers without a wallet, as the EVM backend does with `backendWallet`, the cap applies to
+the whole platform.
 
 **Cancelling ACTIVE cover is Admin-only.** The backend key can cancel PENDING policies. An
 ACTIVE policy can be cancelled only by the admin key (escape hatch); a claim-pending policy

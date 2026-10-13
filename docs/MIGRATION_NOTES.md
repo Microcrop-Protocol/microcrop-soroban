@@ -134,8 +134,9 @@ distributor index preserved but stored one entry per token and read in pages
    UUPS), so there is no `upgrade` fn — matching source. The other three keep `upgrade`.
 6. **Explicit `caller` + `require_auth`** everywhere replaces implicit `msg.sender`.
 7. **Storage TTL / rent.** Every persistent/instance/temporary entry gets an explicit
-   `extend_ttl` bump (persistent ~30–90d, instance ~7–30d, temporary short) — there is no
-   EVM equivalent; entries can be archived if TTL lapses.
+   `extend_ttl` bump (persistent ~400d requested, clamped by the host to the network
+   maximum; roles ~90d; instance ~7–30d; temporary short) — there is no EVM equivalent;
+   entries can be archived if TTL lapses. Paged index reads extend each entry they read.
 8. **Events use `#[contractevent]`.** `env.events().publish(...)` is deprecated in SDK 27;
    `#[topic]` fields replace Solidity `indexed`. Some zero-value "previous value" event
    fields were dropped (no zero Address to emit).
@@ -230,10 +231,10 @@ preparation build into a real migration.
       ~90 days on grant and use, but the host clamps to the network `max_entry_ttl`, which
       on mainnet is shorter than a 365-day policy. Entries then archive and are restored on
       access; measure the restore cost inside the relayer's 3600 s freshness window.
-- [ ] **Pending payouts are not earmarked against new claims.** While an org has a pending
-      payout, a later claim that fits in the reserve is still paid at once, which can delay
-      the older pending one. `reserve_required` stops the org from withdrawing the money;
-      claim ordering between farmers is not enforced on-chain.
+- [ ] **Order among pending claims.** A new claim is paid at once only from the part of
+      the reserve not owed to pending claims, so it queues behind them. Pending claims
+      themselves can be settled in any order by anyone; strict first-come order would need
+      a per-org queue index.
 
 **Product parity not ported**
 - [ ] **Non-custodial target contracts** — replace mandatory `Treasury` custody with
@@ -264,8 +265,21 @@ preparation build into a real migration.
 | 8 | premium credited to a closed policy | read the policy; PENDING, or ACTIVE and not ended | `PolicyNotOpenForPremium` (219), `PolicyCoverageEnded` (220) |
 | 9, 11 | a short reserve reverted a valid claim with no record; it then lapsed | **pending claims**: Treasury records the full payout, the policy becomes `ClaimPending` (cannot expire, be cancelled, or be settled by another determination), `reserve_required` includes it, and anyone can call `PayoutReceiver.settle_pending_claim(policy_id)` once the reserve covers it | `request_payout -> bool`; new `settle_pending_payout`, `get_pending_payout`, `org_pending_payouts`, `mark_claim_pending`, `settle_pending_claim`, `is_claim_pending`; `PolicyStatus::ClaimPending = 5`; errors 221, 222, 319 |
 
-Leads fixed alongside: role grants extend their TTL on grant and on use; per-policy flags
-in Treasury and PayoutReceiver request ~400 days instead of 90 / 30.
+Leads fixed alongside: role grants extend their TTL on grant and on use; persistent
+entries in all four contracts request ~400 days (was 30 / 90), and paged reads extend the
+index entries they read.
+
+Review follow-ups in the same PR:
+- A PENDING policy past its `end_date` (creation + duration) can be expired by anyone,
+  which releases its org exposure and pending slot; `activate_policy` refuses a lapsed
+  PENDING policy (`PolicyExpired`, 111).
+- `request_payout` pays at once only from `org_reserve − org_pending_payouts`, so a new
+  claim cannot take money held for an older pending claim.
+- `mark_claim_pending` releases the active slot and the org exposure (the claim already
+  counts as a claim in the window and as a pending payout), so a ClaimPending policy is
+  not counted twice; `mark_as_claimed` from ClaimPending releases nothing again.
+- `settle_pending_payout` reverts `NotConfigured` (3) unless the PayoutReceiver is wired.
+- `scripts/deploy.sh` checks `decimals() == 7` on `USDC_SAC` before deploying anything.
 
 ## 7. Bottom line
 
