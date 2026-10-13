@@ -2,8 +2,11 @@
 
 **Honest framing:** this workspace is a **preparation port**, not a completed migration.
 The four contracts are faithfully re-implemented in Rust, compile to `wasm32v1-none`
-WASM, and pass their unit suites (66 tests). They have **not** been deployed, integrated
-with the off-chain stack, security-audited on Soroban, or reconciled with live state.
+WASM, and pass their unit and integration suites (118 tests). They have **not** been
+deployed, integrated with the off-chain stack, or reconciled with live state. An AI-assisted
+Soroban review (2026-10) found 11 issues; all are fixed on this code (see
+[§6](#6-audit-fixes-2026-10--where-the-port-now-departs-from-the-solidity)), but that review
+is not a substitute for an independent audit.
 The [DEFERRED](#deferred--not-yet-done) section is the load-bearing part of this document.
 
 **Product-architecture decision (2026-08-21):** the faithful Treasury port is now a
@@ -55,22 +58,29 @@ PolicyManager/Treasury v3.1.0, PayoutReceiver v2.1.0).
 ## 2. Per-contract mapping & what is PRESERVED
 
 ### PolicyManager (`crates/policy-manager`) ← PolicyManager.sol v3.1.0
-Preserved 1:1: sum/premium/duration bounds; combined open-policy cap (ACTIVE+PENDING ≤ 5,
-Finding 5); PENDING→ACTIVE window reset preserving duration; per-org **outstanding
-exposure** accounting (accrue on activate, release on claim/cancel/expire) that drives
-Treasury solvency; claim cap (≤ 3/farmer/year, year = `ts / (365*86400)`); id starts at 1;
+Preserved: duration bounds; PENDING→ACTIVE window reset preserving duration; per-org
+**outstanding exposure** accounting that drives Treasury solvency; id starts at 1;
 `PendingCounted` flag (Finding 8). NFT status updates are **best-effort** via the fallible
 `try_update_policy_status` client (Soroban equivalent of Solidity `try/catch`) so lifecycle
-transitions can never be bricked. Roles: create/activate/cancel/expire = `Backend`;
-mark_as_claimed/increment_claim_count = `Oracle`; setters = `Admin`; upgrade = `Upgrader`.
+transitions can never be bricked. Changed by the 2026-10 audit fixes (§6): sum bounds in
+7dp; exposure accrues at **create** (release on cancel/expire/claim); open cap is
+`open (ACTIVE+PENDING) + claims in the rolling window ≤ 3`; claim cap is 3 per rolling
+365 days (not a calendar-year bucket); farmer index is paginated; new `ClaimPending`
+status. Roles: create/activate = `Backend`; cancel PENDING = `Backend` or `Admin`, cancel
+ACTIVE = `Admin` only; expire = anyone after `end_date`;
+mark_as_claimed/mark_claim_pending/increment_claim_count = `Oracle`; setters = `Admin`;
+upgrade = `Upgrader`.
 
 ### Treasury (`crates/treasury`) ← Treasury.sol v3.1.0
 Money math preserved 1:1: premium split `fee = amount * fee_bps(org) / 10_000`;
 per-org reserve credit; `receive_premium` pulls USDC from caller (`TokenClient::transfer`);
-`request_payout` funds **only** from the policy's org reserve (`InsufficientOrgReserve` if
-short); surplus-only withdrawals (`WouldBreachReserve`); `reserve_required` read from
-PolicyManager's `org_outstanding_sum_insured`; `emergency_withdraw` touches only *unbacked*
-surplus (`balance − Σ reserves − fees`). CEI ordering (effects before the USDC interaction)
+`request_payout` funds **only** from the policy's org reserve; surplus-only withdrawals
+(`WouldBreachReserve`); `emergency_withdraw` touches only *unbacked* surplus
+(`balance − Σ reserves − fees`). Changed by §6: a short reserve records a **pending
+payout** instead of reverting (`settle_pending_payout` pays it later);
+`reserve_required = outstanding × ratio + pending payouts`; reserve ratio default and
+floor 30%; `receive_premium` only for PENDING, or ACTIVE-and-not-ended, policies; the
+constructor refuses a token whose `decimals() != 7`. CEI ordering (effects before the USDC interaction)
 kept. Solvency invariant `balance ≥ total_org_reserves + accumulated_fees` asserted in tests.
 Roles: `receive_premium` = `Backend`; `request_payout` = `Payout` **and** `caller ==
 payout_receiver`; reserve/fee setters = `Admin`.
@@ -84,7 +94,9 @@ on-chain** and compared to the signed value; freshness (`MAX_REPORT_AGE=3600`, s
 farmer claim limit; on-chain digest reconstruction via `shared::encoding::
 determination_digest`; `secp256k1_recover` byte-compared to the stored SEC-1 65-byte key;
 **triple replay guard** (temporary `ConsumedDetermination` + persistent `PolicyPaid` +
-Treasury `PayoutProcessed`). The contract passes `env.current_contract_address()` as the
+Treasury `PayoutProcessed`). Added by §6: when Treasury reports a short reserve the policy
+becomes `ClaimPending` and the permissionless `settle_pending_claim(policy_id)` pays it in
+full later. The contract passes `env.current_contract_address()` as the
 `caller` to its Treasury/PolicyManager sub-invocations (a contract auto-authorizes its own
 sub-calls).
 
@@ -92,7 +104,8 @@ sub-calls).
 `tokenId == policyId`; `policy_id == 0` rejected (reserved sentinel); re-mint rejected;
 **soulbound while active** (`transfer` reverts `TransferWhileActive` if `cert.is_active`);
 `update_policy_status` callable **only** by the stored PolicyManager address (Finding 6);
-distributor index preserved. Minter role gates `mint_policy`.
+distributor index preserved but stored one entry per token and read in pages
+(`get_distributor_policies(distributor, start, limit)`, §6). Minter role gates `mint_policy`.
 
 ---
 
@@ -109,7 +122,12 @@ distributor index preserved. Minter role gates `mint_policy`.
    `set_network_domain` (Admin, port-only new setter). **The off-chain Lit PKP signer MUST
    use the identical 32 bytes**, or every signature fails recovery.
 3. **USDC = SEP-41 Stellar Asset Contract**, not ERC-20. Balances via `TokenClient`; the
-   contract holds SAC balances directly (no trustline provisioning in-contract).
+   contract holds SAC balances directly (no trustline provisioning in-contract). **Stellar
+   USDC has 7 decimals, not 6**: 1 USDC = 10_000_000 base units. Every amount constant is
+   restated in 7dp (`MIN_SUM_INSURED = 1_000_000_000` = 100 USDC, `MAX_SUM_INSURED =
+   10_000_000_000_000` = 1,000,000 USDC) and `Treasury.__constructor` panics
+   `UsdcDecimalsMismatch` (217) unless the token reports `decimals() == 7`. The Lit signer
+   must scale amounts by 1e7 on Stellar and keep 1e6 on Base.
 4. **On-chain SVG/JSON `tokenURI` dropped** from PolicyNFT. Rendered off-chain from the
    stored `PolicyCertificate`. `baseExternalURI` also dropped.
 5. **PolicyNFT is not upgradeable.** The Solidity `PolicyNFT` is plain AccessControl (no
@@ -201,8 +219,21 @@ preparation build into a real migration.
       returning a sentinel; confirm no Soroban caller depends on the old address(0) behavior.
 - [ ] **Fuzz / property tests** for the payout math and the encoder byte layout are not
       written (the encoder is the single most replay-sensitive surface).
-- [ ] `cargo clippy` was not run (clippy component not installed in this environment); a lint
-      pass is deferred.
+- [x] ~~`cargo clippy` was not run~~ — now run as a local gate. 7 warnings pre-date the
+      audit fixes (duplicated test attributes, two needless borrows, one manual range
+      check); the fixes added none. `cargo fmt --all -- --check` is clean.
+- [ ] **Lit signer amount scaling.** `microcrop-lit-oracle/lit-actions/crop-oracle.js:231`
+      scales `sumInsured` by `1e6`. The Stellar path must scale by `1e7` while the Base path
+      stays at `1e6`, so the change has to be chain-aware. Until it ships, every Stellar
+      determination fails `SumInsuredMismatch`.
+- [ ] **TTL against real network limits.** Per-policy flags now request ~400 days, roles
+      ~90 days on grant and use, but the host clamps to the network `max_entry_ttl`, which
+      on mainnet is shorter than a 365-day policy. Entries then archive and are restored on
+      access; measure the restore cost inside the relayer's 3600 s freshness window.
+- [ ] **Pending payouts are not earmarked against new claims.** While an org has a pending
+      payout, a later claim that fits in the reserve is still paid at once, which can delay
+      the older pending one. `reserve_required` stops the org from withdrawing the money;
+      claim ordering between farmers is not enforced on-chain.
 
 **Product parity not ported**
 - [ ] **Non-custodial target contracts** — replace mandatory `Treasury` custody with
@@ -218,7 +249,25 @@ preparation build into a real migration.
 
 ---
 
-## 6. Bottom line
+## 6. Audit fixes (2026-10) — where the port now departs from the Solidity
+
+| # | Finding | Fix | Behaviour change for callers |
+|---|---|---|---|
+| 1 | `PolicyNft` distributor list grew one entry until activation failed (~5,450 ids) | one persistent entry per token + a count | `get_distributor_policies(distributor, start, limit)`, `get_distributor_policy_count`; pages capped at 50 |
+| 10 | `PolicyManager` farmer list, same problem on `create_policy` | same pattern | `get_farmer_policies(farmer, start, limit)`, `get_farmer_policy_count`; pages capped at 50 |
+| 2 | reserve floor 20% < smallest payout 30% | `DEFAULT_RESERVE_RATIO_BPS = MIN_RESERVE_RATIO_BPS = 3_000` | `set_org_reserve_ratio_bps` below 3000 reverts `ReserveRatioTooLow` (218) |
+| 3 | 5 open policies against 3 claims; fixed-year bucket let 6 claims pay | rolling 365-day window over the last 3 claim timestamps; `MAX_ACTIVE_POLICIES_PER_FARMER = 3` and `create_policy` counts open policies **plus** claims in the window | **product rule**: a farmer with 3 claims in the last 365 days cannot buy new cover until the oldest ages out. `get_farmer_claim_count(farmer)` (no year), `get_farmer_claim_times`; `get_current_year` removed |
+| 4 | a PENDING policy's premium was withdrawable surplus | exposure counted at `create_policy`, released on every exit exactly once | `org_outstanding_sum_insured` includes PENDING policies |
+| 5 | amounts in 6dp, Stellar USDC is 7dp | constants restated; constructor checks `decimals() == 7` | see §3.3; signer follow-up in §5 |
+| 6 | Backend could cancel ACTIVE cover after a loss | Backend cancels PENDING only; ACTIVE needs Admin | `CancelActiveRequiresAdmin` (116) |
+| 7 | only Backend could expire an ended policy | permissionless; `now > end_date` is the gate; repeat call is a no-op | `expire_policy(policy_id)` (no caller); event `PolicyExpired` |
+| 8 | premium credited to a closed policy | read the policy; PENDING, or ACTIVE and not ended | `PolicyNotOpenForPremium` (219), `PolicyCoverageEnded` (220) |
+| 9, 11 | a short reserve reverted a valid claim with no record; it then lapsed | **pending claims**: Treasury records the full payout, the policy becomes `ClaimPending` (cannot expire, be cancelled, or be settled by another determination), `reserve_required` includes it, and anyone can call `PayoutReceiver.settle_pending_claim(policy_id)` once the reserve covers it | `request_payout -> bool`; new `settle_pending_payout`, `get_pending_payout`, `org_pending_payouts`, `mark_claim_pending`, `settle_pending_claim`, `is_claim_pending`; `PolicyStatus::ClaimPending = 5`; errors 221, 222, 319 |
+
+Leads fixed alongside: role grants extend their TTL on grant and on use; per-policy flags
+in Treasury and PayoutReceiver request ~400 days instead of 90 / 30.
+
+## 7. Bottom line
 
 The Rust/Soroban re-implementation is **complete and green** as a parity/reference
 version: it builds to WASM on the correct target and its tests preserve the old model's

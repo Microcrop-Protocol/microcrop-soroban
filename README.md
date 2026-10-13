@@ -88,16 +88,17 @@ Package names (for `-p`): `microcrop-shared`, `microcrop-policy-manager`,
 
 ```
 cargo build --target wasm32v1-none --release   ->  4/4 WASM contracts built
-    microcrop_policy_manager.wasm    ~44 KB
-    microcrop_treasury.wasm          ~47 KB
-    microcrop_payout_receiver.wasm   ~44 KB
-    microcrop_policy_nft.wasm        ~27 KB
+    microcrop_policy_manager.wasm    ~52 KB
+    microcrop_treasury.wasm          ~64 KB
+    microcrop_payout_receiver.wasm   ~52 KB
+    microcrop_policy_nft.wasm        ~32 KB
 
-cargo test                                     ->  66/66 passed, 0 failed
-    microcrop-payout-receiver   20 passed   (real secp256k1 sign→recover round-trip)
-    microcrop-treasury          18 passed   (premium split, per-org solvency, replay)
-    microcrop-policy-manager    17 passed   (lifecycle, caps, exposure, roles)
-    microcrop-policy-nft        11 passed   (mint, soulbound transfer, PM-only status)
+cargo test --workspace                         ->  118/118 passed, 0 failed
+    microcrop-treasury          38 passed   (premium split, per-org solvency, pending payouts, 7dp)
+    microcrop-policy-manager    31 passed   (lifecycle, caps, claim window, exposure, roles)
+    microcrop-payout-receiver   27 passed   (real secp256k1 sign→recover round-trip, pending claims)
+    microcrop-policy-nft        12 passed   (mint, soulbound transfer, PM-only status, paging)
+    microcrop-integration-tests 10 passed   (all four real contracts on one Env)
     microcrop-shared             0 tests    (types/errors only)
 ```
 
@@ -113,10 +114,13 @@ cargo test                                     ->  66/66 passed, 0 failed
    The signed `payout_amount` is verified against the re-derived value, never trusted.
 3. **Triple replay guard.** temporary `ConsumedDetermination(digest)` + persistent
    `PolicyPaid(policy_id)` + Treasury `PayoutProcessed(policy_id)`.
-4. **Per-org solvency.** Payouts debit only the policy's org reserve
-   (`InsufficientOrgReserve` if short — loud, never silent); `reserve_required =
-   outstanding_sum_insured * ratio_bps / 10_000`; withdrawals are surplus-only; the
-   invariant `usdc.balance(this) >= Σ org_reserve + accumulated_fees` holds after every op.
+4. **Per-org solvency.** Payouts debit only the policy's org reserve. If it is short, the
+   verified claim is recorded as a pending payout for the full amount (never dropped,
+   never paid partially) and `settle_pending_claim` pays it once the reserve covers it;
+   `reserve_required = outstanding_sum_insured * ratio_bps / 10_000 + pending payouts`,
+   with a 30% ratio floor; withdrawals are surplus-only; the invariant
+   `usdc.balance(this) >= Σ org_reserve + accumulated_fees` holds after every op.
+   Amounts are USDC base units at **7 decimals** (the Stellar Asset Contract).
 5. **Access control.** Every state-changing fn takes an explicit `caller: Address`, calls
    `caller.require_auth()`, and checks the `microcrop_shared::roles` registry (the
    AccessControl replacement).
@@ -149,7 +153,8 @@ stellar contract deploy \
   -- --admin <ADMIN_G...>
 
 # Treasury  __constructor(usdc, backend_wallet, admin)
-#   usdc = the Stellar Asset Contract (SEP-41) address of USDC on the target network
+#   usdc = the Stellar Asset Contract (SEP-41) address of USDC on the target network.
+#   The constructor panics (UsdcDecimalsMismatch, #217) unless usdc.decimals() == 7.
 stellar contract deploy \
   --wasm target/wasm32v1-none/release/microcrop_treasury.wasm \
   --source-account deployer --network testnet --alias treasury \

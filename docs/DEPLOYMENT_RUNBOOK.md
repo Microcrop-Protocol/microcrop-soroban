@@ -31,7 +31,7 @@ identical wiring against all four real contracts. It is verified, not remembered
 | `jq` | `brew install jq` |
 | Built wasm | `cargo build --release --target wasm32v1-none` — produces 4 artifacts (27–47K) |
 | Funded admin identity | `stellar keys generate deployer --network testnet --fund` |
-| USDC SAC address | the USDC Stellar Asset Contract for the target network |
+| USDC SAC address | the USDC Stellar Asset Contract for the target network. **Must report `decimals() == 7`** — the Treasury constructor panics `UsdcDecimalsMismatch` (#217) otherwise. Check first: `stellar contract invoke --id "$USDC_SAC" --network testnet -- decimals` |
 
 ### Environment
 
@@ -80,7 +80,7 @@ already committed to something else.
 
 1. `PolicyNft(admin, "MicroCrop Policy", "MCP")`
 2. `PolicyManager(admin)`
-3. `Treasury(usdc, backend_wallet, admin)`
+3. `Treasury(usdc, backend_wallet, admin)` — refuses a USDC token that is not 7 decimals
 4. `PayoutReceiver(treasury, policy_manager, admin)`
 
 **Wire cross-references**
@@ -163,6 +163,45 @@ pass, not tuned to ledger economics. An archived `PolicyPaid` or `ConsumedDeterm
 entry has replay-safety implications that must be analysed before real money moves.
 
 ---
+
+## Operating the contracts (behaviour after the 2026-10 audit fixes)
+
+**Amounts are 7-decimal USDC.** 1 USDC = `10_000_000` base units. `sum_insured` must be
+between `1_000_000_000` (100 USDC) and `10_000_000_000_000` (1,000,000 USDC). The backend
+and the Lit signer must both scale by `1e7` on Stellar; the Base path keeps `1e6`. A signer
+still on `1e6` makes every determination fail `SumInsuredMismatch`.
+
+**Pending claims need a keeper.** When a valid determination arrives and the org's reserve
+cannot pay it, the claim is not lost: Treasury records it (`PayoutPending` event,
+`get_pending_payout(policy_id)`), the policy becomes `ClaimPending`, and the org cannot
+withdraw that money. Once the org tops up with `deposit_reserve`, **anyone** settles it:
+
+```bash
+stellar contract invoke --id "$PR" --network testnet --source <any funded key> \
+  -- settle_pending_claim --policy_id <id>
+```
+
+Watch for `PayoutPending` / `ClaimAwaitingFunding` events, alert the org, and settle after
+the top-up. Settlement works after the policy's `end_date` and after `MAX_REPORT_AGE`; it is
+blocked only while PayoutReceiver or Treasury is paused.
+
+**Expiry is permissionless.** `expire_policy(policy_id)` needs no role once
+`now > end_date`; a keeper can run it to release the org's reserve and the farmer's slot.
+
+**Cancelling ACTIVE cover is Admin-only.** The backend key can cancel PENDING policies. An
+ACTIVE policy can be cancelled only by the admin key (escape hatch); a claim-pending policy
+cannot be cancelled at all.
+
+**Reserve ratio floor.** `set_org_reserve_ratio_bps` accepts 3000–10000 (30%–100%); the
+default is 3000.
+
+**Farmer cap.** A farmer may hold at most 3 open policies, counting claims paid in the last
+365 days against the same cap. Expect `TooManyActivePolicies` for a farmer with recent
+claims, not only for one with many open policies.
+
+**Paged indexes.** `get_farmer_policies` and `get_distributor_policies` take
+`(start, limit)` and return at most 50 ids per call (a transaction may touch at most 100
+ledger entries); use the matching `*_count` view to page.
 
 ## After a successful testnet deploy
 
