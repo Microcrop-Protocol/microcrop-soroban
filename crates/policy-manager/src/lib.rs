@@ -42,15 +42,20 @@ pub const MIN_SUM_INSURED: i128 = 1_000_000_000;
 pub const MAX_SUM_INSURED: i128 = 10_000_000_000_000;
 pub const MIN_DURATION_DAYS: u32 = 30;
 pub const MAX_DURATION_DAYS: u32 = 365;
-pub const MAX_ACTIVE_POLICIES_PER_FARMER: u32 = 5;
+/// Cap on a farmer's open policies (PENDING + ACTIVE) PLUS claims paid in the rolling claim
+/// window. Equal to the claim cap, so every policy a farmer pays a premium on can still pay
+/// out (audit finding 3; was 5 open against 3 claims).
+pub const MAX_ACTIVE_POLICIES_PER_FARMER: u32 = 3;
+/// Claims per farmer in any rolling [`CLAIM_WINDOW_SECS`] window.
 pub const MAX_CLAIMS_PER_FARMER_PER_YEAR: u32 = 3;
 pub const SECONDS_PER_DAY: u64 = 86_400;
 /// Hard maximum page size for the paginated index views. Each id is its own ledger entry,
 /// and a Soroban transaction (simulation included) may touch at most 100 footprint entries;
 /// a page of 100 plus the count and the instance overflows that, so pages stop at 50.
 pub const MAX_PAGE_SIZE: u32 = 50;
-/// `getCurrentYear = timestamp / (365 * 86400)`.
-pub const SECONDS_PER_YEAR: u64 = 365 * 86_400;
+/// Rolling claim window: 365 days. A claim counts against the cap until it is exactly this
+/// old. (The EVM's fixed `timestamp / 365d` bucket let six claims pay across a bucket edge.)
+pub const CLAIM_WINDOW_SECS: u64 = 365 * SECONDS_PER_DAY;
 
 // ---- TTL bump amounts (ledgers). ~17280 ledgers/day at 5s close. ----
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -79,8 +84,9 @@ pub enum DataKey {
     FarmerActiveCount(Address),
     /// farmer -> count of PENDING (created, not yet activated) policies.
     FarmerPendingCount(Address),
-    /// (farmer, year) -> claim count.
-    FarmerClaimCount(Address, u64),
+    /// farmer -> timestamps of their most recent claims, oldest first, at most
+    /// `MAX_CLAIMS_PER_FARMER_PER_YEAR` long (bounded; the oldest is dropped on overflow).
+    FarmerClaimTimes(Address),
     /// policy_id -> whether it was counted in the pending counter at creation.
     PendingCounted(u64),
     /// org -> outstanding (PENDING + ACTIVE, unpaid) sum insured aggregated across products.
@@ -161,15 +167,15 @@ pub struct PolicyNftUpdateSkipped {
     pub policy_id: u64,
 }
 
-/// `ClaimCountIncremented(farmer, year, newCount)`.
+/// `ClaimCountIncremented(farmer, claimedAt, claimsInWindow)` — `claims_in_window` counts
+/// this claim and every other one in the rolling 365-day window ending now.
 #[contractevent]
 #[derive(Clone)]
 pub struct ClaimCountIncremented {
     #[topic]
     pub farmer: Address,
-    #[topic]
-    pub year: u64,
-    pub new_count: u32,
+    pub claimed_at: u64,
+    pub claims_in_window: u32,
 }
 
 #[contract]
@@ -269,10 +275,13 @@ impl PolicyManager {
             panic_with_error!(&env, PolicyError::InvalidDuration);
         }
 
-        // Cap TOTAL open policies (ACTIVE + PENDING) at creation time (Finding 5).
+        // Cap open policies (ACTIVE + PENDING) PLUS claims already paid in the rolling window.
+        // Each open policy can become at most one claim, so keeping this sum <= the claim cap
+        // means every policy the farmer pays for can still pay out (audit finding 3).
         let current_open =
             Self::farmer_active_count(&env, &farmer) + Self::farmer_pending_count(&env, &farmer);
-        if current_open >= MAX_ACTIVE_POLICIES_PER_FARMER {
+        let recent_claims = Self::claims_in_window(&env, &farmer);
+        if current_open + recent_claims >= MAX_ACTIVE_POLICIES_PER_FARMER {
             panic_with_error!(&env, PolicyError::TooManyActivePolicies);
         }
 
@@ -461,25 +470,31 @@ impl PolicyManager {
         .publish(&env);
     }
 
-    /// Port of `incrementClaimCount` (ORACLE). Enforces <= 3 claims/farmer/year.
+    /// Port of `incrementClaimCount` (ORACLE). Enforces <= 3 claims per farmer in any
+    /// rolling 365-day window: rejects while the oldest of the farmer's last three claims is
+    /// less than [`CLAIM_WINDOW_SECS`] old.
     pub fn increment_claim_count(env: Env, caller: Address, farmer: Address) {
         roles::require_role(&env, &caller, Role::Oracle);
 
-        let year = env.ledger().timestamp() / SECONDS_PER_YEAR;
-        let current = Self::farmer_claim_count(&env, &farmer, year);
-        let new_count = current + 1;
-        if new_count > MAX_CLAIMS_PER_FARMER_PER_YEAR {
+        let now = env.ledger().timestamp();
+        let in_window = Self::claims_in_window(&env, &farmer);
+        if in_window >= MAX_CLAIMS_PER_FARMER_PER_YEAR {
             panic_with_error!(&env, PolicyError::TooManyClaimsThisYear);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::FarmerClaimCount(farmer.clone(), year), &new_count);
-        Self::bump_persistent(&env, &DataKey::FarmerClaimCount(farmer.clone(), year));
+
+        let key = DataKey::FarmerClaimTimes(farmer.clone());
+        let mut times = Self::claim_times(&env, &farmer);
+        times.push_back(now);
+        while times.len() > MAX_CLAIMS_PER_FARMER_PER_YEAR {
+            times.pop_front();
+        }
+        env.storage().persistent().set(&key, &times);
+        Self::bump_persistent(&env, &key);
 
         ClaimCountIncremented {
             farmer,
-            year,
-            new_count,
+            claimed_at: now,
+            claims_in_window: in_window + 1,
         }
         .publish(&env);
     }
@@ -616,15 +631,21 @@ impl PolicyManager {
         Self::farmer_active_count(&env, &farmer)
     }
 
-    /// Port of `getFarmerClaimCount`.
-    pub fn get_farmer_claim_count(env: Env, farmer: Address, year: u64) -> u32 {
-        Self::farmer_claim_count(&env, &farmer, year)
+    /// Claims by `farmer` in the rolling 365-day window ending now. (The EVM took a `year`
+    /// bucket; the window replaces it.)
+    pub fn get_farmer_claim_count(env: Env, farmer: Address) -> u32 {
+        Self::claims_in_window(&env, &farmer)
     }
 
-    /// Port of `canFarmerClaim`.
+    /// Timestamps of the farmer's most recent claims, oldest first (at most 3).
+    pub fn get_farmer_claim_times(env: Env, farmer: Address) -> Vec<u64> {
+        Self::claim_times(&env, &farmer)
+    }
+
+    /// Port of `canFarmerClaim`. Uses the same rolling-window predicate as
+    /// `increment_claim_count`, so the two always agree.
     pub fn can_farmer_claim(env: Env, farmer: Address) -> bool {
-        let year = env.ledger().timestamp() / SECONDS_PER_YEAR;
-        Self::farmer_claim_count(&env, &farmer, year) < MAX_CLAIMS_PER_FARMER_PER_YEAR
+        Self::claims_in_window(&env, &farmer) < MAX_CLAIMS_PER_FARMER_PER_YEAR
     }
 
     /// Port of `isPolicyActive`.
@@ -658,11 +679,6 @@ impl PolicyManager {
     /// Port of `getTotalPolicies` (the counter).
     pub fn get_total_policies(env: Env) -> u64 {
         Self::policy_counter(&env)
-    }
-
-    /// Port of `getCurrentYear` = `timestamp / (365 * 86400)`.
-    pub fn get_current_year(env: Env) -> u64 {
-        env.ledger().timestamp() / SECONDS_PER_YEAR
     }
 
     // ============ internal helpers ============
@@ -719,11 +735,24 @@ impl PolicyManager {
         Self::bump_persistent(env, &DataKey::FarmerPendingCount(farmer.clone()));
     }
 
-    fn farmer_claim_count(env: &Env, farmer: &Address, year: u64) -> u32 {
+    fn claim_times(env: &Env, farmer: &Address) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::FarmerClaimCount(farmer.clone(), year))
-            .unwrap_or(0)
+            .get(&DataKey::FarmerClaimTimes(farmer.clone()))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Claims younger than [`CLAIM_WINDOW_SECS`]: a claim at `t` counts while
+    /// `now < t + CLAIM_WINDOW_SECS` and stops counting at exactly 365 days.
+    fn claims_in_window(env: &Env, farmer: &Address) -> u32 {
+        let now = env.ledger().timestamp();
+        let mut n = 0u32;
+        for t in Self::claim_times(env, farmer).iter() {
+            if now < t.saturating_add(CLAIM_WINDOW_SECS) {
+                n += 1;
+            }
+        }
+        n
     }
 
     fn org_outstanding(env: &Env, org: &Address) -> i128 {

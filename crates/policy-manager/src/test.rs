@@ -16,8 +16,8 @@ use microcrop_shared::{
 };
 
 use crate::{
-    PolicyManager, PolicyManagerClient, MAX_PAGE_SIZE, MAX_SUM_INSURED, MIN_SUM_INSURED,
-    SECONDS_PER_DAY, SECONDS_PER_YEAR,
+    PolicyManager, PolicyManagerClient, CLAIM_WINDOW_SECS, MAX_ACTIVE_POLICIES_PER_FARMER,
+    MAX_PAGE_SIZE, MAX_SUM_INSURED, MIN_SUM_INSURED, SECONDS_PER_DAY,
 };
 
 // ---- minimal PolicyNFT mock matching the IPolicyNft cross-contract interface ----
@@ -290,8 +290,9 @@ fn create_rejects_bad_duration() {
 #[test]
 fn create_enforces_open_policy_cap() {
     let c = setup();
-    // 5 open (PENDING) policies allowed.
-    for _ in 0..5 {
+    // 3 open (PENDING) policies allowed.
+    assert_eq!(MAX_ACTIVE_POLICIES_PER_FARMER, 3);
+    for _ in 0..3 {
         create_default(&c);
     }
     // 6th exceeds the ACTIVE+PENDING cap.
@@ -366,8 +367,8 @@ fn cancel_pending_releases_slot() {
     c.client.cancel_policy(&c.backend, &id);
     assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Cancelled);
 
-    // Fill the cap again to prove the PENDING slot was freed (5 more creations succeed).
-    for _ in 0..5 {
+    // Fill the cap again to prove the PENDING slot was freed (3 more creations succeed).
+    for _ in 0..3 {
         create_default(&c);
     }
     let res = c.client.try_create_policy(
@@ -435,31 +436,89 @@ fn mark_as_claimed_rejects_expired_coverage() {
 }
 
 #[test]
-fn claim_count_limit_and_year_rollover() {
+fn claim_cap_is_a_rolling_365_day_window() {
     let c = setup();
-    // Year 2.
-    c.env.ledger().set_timestamp(2 * SECONDS_PER_YEAR + 100);
-    let year2 = c.client.get_current_year();
-    assert_eq!(year2, 2);
+    let t0: u64 = 1_800_000_000;
+    c.env.ledger().set_timestamp(t0);
 
     assert!(c.client.can_farmer_claim(&c.farmer));
-    for _ in 0..3 {
+    for i in 0..3u64 {
+        c.env.ledger().set_timestamp(t0 + i);
         c.client.increment_claim_count(&c.oracle, &c.farmer);
     }
-    assert_eq!(c.client.get_farmer_claim_count(&c.farmer, &year2), 3);
+    assert_eq!(c.client.get_farmer_claim_count(&c.farmer), 3);
     assert!(!c.client.can_farmer_claim(&c.farmer));
-
-    // 4th within the same year exceeds the limit.
     let res = c.client.try_increment_claim_count(&c.oracle, &c.farmer);
     assert_err(res, PolicyError::TooManyClaimsThisYear as u32);
 
-    // Roll to year 3 — counter resets.
-    c.env.ledger().set_timestamp(3 * SECONDS_PER_YEAR + 100);
-    assert_eq!(c.client.get_current_year(), 3);
+    // One second before the oldest claim is 365 days old: still blocked, and the view agrees.
+    c.env.ledger().set_timestamp(t0 + CLAIM_WINDOW_SECS - 1);
+    assert_eq!(c.client.get_farmer_claim_count(&c.farmer), 3);
+    assert!(!c.client.can_farmer_claim(&c.farmer));
+    let res = c.client.try_increment_claim_count(&c.oracle, &c.farmer);
+    assert_err(res, PolicyError::TooManyClaimsThisYear as u32);
+
+    // Exactly 365 days after the oldest claim: it drops out and one more claim is allowed.
+    c.env.ledger().set_timestamp(t0 + CLAIM_WINDOW_SECS);
+    assert_eq!(c.client.get_farmer_claim_count(&c.farmer), 2);
     assert!(c.client.can_farmer_claim(&c.farmer));
-    assert_eq!(c.client.get_farmer_claim_count(&c.farmer, &3u64), 0);
     c.client.increment_claim_count(&c.oracle, &c.farmer);
-    assert_eq!(c.client.get_farmer_claim_count(&c.farmer, &3u64), 1);
+    assert_eq!(c.client.get_farmer_claim_count(&c.farmer), 3);
+    assert!(!c.client.can_farmer_claim(&c.farmer));
+    // The stored list stays bounded at 3, oldest first.
+    let times = c.client.get_farmer_claim_times(&c.farmer);
+    assert_eq!(times.len(), 3);
+    assert_eq!(times.get(0).unwrap(), t0 + 1);
+    assert_eq!(times.get(2).unwrap(), t0 + CLAIM_WINDOW_SECS);
+}
+
+#[test]
+fn no_six_claims_across_a_calendar_bucket_edge() {
+    // The old fixed bucket (timestamp / 365d) reset at 1_797_552_000: three claims just
+    // before and three just after all paid. The rolling window stops the fourth.
+    let c = setup();
+    let edge: u64 = 1_797_552_000;
+    for i in 0..3u64 {
+        c.env.ledger().set_timestamp(edge - 10 + i);
+        c.client.increment_claim_count(&c.oracle, &c.farmer);
+    }
+    c.env.ledger().set_timestamp(edge + 10);
+    assert!(!c.client.can_farmer_claim(&c.farmer));
+    let res = c.client.try_increment_claim_count(&c.oracle, &c.farmer);
+    assert_err(res, PolicyError::TooManyClaimsThisYear as u32);
+}
+
+#[test]
+fn create_counts_recent_claims_against_the_open_cap() {
+    // Open policies + claims in the window <= 3, so every premium paid can still pay out.
+    let c = setup();
+    let t0: u64 = 1_800_000_000;
+    c.env.ledger().set_timestamp(t0);
+
+    // One policy claimed: 0 open + 1 claim.
+    let a = create_default(&c);
+    activate_default(&c, a);
+    c.client.mark_as_claimed(&c.oracle, &a);
+    c.client.increment_claim_count(&c.oracle, &c.farmer);
+
+    // Two more fit (2 open + 1 claim = 3); a third does not.
+    create_default(&c);
+    create_default(&c);
+    let res = c.client.try_create_policy(
+        &c.backend,
+        &c.farmer,
+        &1u64,
+        &MIN_SUM_INSURED,
+        &100_000_000i128,
+        &30u32,
+        &CoverageType::Drought,
+        &c.org,
+    );
+    assert_err(res, PolicyError::TooManyActivePolicies as u32);
+
+    // Once the claim is 365 days old it no longer counts, and the slot frees up.
+    c.env.ledger().set_timestamp(t0 + CLAIM_WINDOW_SECS);
+    create_default(&c);
 }
 
 #[test]

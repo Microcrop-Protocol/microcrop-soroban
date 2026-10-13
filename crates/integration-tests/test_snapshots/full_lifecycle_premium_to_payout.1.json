@@ -1406,19 +1406,20 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "FarmerClaimCount"
+                    "symbol": "FarmerClaimTimes"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                  },
-                  {
-                    "u64": "53"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "u32": 1
+                "vec": [
+                  {
+                    "u64": "1700000000"
+                  }
+                ]
               }
             }
           },
