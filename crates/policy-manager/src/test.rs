@@ -121,10 +121,10 @@ fn create_default(c: &Ctx) -> u64 {
     c.client.create_policy(
         &c.backend,
         &c.farmer,
-        &1u64,             // plot_id
-        &MIN_SUM_INSURED,  // sum_insured (100 USDC)
-        &10_000_000i128,   // premium (10 USDC)
-        &30u32,            // duration_days
+        &1u64,            // plot_id
+        &MIN_SUM_INSURED, // sum_insured (100 USDC)
+        &10_000_000i128,  // premium (10 USDC)
+        &30u32,           // duration_days
         &CoverageType::Drought,
         &c.org,
     )
@@ -185,9 +185,15 @@ fn create_activate_claim_happy_path() {
     let p = c.client.get_policy(&id);
     assert_eq!(p.status, PolicyStatus::Active);
     assert_eq!(c.client.get_farmer_active_count(&c.farmer), 1);
-    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), MIN_SUM_INSURED);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
     assert!(c.client.is_policy_active(&id));
-    assert_eq!(c.client.get_farmer_policies(&c.farmer), soroban_sdk::vec![&c.env, 1u64]);
+    assert_eq!(
+        c.client.get_farmer_policies(&c.farmer),
+        soroban_sdk::vec![&c.env, 1u64]
+    );
 
     // Claim (ORACLE).
     c.client.mark_as_claimed(&c.oracle, &id);
@@ -377,7 +383,10 @@ fn cancel_active_releases_exposure() {
     let c = setup();
     let id = create_default(&c);
     activate_default(&c, id);
-    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), MIN_SUM_INSURED);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
 
     c.client.cancel_policy(&c.backend, &id);
     assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Cancelled);

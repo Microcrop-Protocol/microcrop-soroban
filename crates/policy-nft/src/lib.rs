@@ -315,12 +315,7 @@ impl PolicyNft {
         p.set(&DataKey::Owner(token_id), &to);
         Self::bump_persistent(&env, &DataKey::Owner(token_id));
 
-        Transfer {
-            from,
-            to,
-            token_id,
-        }
-        .publish(&env);
+        Transfer { from, to, token_id }.publish(&env);
     }
 
     // ---- views ----
@@ -366,9 +361,11 @@ impl PolicyNft {
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 }
 

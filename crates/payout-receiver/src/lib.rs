@@ -380,8 +380,10 @@ impl PayoutReceiver {
         }
 
         // ============ All checks passed — effects before interactions (CEI) ============
-        s.temporary()
-            .set(&DataKey::ConsumedDetermination(preimage_hash.clone()), &true);
+        s.temporary().set(
+            &DataKey::ConsumedDetermination(preimage_hash.clone()),
+            &true,
+        );
         s.temporary().extend_ttl(
             &DataKey::ConsumedDetermination(preimage_hash.clone()),
             TEMP_THRESHOLD,

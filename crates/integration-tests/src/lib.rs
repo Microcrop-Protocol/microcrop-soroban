@@ -372,7 +372,10 @@ fn determination_replay_rejected() {
     assert_eq!(res, Err(Ok(PayoutError::PolicyNotActive.into())));
 
     // No second payout: balances + reserve unchanged, Treasury still solvent.
-    assert_eq!(w.token.balance(&w.backend_wallet), backend_wallet_after_first);
+    assert_eq!(
+        w.token.balance(&w.backend_wallet),
+        backend_wallet_after_first
+    );
     assert_eq!(w.treasury.org_reserve(&w.org), reserve_after_first);
     assert_eq!(w.token.balance(&w.treasury_id), premium - PAYOUT);
     w.assert_solvent();
@@ -447,9 +450,18 @@ fn has_role_reports_the_money_path_grants() {
 
     // Granted to CONTRACTS. Missing #1 -> activation cannot mint a certificate; #2 ->
     // determinations cannot mark a policy claimed; #3 -> NO PAYOUT CAN EVER BE DRAWN.
-    assert!(w.nft.has_role(&Role::Minter, &w.pm.address), "PolicyManager must hold Minter on PolicyNft");
-    assert!(w.pm.has_role(&Role::Oracle, &w.pr_addr), "PayoutReceiver must hold Oracle on PolicyManager");
-    assert!(w.treasury.has_role(&Role::Payout, &w.pr_addr), "PayoutReceiver must hold Payout on Treasury");
+    assert!(
+        w.nft.has_role(&Role::Minter, &w.pm.address),
+        "PolicyManager must hold Minter on PolicyNft"
+    );
+    assert!(
+        w.pm.has_role(&Role::Oracle, &w.pr_addr),
+        "PayoutReceiver must hold Oracle on PolicyManager"
+    );
+    assert!(
+        w.treasury.has_role(&Role::Payout, &w.pr_addr),
+        "PayoutReceiver must hold Payout on Treasury"
+    );
 
     // Granted to accounts.
     assert!(w.pm.has_role(&Role::Backend, &w.backend));
@@ -464,7 +476,10 @@ fn has_role_is_false_for_non_holders_and_is_per_contract() {
     // An address holding a role in one contract does not hold it in another. The registry is
     // namespaced per contract, and a verifier that assumed otherwise would false-pass.
     assert!(w.pm.has_role(&Role::Backend, &w.backend));
-    assert!(!w.nft.has_role(&Role::Backend, &w.backend), "Backend on PolicyManager must not leak into PolicyNft");
+    assert!(
+        !w.nft.has_role(&Role::Backend, &w.backend),
+        "Backend on PolicyManager must not leak into PolicyNft"
+    );
 
     // Holding one role does not imply another.
     assert!(!w.pm.has_role(&Role::Oracle, &w.backend));
@@ -484,5 +499,8 @@ fn revoking_a_role_is_visible_through_has_role() {
     // Revocation must be observable, or an operator cannot confirm an emergency lockout
     // actually took effect.
     w.treasury.revoke_role(&w.admin, &Role::Payout, &w.pr_addr);
-    assert!(!w.treasury.has_role(&Role::Payout, &w.pr_addr), "revoke must be visible via has_role");
+    assert!(
+        !w.treasury.has_role(&Role::Payout, &w.pr_addr),
+        "revoke must be visible via has_role"
+    );
 }

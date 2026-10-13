@@ -32,7 +32,9 @@ use soroban_sdk::{
     token::TokenClient, Address, BytesN, Env,
 };
 
-use microcrop_shared::{errors::TreasuryError, interfaces::PolicyManagerClient, roles, types::Role};
+use microcrop_shared::{
+    errors::TreasuryError, interfaces::PolicyManagerClient, roles, types::Role,
+};
 
 // ============ Constants (ported 1:1) ============
 pub const MIN_RESERVE_PERCENT: u32 = 20;
@@ -389,10 +391,22 @@ impl Treasury {
 
         // Mark received BEFORE the external transfer (CEI).
         set_premium_received(&env, policy_id);
-        set_scalar(&env, &DataKey::AccumulatedFees, get_accumulated_fees(&env) + platform_fee);
-        set_scalar(&env, &DataKey::TotalPremiums, get_total_premiums(&env) + net_premium);
+        set_scalar(
+            &env,
+            &DataKey::AccumulatedFees,
+            get_accumulated_fees(&env) + platform_fee,
+        );
+        set_scalar(
+            &env,
+            &DataKey::TotalPremiums,
+            get_total_premiums(&env) + net_premium,
+        );
         set_org_reserve(&env, &org, org_reserve_of(&env, &org) + net_premium);
-        set_scalar(&env, &DataKey::TotalOrgReserves, get_total_org_reserves(&env) + net_premium);
+        set_scalar(
+            &env,
+            &DataKey::TotalOrgReserves,
+            get_total_org_reserves(&env) + net_premium,
+        );
 
         // Pull USDC from the caller (payer's require_auth propagates to the SAC sub-call).
         usdc(&env).transfer(&caller, &env.current_contract_address(), &amount);
@@ -452,10 +466,18 @@ impl Treasury {
 
         // Update state BEFORE the external transfer (CEI).
         set_payout_processed(&env, policy_id);
-        set_scalar(&env, &DataKey::TotalPayouts, get_total_payouts(&env) + amount);
+        set_scalar(
+            &env,
+            &DataKey::TotalPayouts,
+            get_total_payouts(&env) + amount,
+        );
         let remaining = available - amount;
         set_org_reserve(&env, &org, remaining);
-        set_scalar(&env, &DataKey::TotalOrgReserves, get_total_org_reserves(&env) - amount);
+        set_scalar(
+            &env,
+            &DataKey::TotalOrgReserves,
+            get_total_org_reserves(&env) - amount,
+        );
 
         // Transfer USDC to backend wallet (M-Pesa offramp). A contract auto-authorizes its own
         // balance moves.
@@ -502,7 +524,11 @@ impl Treasury {
             panic_with_error!(&env, TreasuryError::ZeroAmount);
         }
         set_org_reserve(&env, &org, org_reserve_of(&env, &org) + amount);
-        set_scalar(&env, &DataKey::TotalOrgReserves, get_total_org_reserves(&env) + amount);
+        set_scalar(
+            &env,
+            &DataKey::TotalOrgReserves,
+            get_total_org_reserves(&env) + amount,
+        );
         usdc(&env).transfer(&from, &env.current_contract_address(), &amount);
         OrgReserveDeposited { org, from, amount }.publish(&env);
     }
@@ -529,7 +555,11 @@ impl Treasury {
         }
 
         set_org_reserve(&env, &org, remaining);
-        set_scalar(&env, &DataKey::TotalOrgReserves, get_total_org_reserves(&env) - amount);
+        set_scalar(
+            &env,
+            &DataKey::TotalOrgReserves,
+            get_total_org_reserves(&env) - amount,
+        );
         usdc(&env).transfer(&env.current_contract_address(), &to, &amount);
         OrgSurplusWithdrawn { org, to, amount }.publish(&env);
     }
@@ -543,7 +573,11 @@ impl Treasury {
         }
         set_persistent_u32(&env, DataKey::OrgReserveRatioBps(org.clone()), bps);
         set_persistent_bool(&env, DataKey::OrgRatioSet(org.clone()), true);
-        OrgReserveRatioSet { org, ratio_bps: bps }.publish(&env);
+        OrgReserveRatioSet {
+            org,
+            ratio_bps: bps,
+        }
+        .publish(&env);
     }
 
     /// Port of `setOrgFeeBps` (ADMIN). <= `MAX_FEE_BPS`; sets presence flag.
@@ -609,7 +643,11 @@ impl Treasury {
         // Only UNBACKED surplus may be recovered — never funds that back org reserves or fees.
         let balance = usdc(&env).balance(&env.current_contract_address());
         let backed = get_total_org_reserves(&env) + get_accumulated_fees(&env);
-        let recoverable = if balance > backed { balance - backed } else { 0 };
+        let recoverable = if balance > backed {
+            balance - backed
+        } else {
+            0
+        };
         if amount > recoverable {
             panic_with_error!(&env, TreasuryError::ExceedsRecoverableSurplus);
         }
@@ -765,9 +803,11 @@ fn org_reserve_of(env: &Env, org: &Address) -> i128 {
 fn set_org_reserve(env: &Env, org: &Address, v: i128) {
     let key = DataKey::OrgReserve(org.clone());
     env.storage().persistent().set(&key, &v);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
 }
 
 fn is_premium_received(env: &Env, policy_id: u64) -> bool {
@@ -780,9 +820,11 @@ fn is_premium_received(env: &Env, policy_id: u64) -> bool {
 fn set_premium_received(env: &Env, policy_id: u64) {
     let key = DataKey::PremiumReceived(policy_id);
     env.storage().persistent().set(&key, &true);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
 }
 
 fn is_payout_processed(env: &Env, policy_id: u64) -> bool {
@@ -795,23 +837,29 @@ fn is_payout_processed(env: &Env, policy_id: u64) -> bool {
 fn set_payout_processed(env: &Env, policy_id: u64) {
     let key = DataKey::PayoutProcessed(policy_id);
     env.storage().persistent().set(&key, &true);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
 }
 
 fn set_persistent_u32(env: &Env, key: DataKey, v: u32) {
     env.storage().persistent().set(&key, &v);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
 }
 
 fn set_persistent_bool(env: &Env, key: DataKey, v: bool) {
     env.storage().persistent().set(&key, &v);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
 }
 
 /// Effective reserve ratio for an org (explicit per-org value if set — including 0 — else the

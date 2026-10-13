@@ -573,18 +573,14 @@ impl PolicyManager {
             .persistent()
             .get::<_, Policy>(&DataKey::Policy(policy_id))
         {
-            Some(p) => {
-                p.status == PolicyStatus::Active && env.ledger().timestamp() <= p.end_date
-            }
+            Some(p) => p.status == PolicyStatus::Active && env.ledger().timestamp() <= p.end_date,
             None => false,
         }
     }
 
     /// Port of `policyExists`.
     pub fn policy_exists(env: Env, policy_id: u64) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Policy(policy_id))
+        env.storage().persistent().has(&DataKey::Policy(policy_id))
     }
 
     /// Port of `policyOrg`. Reverts `PolicyDoesNotExist` for an unknown policy (Soroban has no

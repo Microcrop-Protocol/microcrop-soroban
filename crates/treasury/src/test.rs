@@ -39,7 +39,9 @@ struct MockPm;
 #[contractimpl]
 impl MockPm {
     pub fn set_org(env: Env, policy_id: u64, org: Address) {
-        env.storage().persistent().set(&MockKey::Org(policy_id), &org);
+        env.storage()
+            .persistent()
+            .set(&MockKey::Org(policy_id), &org);
     }
 
     pub fn set_outstanding(env: Env, org: Address, amount: i128) {
@@ -193,7 +195,10 @@ fn per_org_fee_override_is_honored() {
     // 5% of 2_000_000 = 100_000 fee; net 1_900_000.
     assert_eq!(c.treasury.accumulated_fees(), 100_000);
     assert_eq!(c.treasury.org_reserve(&c.org), 1_900_000);
-    assert_eq!(c.treasury.calculate_platform_fee(&2_000_000, &c.org), 100_000);
+    assert_eq!(
+        c.treasury.calculate_platform_fee(&2_000_000, &c.org),
+        100_000
+    );
     c.assert_solvent();
 }
 
@@ -221,7 +226,7 @@ fn payout_exceeding_org_reserve_reverts() {
     c.pm().set_org(&1u64, &c.org);
     c.token_admin.mint(&c.backend, &1_000_000);
     c.treasury.receive_premium(&c.backend, &1u64, &1_000_000); // org reserve = 900_000
-    // Ask for more than the org holds.
+                                                               // Ask for more than the org holds.
     c.treasury
         .request_payout(&c.payout_receiver, &1u64, &900_001);
 }
@@ -258,7 +263,8 @@ fn payout_without_premium_reverts() {
     // failure is specifically PremiumNotReceived (not InsufficientOrgReserve).
     c.token_admin.mint(&c.org, &1_000_000);
     c.treasury.deposit_reserve(&c.org, &c.org, &1_000_000);
-    c.treasury.request_payout(&c.payout_receiver, &5u64, &100_000);
+    c.treasury
+        .request_payout(&c.payout_receiver, &5u64, &100_000);
 }
 
 #[test]

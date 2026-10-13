@@ -37,14 +37,20 @@ pub struct MockPolicyManager;
 #[contractimpl]
 impl MockPolicyManager {
     pub fn __constructor(env: Env, policy: Policy) {
-        env.storage().instance().set(&symbol_short!("policy"), &policy);
-        env.storage().instance().set(&symbol_short!("canclaim"), &true);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("policy"), &policy);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("canclaim"), &true);
     }
     pub fn set_can_claim(env: Env, v: bool) {
         env.storage().instance().set(&symbol_short!("canclaim"), &v);
     }
     pub fn set_policy(env: Env, policy: Policy) {
-        env.storage().instance().set(&symbol_short!("policy"), &policy);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("policy"), &policy);
     }
     pub fn policy_exists(env: Env, policy_id: u64) -> bool {
         match env
@@ -57,7 +63,10 @@ impl MockPolicyManager {
         }
     }
     pub fn get_policy(env: Env, _policy_id: u64) -> Policy {
-        env.storage().instance().get(&symbol_short!("policy")).unwrap()
+        env.storage()
+            .instance()
+            .get(&symbol_short!("policy"))
+            .unwrap()
     }
     pub fn can_farmer_claim(env: Env, _farmer: Address) -> bool {
         env.storage()
@@ -66,18 +75,36 @@ impl MockPolicyManager {
             .unwrap_or(true)
     }
     pub fn mark_as_claimed(env: Env, _caller: Address, _policy_id: u64) {
-        let n: u32 = env.storage().instance().get(&symbol_short!("claimed")).unwrap_or(0);
-        env.storage().instance().set(&symbol_short!("claimed"), &(n + 1));
+        let n: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("claimed"))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("claimed"), &(n + 1));
     }
     pub fn increment_claim_count(env: Env, _caller: Address, _farmer: Address) {
-        let n: u32 = env.storage().instance().get(&symbol_short!("inc")).unwrap_or(0);
-        env.storage().instance().set(&symbol_short!("inc"), &(n + 1));
+        let n: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("inc"))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("inc"), &(n + 1));
     }
     pub fn claimed_calls(env: Env) -> u32 {
-        env.storage().instance().get(&symbol_short!("claimed")).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&symbol_short!("claimed"))
+            .unwrap_or(0)
     }
     pub fn inc_calls(env: Env) -> u32 {
-        env.storage().instance().get(&symbol_short!("inc")).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&symbol_short!("inc"))
+            .unwrap_or(0)
     }
 }
 
@@ -88,19 +115,34 @@ pub struct MockTreasury;
 impl MockTreasury {
     pub fn __constructor(_env: Env) {}
     pub fn request_payout(env: Env, _caller: Address, policy_id: u64, amount: i128) {
-        env.storage().instance().set(&symbol_short!("pid"), &policy_id);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("pid"), &policy_id);
         env.storage().instance().set(&symbol_short!("amt"), &amount);
-        let n: u32 = env.storage().instance().get(&symbol_short!("n")).unwrap_or(0);
+        let n: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("n"))
+            .unwrap_or(0);
         env.storage().instance().set(&symbol_short!("n"), &(n + 1));
     }
     pub fn last_pid(env: Env) -> u64 {
-        env.storage().instance().get(&symbol_short!("pid")).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&symbol_short!("pid"))
+            .unwrap_or(0)
     }
     pub fn last_amt(env: Env) -> i128 {
-        env.storage().instance().get(&symbol_short!("amt")).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&symbol_short!("amt"))
+            .unwrap_or(0)
     }
     pub fn calls(env: Env) -> u32 {
-        env.storage().instance().get(&symbol_short!("n")).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&symbol_short!("n"))
+            .unwrap_or(0)
     }
 }
 
@@ -194,7 +236,10 @@ fn setup() -> Fixture {
 
     let treasury_id = env.register(MockTreasury, ());
     let pm_id = env.register(MockPolicyManager, (policy,));
-    let pr_addr = env.register(PayoutReceiver, (treasury_id.clone(), pm_id.clone(), admin.clone()));
+    let pr_addr = env.register(
+        PayoutReceiver,
+        (treasury_id.clone(), pm_id.clone(), admin.clone()),
+    );
 
     let client = PayoutReceiverClient::new(&env, &pr_addr);
     client.grant_role(&admin, &Role::Relayer, &relayer);
@@ -268,7 +313,9 @@ fn unauthorized_relayer_rejected() {
     let d = base_det();
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
 
-    let res = f.client.try_submit_determination(&stranger, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&stranger, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(CommonError::Unauthorized.into())));
 }
 
@@ -322,7 +369,9 @@ fn wrong_signer_rejected() {
     let attacker = sk_from(0x22);
     let (sig, recid) = sign(&f.env, &attacker, &f.pr_addr, &f.domain, &d);
 
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidSignature.into())));
 }
 
@@ -334,7 +383,9 @@ fn wrong_network_domain_rejected() {
     let other_domain = BytesN::from_array(&f.env, &[0x01u8; 32]);
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &other_domain, &d);
 
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidSignature.into())));
 }
 
@@ -346,7 +397,9 @@ fn wrong_contract_address_rejected() {
     let other_addr = Address::generate(&f.env);
     let (sig, recid) = sign(&f.env, &f.sk, &other_addr, &f.domain, &d);
 
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidSignature.into())));
 }
 
@@ -358,7 +411,9 @@ fn damage_exceeds_maximum_rejected() {
     let mut d = base_det();
     d.damage_percent_bp = 10_001;
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::DamageExceedsMaximum.into())));
 }
 
@@ -368,7 +423,9 @@ fn subscore_out_of_range_rejected() {
     let mut d = base_det();
     d.weather_damage = 101;
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::SubScoreOutOfRange.into())));
 }
 
@@ -378,7 +435,9 @@ fn invalid_weather_flag_rejected() {
     let mut d = base_det();
     d.weather_present = 2;
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidWeatherFlag.into())));
 }
 
@@ -389,7 +448,9 @@ fn weather_flag_damage_mismatch_rejected() {
     d.weather_present = 0; // satellite-only ...
     d.weather_damage = 10; // ... but nonzero weather damage
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::WeatherFlagDamageMismatch.into())));
 }
 
@@ -400,7 +461,9 @@ fn invalid_weighted_damage_rejected() {
     // weather present: expected bp = 60*50 + 40*50 = 5000; claim 6000 instead.
     d.damage_percent_bp = 6_000;
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidWeightedDamage.into())));
 }
 
@@ -414,7 +477,9 @@ fn below_threshold_rejected() {
     d.damage_percent_bp = 2_000;
     d.payout_amount = SUM_INSURED * 2_000 / 10_000;
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::DamageBelowThreshold.into())));
 }
 
@@ -425,10 +490,12 @@ fn sum_insured_mismatch_rejected() {
     let f = setup();
     let mut d = base_det();
     d.sum_insured = SUM_INSURED + 1; // does not match the on-chain policy
-    // keep payout consistent with the FALSE sum so only the sum check can fire
+                                     // keep payout consistent with the FALSE sum so only the sum check can fire
     d.payout_amount = (SUM_INSURED + 1) * 5_000 / 10_000;
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::SumInsuredMismatch.into())));
 }
 
@@ -438,7 +505,9 @@ fn wrong_payout_amount_rejected() {
     let mut d = base_det();
     d.payout_amount = 499_999; // != SUM_INSURED * 5000 / 10000
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidPayoutCalculation.into())));
 }
 
@@ -450,7 +519,9 @@ fn future_report_rejected() {
     let mut d = base_det();
     d.assessed_at = NOW + 10;
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::ReportInFuture.into())));
 }
 
@@ -460,7 +531,9 @@ fn stale_report_rejected() {
     let mut d = base_det();
     d.assessed_at = NOW - 3_601; // older than MAX_REPORT_AGE (3600)
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::ReportTooOld.into())));
 }
 
@@ -521,7 +594,9 @@ fn replay_rejected_by_policy_paid_guard() {
 
     // Second (identical) submission is rejected — the persistent PolicyPaid layer of the
     // triple replay guard fires first (before the ConsumedDetermination/Treasury layers).
-    let res = f.client.try_submit_determination(&f.relayer, &d, &sig, &recid);
+    let res = f
+        .client
+        .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::PolicyAlreadyPaid.into())));
     // Treasury was only paid once.
     assert_eq!(f.treasury.calls(), 1);
