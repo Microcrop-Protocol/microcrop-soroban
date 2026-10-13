@@ -46,6 +46,8 @@ pub enum PolicyError {
     /// Only `Role::Admin` may cancel an ACTIVE policy; `Role::Backend` may cancel PENDING
     /// ones only. Stops cover being cancelled after a loss to dodge the payout.
     CancelActiveRequiresAdmin = 116,
+    /// `create_policy` with `|lat_e6| > 90_000_000` or `|lon_e6| > 180_000_000`.
+    InvalidCoordinates = 117,
 }
 
 /// `Treasury` domain errors. Range 200..=299.
@@ -85,6 +87,15 @@ pub enum TreasuryError {
     NoPendingPayout = 221,
     /// `request_payout` for a policy that already has a recorded pending payout.
     PayoutAlreadyPending = 222,
+    /// `receive_premium` with an amount other than the policy's recorded `premium`.
+    PremiumAmountMismatch = 223,
+    /// `settle_pending_payout` for a pending payout that is not at the head of its org's
+    /// first-in-first-out queue. Settle `pending_payout_head(org)` first.
+    NotPendingQueueHead = 224,
+    /// `settle_pending_payout` could not transfer USDC to the backend wallet (trustline
+    /// missing or deauthorized by the issuer). The claim stays recorded; rotate the wallet
+    /// with `set_backend_wallet` and settle again.
+    PayoutTransferFailed = 225,
 }
 
 /// `PayoutReceiver` domain errors. Range 300..=399. Order mirrors the 12 validation steps.
@@ -113,6 +124,11 @@ pub enum PayoutError {
     // 318 is the crate-local `payout_receiver::PausedError::ContractPaused`.
     /// `settle_pending_claim` for a policy with no claim awaiting funding.
     NoPendingClaim = 319,
+    /// The policy's coverage type is not one the CROP_DAMAGE methodology settles (only
+    /// `CoverageType::Comprehensive`; see `CoverageType`).
+    CoverageNotSettledByMethodology = 320,
+    /// The signed `latitude_e6` / `longitude_e6` are not the insured plot's coordinates.
+    PlotLocationMismatch = 321,
 }
 
 /// `PolicyNft` domain errors. Range 400..=499.

@@ -548,7 +548,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -578,7 +578,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -608,7 +608,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -638,7 +638,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -782,7 +782,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -842,6 +842,22 @@
                     },
                     "val": {
                       "u64": "9"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lat_e6"
+                    },
+                    "val": {
+                      "i64": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lon_e6"
+                    },
+                    "val": {
+                      "i64": "0"
                     }
                   },
                   {
@@ -1142,7 +1158,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
       }
     ]
   },

@@ -20,6 +20,10 @@ use crate::{
     MAX_PAGE_SIZE, MAX_SUM_INSURED, MIN_SUM_INSURED, SECONDS_PER_DAY,
 };
 
+/// Insured plot near Nairobi, degrees x 1e6.
+const PLOT_LAT_E6: i64 = -1_286_389;
+const PLOT_LON_E6: i64 = 36_817_223;
+
 // ---- minimal PolicyNFT mock matching the IPolicyNft cross-contract interface ----
 mod nft_mock {
     use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String};
@@ -52,6 +56,8 @@ mod nft_mock {
         ) {
             // no-op: exercises the best-effort deactivation path without reverting.
         }
+
+        pub fn extend_policy_ttl(_env: Env, _policy_id: u64) {}
 
         #[allow(clippy::too_many_arguments)]
         pub fn mint_policy(
@@ -123,7 +129,9 @@ fn create_default(c: &Ctx) -> u64 {
     c.client.create_policy(
         &c.backend,
         &c.farmer,
-        &1u64,            // plot_id
+        &1u64, // plot_id
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &MIN_SUM_INSURED, // sum_insured (100 USDC)
         &100_000_000i128, // premium (10 USDC)
         &30u32,           // duration_days
@@ -217,6 +225,8 @@ fn create_rejects_sum_too_low() {
         &c.backend,
         &c.farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &(MIN_SUM_INSURED - 1),
         &100_000_000i128,
         &30u32,
@@ -233,6 +243,8 @@ fn create_rejects_sum_too_high() {
         &c.backend,
         &c.farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &(MAX_SUM_INSURED + 1),
         &100_000_000i128,
         &30u32,
@@ -249,6 +261,8 @@ fn create_rejects_zero_premium() {
         &c.backend,
         &c.farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &0i128,
         &30u32,
@@ -266,6 +280,8 @@ fn create_rejects_bad_duration() {
         &c.backend,
         &c.farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &29u32,
@@ -278,6 +294,8 @@ fn create_rejects_bad_duration() {
         &c.backend,
         &c.farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &366u32,
@@ -300,6 +318,8 @@ fn create_enforces_open_policy_cap() {
         &c.backend,
         &c.farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
@@ -317,6 +337,8 @@ fn create_requires_backend_role() {
         &stranger,
         &c.farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
@@ -375,6 +397,8 @@ fn cancel_pending_releases_slot() {
         &c.backend,
         &c.farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
@@ -508,6 +532,8 @@ fn create_counts_recent_claims_against_the_open_cap() {
         &c.backend,
         &c.farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
@@ -539,6 +565,8 @@ fn activate_without_nft_set_reverts() {
         &backend,
         &farmer,
         &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &30u32,
@@ -569,6 +597,8 @@ fn sum_insured_bounds_are_seven_decimal_usdc() {
             &c.backend,
             &Address::generate(&c.env),
             &1u64,
+            &PLOT_LAT_E6,
+            &PLOT_LON_E6,
             &sum,
             &100_000_000i128,
             &30u32,
@@ -844,6 +874,8 @@ fn stale_pending_policy_expires_and_releases_exposure_once() {
             &c.backend,
             &c.farmer,
             &1u64,
+            &PLOT_LAT_E6,
+            &PLOT_LON_E6,
             &MIN_SUM_INSURED,
             &100_000_000i128,
             &30u32,
@@ -961,27 +993,138 @@ fn mark_claim_pending_requires_oracle_and_live_active_cover() {
 
 #[test]
 fn role_grant_ttl_is_set_on_grant_and_extended_on_use() {
-    use microcrop_shared::roles::RoleKey;
+    use microcrop_shared::{roles::RoleKey, ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS};
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    // Run against the measured mainnet/testnet limit (~180 days), not the test default.
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger()
+        .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    let admin = Address::generate(&env);
+    let pm_id = env.register(PolicyManager, (admin.clone(),));
+    let client = PolicyManagerClient::new(&env, &pm_id);
+    let backend = Address::generate(&env);
+    client.grant_role(&admin, &Role::Backend, &backend);
+
+    // `get_ttl` counts the current ledger, so an entry at the limit reports max_entry_ttl.
+    let max = NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    let day: u32 = 17_280;
+    let key = RoleKey::Role(Role::Backend, backend.clone());
+    let ttl = || env.as_contract(&pm_id, || env.storage().persistent().get_ttl(&key));
+    assert_eq!(
+        ttl(),
+        max,
+        "grant must extend the role TTL to the network maximum"
+    );
+
+    // 70 days later a role-gated call extends it back to the maximum.
+    let seq = env.ledger().sequence();
+    env.ledger().set_sequence_number(seq + 70 * day);
+    assert_eq!(ttl(), max - 70 * day);
+    client.create_policy(
+        &backend,
+        &Address::generate(&env),
+        &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
+        &MIN_SUM_INSURED,
+        &100_000_000i128,
+        &30u32,
+        &CoverageType::Comprehensive,
+        &Address::generate(&env),
+    );
+    assert_eq!(ttl(), max, "a held role must be extended on use");
+}
+
+// ---------------- Plot coordinates ----------------
+
+#[test]
+fn create_stores_the_plot_coordinates() {
+    let c = setup();
+    let id = create_default(&c);
+    let p = c.client.get_policy(&id);
+    assert_eq!(p.lat_e6, PLOT_LAT_E6);
+    assert_eq!(p.lon_e6, PLOT_LON_E6);
+}
+
+#[test]
+fn create_rejects_out_of_range_coordinates() {
+    let c = setup();
+    let create = |lat: i64, lon: i64| {
+        c.client.try_create_policy(
+            &c.backend,
+            &Address::generate(&c.env),
+            &1u64,
+            &lat,
+            &lon,
+            &MIN_SUM_INSURED,
+            &100_000_000i128,
+            &30u32,
+            &CoverageType::Comprehensive,
+            &c.org,
+        )
+    };
+    assert_err(
+        create(90_000_001, 0),
+        PolicyError::InvalidCoordinates as u32,
+    );
+    assert_err(
+        create(-90_000_001, 0),
+        PolicyError::InvalidCoordinates as u32,
+    );
+    assert_err(
+        create(0, 180_000_001),
+        PolicyError::InvalidCoordinates as u32,
+    );
+    assert_err(
+        create(0, -180_000_001),
+        PolicyError::InvalidCoordinates as u32,
+    );
+    // The poles and the antimeridian themselves are valid.
+    assert!(create(90_000_000, -180_000_000).is_ok());
+    assert!(create(-90_000_000, 180_000_000).is_ok());
+}
+
+// ---------------- TTL keep-alive ----------------
+
+#[test]
+fn extend_policy_ttl_restores_the_policy_entry_to_the_network_max() {
+    use crate::DataKey;
+    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
     use soroban_sdk::testutils::storage::Persistent as _;
 
     let c = setup();
-    let day: u32 = 17_280;
-    let key = RoleKey::Role(Role::Backend, c.backend.clone());
-    let ttl = |c: &Ctx| {
+    c.env
+        .ledger()
+        .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    let id = create_default(&c);
+    let ttl = |k: &DataKey| {
         c.env.as_contract(&c.client.address, || {
-            c.env.storage().persistent().get_ttl(&key)
+            c.env.storage().persistent().get_ttl(k)
         })
     };
-    assert!(ttl(&c) >= 90 * day - 1, "grant must extend the role TTL");
+    assert_eq!(ttl(&DataKey::Policy(id)), NETWORK_MAX_ENTRY_TTL_LEDGERS);
 
-    // 70 days later the remaining TTL is under the 30-day threshold; a role-gated call
-    // extends it back to ~90 days.
+    // ~150 days with no touch: the entry is 150 days closer to archival.
     let seq = c.env.ledger().sequence();
-    c.env.ledger().set_sequence_number(seq + 70 * day);
-    assert!(ttl(&c) < 30 * day);
-    create_default(&c);
-    assert!(
-        ttl(&c) >= 90 * day - 1,
-        "a held role must be extended on use"
+    c.env.ledger().set_sequence_number(seq + 150 * 17_280);
+    assert_eq!(
+        ttl(&DataKey::Policy(id)),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS - 150 * 17_280
+    );
+
+    // Anyone can keep it alive, with no auth.
+    c.env.set_auths(&[]);
+    c.client.extend_policy_ttl(&id);
+    assert_eq!(ttl(&DataKey::Policy(id)), NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    assert_eq!(
+        ttl(&DataKey::PendingCounted(id)),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS
+    );
+
+    assert_err(
+        c.client.try_extend_policy_ttl(&999),
+        PolicyError::PolicyDoesNotExist as u32,
     );
 }

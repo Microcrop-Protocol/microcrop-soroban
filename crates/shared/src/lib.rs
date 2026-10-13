@@ -10,9 +10,11 @@
 //! - [`roles`]      — `AccessControl`-equivalent role registry + `require_role` guard.
 //! - [`interfaces`] — `#[contractclient]` traits for cross-contract calls (no WASM build coupling).
 //! - [`encoding`]   — the FROZEN canonical byte layout for the PKP determination signature.
+//! - [`ttl`]        — storage TTL policy: extend long-lived entries to the network maximum.
 
 pub mod encoding;
 pub mod errors;
 pub mod interfaces;
 pub mod roles;
+pub mod ttl;
 pub mod types;

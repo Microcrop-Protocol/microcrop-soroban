@@ -13,6 +13,14 @@ use soroban_sdk::{contracttype, Address, String};
 
 /// Coverage kinds — ordinals 0..4 preserved from `PolicyManager.CoverageType` /
 /// `PolicyNFT.CoverageType`.
+///
+/// Settlement mapping: the only determination kind is CROP_DAMAGE (`crop-dualindex-1.0`), a
+/// cause-agnostic damage index (60% weather, 40% NDVI). It measures how much of the crop was
+/// lost, not which peril caused the loss, so it can only settle cover that pays for loss from
+/// any covered cause: `Comprehensive`. `Drought`, `Flood`, `Both` and `ExcessRain` name a
+/// peril the index cannot attribute, and `submit_determination` rejects them
+/// (`CoverageNotSettledByMethodology`). The EVM backend already creates every on-chain policy
+/// as `Comprehensive` (`policy.writer.js`, `blockchain.worker.js`).
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -74,6 +82,11 @@ pub struct Policy {
     pub id: u64,
     pub farmer: Address,
     pub plot_id: u64,
+    /// Insured plot latitude, degrees x 1e6 (signed). Set by the backend at `create_policy`;
+    /// a determination's signed `latitude_e6` must match it (PayoutReceiver step 6d).
+    pub lat_e6: i64,
+    /// Insured plot longitude, degrees x 1e6 (signed). See `lat_e6`.
+    pub lon_e6: i64,
     pub sum_insured: i128,
     pub premium: i128,
     pub start_date: u64,

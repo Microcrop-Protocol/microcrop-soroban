@@ -592,6 +592,63 @@
               "key": {
                 "vec": [
                   {
+                    "symbol": "OrgQueueAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  },
+                  {
+                    "u64": "0"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "1"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "OrgQueueTail"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "1"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+              "key": {
+                "vec": [
+                  {
                     "symbol": "OrgReserve"
                   },
                   {
@@ -643,6 +700,14 @@
                     },
                     "val": {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "queue_index"
+                    },
+                    "val": {
+                      "u64": "0"
                     }
                   },
                   {
@@ -716,7 +781,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -746,7 +811,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -776,7 +841,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -806,7 +871,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -950,7 +1015,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1010,6 +1075,22 @@
                     },
                     "val": {
                       "u64": "1"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lat_e6"
+                    },
+                    "val": {
+                      "i64": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lon_e6"
+                    },
+                    "val": {
+                      "i64": "0"
                     }
                   },
                   {
@@ -1362,7 +1443,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
       }
     ]
   },

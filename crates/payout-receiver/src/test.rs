@@ -116,6 +116,15 @@ impl MockPolicyManager {
             .get(&symbol_short!("claimed"))
             .unwrap_or(0)
     }
+    pub fn extend_policy_ttl(env: Env, _policy_id: u64) {
+        env.storage().instance().set(&symbol_short!("ttl"), &true);
+    }
+    pub fn ttl_called(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("ttl"))
+            .unwrap_or(false)
+    }
     pub fn inc_calls(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -183,6 +192,15 @@ impl MockTreasury {
             .set(&symbol_short!("settled"), &(n + 1));
         amt
     }
+    pub fn extend_policy_ttl(env: Env, _policy_id: u64) {
+        env.storage().instance().set(&symbol_short!("ttl"), &true);
+    }
+    pub fn ttl_called(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("ttl"))
+            .unwrap_or(false)
+    }
     pub fn settled_calls(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -213,6 +231,9 @@ impl MockTreasury {
 
 const NOW: u64 = 1_700_000_000;
 const SUM_INSURED: i128 = 10_000_000_000; // 1,000 USDC at 7dp (Stellar SAC)
+/// The insured plot (Nairobi), degrees x 1e6.
+const PLOT_LAT_E6: i64 = -1_286_389;
+const PLOT_LON_E6: i64 = 36_817_223;
 
 struct Fixture {
     env: Env,
@@ -236,8 +257,8 @@ fn base_det() -> CropDetermination {
         satellite_damage: 50,
         payout_amount: 5_000_000_000,
         assessed_at: NOW,
-        latitude_e6: -1_286_389,
-        longitude_e6: 36_817_223,
+        latitude_e6: PLOT_LAT_E6 as i128,
+        longitude_e6: PLOT_LON_E6 as i128,
         sum_insured: SUM_INSURED,
         ndvi_scaled: 4_200,
         weather_present: 1,
@@ -289,11 +310,13 @@ fn setup() -> Fixture {
         id: 1,
         farmer,
         plot_id: 7,
+        lat_e6: PLOT_LAT_E6,
+        lon_e6: PLOT_LON_E6,
         sum_insured: SUM_INSURED,
         premium: 500_000_000,
         start_date: NOW - 10,
         end_date: NOW + 1_000_000,
-        coverage_type: CoverageType::Drought,
+        coverage_type: CoverageType::Comprehensive,
         status: PolicyStatus::Active,
         created_at: NOW - 20,
         org,
@@ -402,11 +425,13 @@ fn paused_blocks_submit() {
         id: 1,
         farmer: farmer.clone(),
         plot_id: 7,
+        lat_e6: PLOT_LAT_E6,
+        lon_e6: PLOT_LON_E6,
         sum_insured: SUM_INSURED,
         premium: 500_000_000,
         start_date: NOW - 10,
         end_date: NOW + 1_000_000,
-        coverage_type: CoverageType::Drought,
+        coverage_type: CoverageType::Comprehensive,
         status: PolicyStatus::Active,
         created_at: NOW - 20,
         org,
@@ -622,11 +647,13 @@ fn farmer_over_claim_limit_rejected() {
         id: 1,
         farmer: farmer.clone(),
         plot_id: 7,
+        lat_e6: PLOT_LAT_E6,
+        lon_e6: PLOT_LON_E6,
         sum_insured: SUM_INSURED,
         premium: 500_000_000,
         start_date: NOW - 10,
         end_date: NOW + 1_000_000,
-        coverage_type: CoverageType::Drought,
+        coverage_type: CoverageType::Comprehensive,
         status: PolicyStatus::Active,
         created_at: NOW - 20,
         org,
@@ -686,11 +713,13 @@ fn signer_not_configured_rejected() {
         id: 1,
         farmer,
         plot_id: 7,
+        lat_e6: PLOT_LAT_E6,
+        lon_e6: PLOT_LON_E6,
         sum_insured: SUM_INSURED,
         premium: 500_000_000,
         start_date: NOW - 10,
         end_date: NOW + 1_000_000,
-        coverage_type: CoverageType::Drought,
+        coverage_type: CoverageType::Comprehensive,
         status: PolicyStatus::Active,
         created_at: NOW - 20,
         org,
@@ -846,4 +875,110 @@ fn settle_is_blocked_while_paused() {
     f.client.unpause(&f.admin);
     f.client.settle_pending_claim(&1);
     assert!(!f.client.is_claim_pending(&1));
+}
+
+// ============ Coverage-type binding (step 6c) ============
+
+#[test]
+fn crop_damage_rejects_every_single_peril_coverage() {
+    // CROP_DAMAGE is cause-agnostic: it settles Comprehensive cover only.
+    for coverage in [
+        CoverageType::Drought,
+        CoverageType::Flood,
+        CoverageType::Both,
+        CoverageType::ExcessRain,
+    ] {
+        let f = setup();
+        let mut p = f.pm.get_policy(&1);
+        p.coverage_type = coverage;
+        f.pm.set_policy(&p);
+        let d = base_det();
+        let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+        let res = f
+            .client
+            .try_submit_determination(&f.relayer, &d, &sig, &recid);
+        assert_eq!(
+            res,
+            Err(Ok(PayoutError::CoverageNotSettledByMethodology.into())),
+            "{:?} must not settle on a crop-damage determination",
+            coverage
+        );
+        assert_eq!(f.treasury.calls(), 0);
+        assert!(!f.client.is_policy_paid(&1));
+    }
+}
+
+// ============ Plot binding (step 6d) ============
+
+#[test]
+fn determination_for_another_location_is_rejected() {
+    let f = setup();
+    // Latitude 2 micro-degrees off (beyond the 1-unit tolerance).
+    let mut d = base_det();
+    d.latitude_e6 += 2;
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    assert_eq!(
+        f.client
+            .try_submit_determination(&f.relayer, &d, &sig, &recid),
+        Err(Ok(PayoutError::PlotLocationMismatch.into()))
+    );
+    // Longitude of a different farm entirely.
+    let mut d = base_det();
+    d.longitude_e6 = 36_900_000;
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    assert_eq!(
+        f.client
+            .try_submit_determination(&f.relayer, &d, &sig, &recid),
+        Err(Ok(PayoutError::PlotLocationMismatch.into()))
+    );
+    assert_eq!(f.treasury.calls(), 0);
+}
+
+#[test]
+fn one_micro_degree_rounding_difference_is_accepted() {
+    let f = setup();
+    let mut d = base_det();
+    d.latitude_e6 -= 1;
+    d.longitude_e6 += 1;
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+    assert_eq!(f.treasury.calls(), 1);
+}
+
+// ============ TTL keep-alive ============
+
+#[test]
+fn extend_policy_ttl_bumps_own_entries_and_both_siblings() {
+    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let f = setup();
+    f.env
+        .ledger()
+        .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+
+    let ttl = |k: &crate::DataKey| {
+        f.env
+            .as_contract(&f.pr_addr, || f.env.storage().persistent().get_ttl(k))
+    };
+    let seq = f.env.ledger().sequence();
+    f.env.ledger().set_sequence_number(seq + 150 * 17_280);
+    assert!(ttl(&crate::DataKey::PolicyPaid(1)) < NETWORK_MAX_ENTRY_TTL_LEDGERS);
+
+    // Permissionless.
+    f.env.set_auths(&[]);
+    f.client.extend_policy_ttl(&1);
+    assert_eq!(
+        ttl(&crate::DataKey::PolicyPaid(1)),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS
+    );
+    assert_eq!(
+        ttl(&crate::DataKey::Report(1)),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS
+    );
+    assert!(f.treasury.ttl_called());
+    assert!(f.pm.ttl_called());
 }

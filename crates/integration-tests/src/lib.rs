@@ -77,6 +77,9 @@ const DAMAGE_BP: u32 = 5_000;
 /// SUM_INSURED * 5000 / 10000.
 const PAYOUT: i128 = 5_000_000_000;
 const DURATION_DAYS: u32 = 90;
+/// The insured plot (Nairobi), degrees x 1e6 — what create_policy stores and the signer signs.
+const PLOT_LAT_E6: i64 = -1_286_389;
+const PLOT_LON_E6: i64 = 36_817_223;
 
 // ============ secp256k1 signing helpers (copied verbatim from payout-receiver/src/test.rs) ============
 
@@ -118,8 +121,8 @@ fn determination(policy_id: u64, sum_insured: i128, payout: i128) -> CropDetermi
         satellite_damage: 50,
         payout_amount: payout,
         assessed_at: NOW,
-        latitude_e6: -1_286_389,
-        longitude_e6: 36_817_223,
+        latitude_e6: PLOT_LAT_E6 as i128,
+        longitude_e6: PLOT_LON_E6 as i128,
         sum_insured,
         ndvi_scaled: 4_200,
         weather_present: 1,
@@ -156,6 +159,8 @@ struct World<'a> {
     // signing
     sk: SigningKey,
     domain: BytesN<32>,
+    // the USDC Stellar Asset Contract (issuer flags for the freeze test)
+    sac: soroban_sdk::testutils::StellarAssetContract,
 }
 
 /// Deploy + wire all four contracts exactly as a real deployment would. `mock_all_auths` covers
@@ -246,6 +251,7 @@ fn deploy<'a>() -> World<'a> {
         relayer,
         sk,
         domain,
+        sac,
     }
 }
 
@@ -256,10 +262,12 @@ impl<'a> World<'a> {
             &self.backend,
             &self.farmer,
             &7u64, // plot_id
+            &PLOT_LAT_E6,
+            &PLOT_LON_E6,
             &SUM_INSURED,
             &premium,
             &DURATION_DAYS,
-            &CoverageType::Drought,
+            &CoverageType::Comprehensive,
             &self.org,
         );
         self.pm.activate_policy(
@@ -692,10 +700,12 @@ fn pending_policy_premium_is_reserve_not_surplus() {
         &w.backend,
         &w.farmer,
         &7u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
         &SUM_INSURED,
         &premium,
         &DURATION_DAYS,
-        &CoverageType::Drought,
+        &CoverageType::Comprehensive,
         &w.org,
     );
     assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Pending);
@@ -722,4 +732,188 @@ fn pending_policy_premium_is_reserve_not_surplus() {
     assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), 0);
     assert_eq!(w.treasury.reserve_required(&w.org), 0);
     w.assert_solvent();
+}
+
+// ============ Pending claims settle first-in-first-out per org ============
+
+#[test]
+fn pending_claims_of_one_org_settle_in_arrival_order() {
+    let w = deploy();
+    let first = record_short_claim(&w); // 500 USDC pending, reserve 90 USDC
+    let second = record_short_claim(&w); // 500 USDC pending, reserve 180 USDC
+    assert_eq!(w.treasury.pending_payout_head(&w.org), Some(first));
+    assert_eq!(w.treasury.pending_payout_count(&w.org), 2);
+
+    // Fund exactly one claim. Anyone may settle, but only the head: the second claim
+    // cannot take the money the first has been waiting for.
+    w.token_admin.mint(&w.org, &(PAYOUT - 1_800_000_000));
+    w.treasury
+        .deposit_reserve(&w.org, &w.org, &(PAYOUT - 1_800_000_000));
+    w.env.set_auths(&[]);
+    assert_eq!(
+        w.pr.try_settle_pending_claim(&second),
+        Err(Ok(TreasuryError::NotPendingQueueHead.into()))
+    );
+    assert!(w.pr.is_claim_pending(&second));
+    w.pr.settle_pending_claim(&first);
+    assert_eq!(w.token.balance(&w.backend_wallet), PAYOUT);
+    assert_eq!(w.treasury.pending_payout_head(&w.org), Some(second));
+
+    // The second settles once funded.
+    w.env.mock_all_auths();
+    w.token_admin.mint(&w.org, &PAYOUT);
+    w.treasury.deposit_reserve(&w.org, &w.org, &PAYOUT);
+    w.env.set_auths(&[]);
+    w.pr.settle_pending_claim(&second);
+    assert_eq!(w.token.balance(&w.backend_wallet), 2 * PAYOUT);
+    assert_eq!(w.pm.get_policy(&second).status, PolicyStatus::Claimed);
+    assert_eq!(w.treasury.pending_payout_head(&w.org), None);
+    w.assert_solvent();
+}
+
+// ============ An issuer freeze on the backend wallet does not lose the claim ============
+
+#[test]
+fn frozen_backend_wallet_queues_the_claim_until_the_wallet_is_rotated() {
+    let w = deploy();
+    let premium: i128 = 10_000_000_000; // reserve 900 USDC covers the 500 USDC claim.
+    let policy_id = w.create_and_activate(premium);
+    w.pay_premium(policy_id, premium);
+
+    // Circle's issuer has AUTH_REVOCABLE: it deauthorizes the backend wallet.
+    w.sac
+        .issuer()
+        .set_flag(soroban_sdk::testutils::IssuerFlags::RevocableFlag);
+    w.token_admin.set_authorized(&w.backend_wallet, &false);
+
+    // The determination is accepted, not reverted: consumed, counted, and queued.
+    let d = determination(policy_id, SUM_INSURED, PAYOUT);
+    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
+    w.pr.submit_determination(&w.relayer, &d, &sig, &recid);
+    assert!(w.pr.is_policy_paid(&policy_id));
+    assert!(w.pr.is_claim_pending(&policy_id));
+    assert_eq!(
+        w.pm.get_policy(&policy_id).status,
+        PolicyStatus::ClaimPending
+    );
+    assert_eq!(w.token.balance(&w.backend_wallet), 0);
+    assert_eq!(w.treasury.org_pending_payouts(&w.org), PAYOUT);
+
+    // Settling into the frozen wallet fails and keeps the claim.
+    assert_eq!(
+        w.pr.try_settle_pending_claim(&policy_id),
+        Err(Ok(TreasuryError::PayoutTransferFailed.into()))
+    );
+    assert!(w.pr.is_claim_pending(&policy_id));
+
+    // The admin rotates the wallet; anyone settles; the farmer's claim is paid in full,
+    // long after MAX_REPORT_AGE.
+    let new_wallet = Address::generate(&w.env);
+    w.treasury.set_backend_wallet(&w.admin, &new_wallet);
+    w.env.ledger().set_timestamp(NOW + 7 * 86_400);
+    w.env.set_auths(&[]);
+    w.pr.settle_pending_claim(&policy_id);
+    assert_eq!(w.token.balance(&new_wallet), PAYOUT);
+    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
+    w.assert_solvent();
+}
+
+// ============ Coverage type and plot binding, end to end ============
+
+#[test]
+fn crop_damage_does_not_settle_single_peril_cover() {
+    let w = deploy();
+    let premium: i128 = 10_000_000_000;
+    let policy_id = w.pm.create_policy(
+        &w.backend,
+        &w.farmer,
+        &7u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
+        &SUM_INSURED,
+        &premium,
+        &DURATION_DAYS,
+        &CoverageType::Flood,
+        &w.org,
+    );
+    w.pm.activate_policy(
+        &w.backend,
+        &policy_id,
+        &w.distributor,
+        &String::from_str(&w.env, "Acme Distributor"),
+        &String::from_str(&w.env, "Rift Valley"),
+    );
+    w.pay_premium(policy_id, premium);
+
+    let d = determination(policy_id, SUM_INSURED, PAYOUT);
+    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
+    assert_eq!(
+        w.pr.try_submit_determination(&w.relayer, &d, &sig, &recid),
+        Err(Ok(PayoutError::CoverageNotSettledByMethodology.into()))
+    );
+    assert_eq!(w.token.balance(&w.backend_wallet), 0);
+}
+
+#[test]
+fn evidence_from_another_plot_does_not_settle() {
+    let w = deploy();
+    let premium: i128 = 10_000_000_000;
+    let policy_id = w.create_and_activate(premium);
+    w.pay_premium(policy_id, premium);
+
+    let mut d = determination(policy_id, SUM_INSURED, PAYOUT);
+    d.latitude_e6 = -1_300_000; // ~1.5 km south
+    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
+    assert_eq!(
+        w.pr.try_submit_determination(&w.relayer, &d, &sig, &recid),
+        Err(Ok(PayoutError::PlotLocationMismatch.into()))
+    );
+    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Active);
+}
+
+// ============ One call keeps a policy alive across all four contracts ============
+
+#[test]
+fn extend_policy_ttl_reaches_every_contract() {
+    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let w = deploy();
+    w.env
+        .ledger()
+        .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    let policy_id = record_short_claim(&w);
+
+    let ttl_in = |contract: &Address, k: &dyn Fn() -> soroban_sdk::Val| {
+        w.env
+            .as_contract(contract, || w.env.storage().persistent().get_ttl(&k()))
+    };
+    use soroban_sdk::IntoVal;
+    let pm_policy = || microcrop_policy_manager::DataKey::Policy(policy_id).into_val(&w.env);
+    let tr_premium = || microcrop_treasury::DataKey::PremiumReceived(policy_id).into_val(&w.env);
+    let pr_paid = || microcrop_payout_receiver::DataKey::PolicyPaid(policy_id).into_val(&w.env);
+    let nft_cert = || microcrop_policy_nft::DataKey::Certificate(policy_id).into_val(&w.env);
+
+    // 150 days of silence: every entry has aged.
+    let seq = w.env.ledger().sequence();
+    w.env.ledger().set_sequence_number(seq + 150 * 17_280);
+    let aged = NETWORK_MAX_ENTRY_TTL_LEDGERS - 150 * 17_280;
+    assert!(ttl_in(&w.pm.address, &pm_policy) <= aged);
+
+    // One permissionless call.
+    w.env.set_auths(&[]);
+    w.pr.extend_policy_ttl(&policy_id);
+    assert_eq!(
+        ttl_in(&w.pm.address, &pm_policy),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS
+    );
+    assert_eq!(
+        ttl_in(&w.treasury_id, &tr_premium),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS
+    );
+    assert_eq!(ttl_in(&w.pr_addr, &pr_paid), NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    assert_eq!(
+        ttl_in(&w.nft.address, &nft_cert),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS
+    );
 }

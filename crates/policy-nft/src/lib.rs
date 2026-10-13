@@ -42,20 +42,15 @@ use soroban_sdk::{
 
 use microcrop_shared::{
     errors::{CommonError, NftError},
-    roles,
+    roles, ttl,
     types::{CoverageType, PolicyCertificate, Role},
 };
 
 // ============ Storage TTL policy ============
-// ~5s ledgers => 17,280 ledgers/day. Certificates are long-lived registry records, so
-// persistent entries are bumped ~400 days on every touch (longer than a 365-day policy; the
-// host clamps to the network `max_entry_ttl`); the instance (name/symbol/wiring) ~7 days.
-// Thresholds sit one day below the bump so a bump only happens when actually needed.
-const DAY_IN_LEDGERS: u32 = 17_280;
-const INSTANCE_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
-const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
-const PERSISTENT_BUMP_AMOUNT: u32 = 400 * DAY_IN_LEDGERS;
-const PERSISTENT_LIFETIME_THRESHOLD: u32 = PERSISTENT_BUMP_AMOUNT - DAY_IN_LEDGERS;
+// Certificates and the instance (name/symbol/PolicyManager wiring) are long-lived, so every
+// touch extends them to the network maximum (`microcrop_shared::ttl`; ~180 days on mainnet
+// and testnet). The instance was bumped only ~7 days on mint; an archived PolicyNft instance
+// would make every claim, cancel and expiry pay a restore first.
 
 /// Hard maximum page size for the paginated index views. Each id is its own ledger entry,
 /// and a Soroban transaction (simulation included) may touch at most 100 footprint entries;
@@ -292,6 +287,7 @@ impl PolicyNft {
         cert.is_active = is_active;
         p.set(&DataKey::Certificate(token_id), &cert);
         Self::bump_persistent(&env, &DataKey::Certificate(token_id));
+        Self::bump_instance(&env);
 
         PolicyStatusUpdated {
             token_id,
@@ -328,6 +324,23 @@ impl PolicyNft {
         Self::bump_persistent(&env, &DataKey::Owner(token_id));
 
         Transfer { from, to, token_id }.publish(&env);
+    }
+
+    /// PERMISSIONLESS TTL helper: extend the certificate entries of `policy_id`
+    /// (`PolicyToToken`, `Certificate`, `Owner`) and the instance to the network maximum.
+    /// A no-op for a policy that was never minted. Called best effort by
+    /// `PolicyManager::extend_policy_ttl`.
+    pub fn extend_policy_ttl(env: Env, policy_id: u64) {
+        Self::bump_instance(&env);
+        let token: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PolicyToToken(policy_id));
+        if let Some(token_id) = token {
+            Self::bump_persistent(&env, &DataKey::PolicyToToken(policy_id));
+            ttl::extend_persistent_if_present(&env, &DataKey::Certificate(token_id));
+            ttl::extend_persistent_if_present(&env, &DataKey::Owner(token_id));
+        }
     }
 
     // ---- views ----
@@ -396,17 +409,11 @@ impl PolicyNft {
     // ---- internal helpers ----
 
     fn bump_instance(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        ttl::extend_instance(env);
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
-        env.storage().persistent().extend_ttl(
-            key,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
+        ttl::extend_persistent(env, key);
     }
 }
 

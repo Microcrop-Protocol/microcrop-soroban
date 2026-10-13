@@ -35,7 +35,7 @@ use soroban_sdk::{
 use microcrop_shared::{
     errors::{CommonError, TreasuryError},
     interfaces::PolicyManagerClient,
-    roles,
+    roles, ttl,
     types::{PolicyStatus, Role},
 };
 
@@ -62,18 +62,10 @@ pub const DEFAULT_PLATFORM_FEE_PERCENT: u32 = 10;
 /// The constructor refuses any other token precision.
 pub const USDC_DECIMALS: u32 = 7;
 
-// ============ TTL bump parameters ============
-// Soroban rents storage; entries expire unless their TTL is extended. We bump on every
-// state-changing entrypoint so live config + per-org reserves never lapse under regular use.
-const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers => ~1 day
-const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
-const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
-/// ~400 days: longer than MAX_DURATION_DAYS (365), so the per-policy flags
-/// (`PremiumReceived`, `PayoutProcessed`, `PendingPayout`) outlive the policy they guard.
-/// The host clamps a persistent extension to the network's `max_entry_ttl`, so on a network
-/// whose maximum is shorter the entry lives that long and is restored on access after.
-const PERSISTENT_BUMP_AMOUNT: u32 = 400 * DAY_IN_LEDGERS;
-const PERSISTENT_LIFETIME_THRESHOLD: u32 = PERSISTENT_BUMP_AMOUNT - DAY_IN_LEDGERS;
+// ============ TTL ============
+// Every touch extends the instance and the persistent entry it reads or writes to the network
+// maximum (`microcrop_shared::ttl`; ~180 days on mainnet/testnet). That is shorter than a
+// 365-day policy, so `extend_policy_ttl(policy_id)` keeps one policy's flags alive.
 
 /// Crate-local paused guard errors. The shared `TreasuryError` enum (range 200..=214) has no
 /// paused code; `Pausable`'s two reverts map here. Codes 215/216 stay inside the Treasury
@@ -146,6 +138,19 @@ pub struct ReserveBelowRequirement {
     pub org: Address,
     pub remaining: i128,
     pub required: i128,
+}
+
+/// The USDC transfer to the backend wallet failed (trustline missing, or deauthorized by the
+/// issuer — Circle's Stellar USDC issuer has `auth_revocable` set). The claim is recorded as
+/// pending instead (a `PayoutPending` event follows); rotate the wallet and settle it.
+#[contractevent]
+#[derive(Clone)]
+pub struct PayoutTransferFailed {
+    #[topic]
+    pub policy_id: u64,
+    #[topic]
+    pub recipient: Address,
+    pub amount: i128,
 }
 
 /// A verified claim could not be paid from the org reserve and was recorded as pending.
@@ -308,6 +313,13 @@ pub enum DataKey {
     PendingPayout(u64),
     /// org -> sum of its pending payouts (counted in `reserve_required`).
     OrgPendingPayouts(Address),
+    /// org -> queue index of its oldest unsettled pending payout (first-in-first-out).
+    OrgQueueHead(Address),
+    /// org -> queue index the next pending payout will take.
+    OrgQueueTail(Address),
+    /// (org, queue index) -> policy id of that pending payout. One entry per claim, removed
+    /// on settlement, so the queue never grows a single ledger entry.
+    OrgQueueAt(Address, u64),
 }
 
 /// A verified claim waiting for the org reserve. Recorded by `request_payout` when the reserve
@@ -319,6 +331,8 @@ pub struct PendingPayout {
     /// The full payout owed (USDC base units, 7dp) — never a partial amount.
     pub amount: i128,
     pub recorded_at: u64,
+    /// Position in the org's first-in-first-out pending queue. Only the head settles.
+    pub queue_index: u64,
 }
 
 #[contract]
@@ -434,7 +448,8 @@ impl Treasury {
     // ---- domain logic ----
 
     /// Port of `receivePremium` (BACKEND, when-not-paused). Reads the policy from
-    /// PolicyManager and reverts unless it is PENDING, or ACTIVE and not past `end_date`.
+    /// PolicyManager and reverts unless it is PENDING, or ACTIVE and not past `end_date`, and
+    /// unless `amount` is exactly the policy's recorded `premium` (`PremiumAmountMismatch`).
     /// Splits per-org fee, credits `org_reserve` + `accumulated_fees` + `total_premiums`,
     /// pulls USDC from `caller`.
     pub fn receive_premium(env: Env, caller: Address, policy_id: u64, amount: i128) {
@@ -462,6 +477,12 @@ impl Treasury {
                 }
             }
             _ => panic_with_error!(&env, TreasuryError::PolicyNotOpenForPremium),
+        }
+        // The premium is a single payment of exactly the priced amount. A short payment would
+        // leave cover the org's reserve was never credited for; an over-payment would credit
+        // the org with surplus no policy priced (and the flag blocks a second, correcting call).
+        if amount != policy.premium {
+            panic_with_error!(&env, TreasuryError::PremiumAmountMismatch);
         }
 
         // The backing org comes from the same read; split the per-org platform fee.
@@ -516,6 +537,11 @@ impl Treasury {
     /// it records a pending payout for the FULL `amount`, adds it to the org's pending total
     /// (which `reserve_required` includes, so the org cannot withdraw it), emits
     /// `PayoutPending`, and returns `false`. `settle_pending_payout` pays it later.
+    ///
+    /// The same happens when the reserve covers the claim but the USDC transfer to the backend
+    /// wallet fails (`PayoutTransferFailed` event): the issuer can deauthorize a trustline, and
+    /// a revert there would lose the determination. The claim joins the org's pending queue
+    /// and settles after the admin rotates the wallet with `set_backend_wallet`.
     pub fn request_payout(env: Env, caller: Address, policy_id: u64, amount: i128) -> bool {
         require_payout_receiver(&env, &caller);
         require_not_paused(&env);
@@ -550,36 +576,26 @@ impl Treasury {
         if available < amount {
             // Record the claim instead of reverting. The farmer is owed money; the backend
             // must alert the org + admin, and anyone may settle once the reserve is topped up.
-            let pending = PendingPayout {
-                org: org.clone(),
-                amount,
-                recorded_at: env.ledger().timestamp(),
-            };
-            set_persistent(&env, DataKey::PendingPayout(policy_id), &pending);
-            set_persistent(
-                &env,
-                DataKey::OrgPendingPayouts(org.clone()),
-                &(org_pending_payouts_of(&env, &org) + amount),
-            );
-            PayoutPending {
-                policy_id,
-                org,
-                amount,
-                available,
-            }
-            .publish(&env);
+            record_pending(&env, policy_id, &org, amount, available);
             return false;
         }
 
-        pay_out(&env, policy_id, &org, amount, reserve);
+        if !pay_out(&env, policy_id, &org, amount, reserve) {
+            // The wallet cannot receive USDC. Nothing moved; keep the claim instead.
+            record_pending(&env, policy_id, &org, amount, available);
+            return false;
+        }
         true
     }
 
     /// Pays a pending payout recorded by `request_payout`, in full, once the org reserve covers
     /// it (PAYOUT + caller == payout_receiver, when-not-paused). Reverts `NoPendingPayout` if
-    /// none is recorded (never, or already settled) and `InsufficientOrgReserve` if the reserve
-    /// is still short. Marks the payout processed exactly as the immediate path does. Returns
-    /// the amount paid.
+    /// none is recorded (never, or already settled), `NotPendingQueueHead` unless it is the
+    /// oldest unsettled pending payout of its org (strict first-in-first-out: whoever calls
+    /// first cannot pick which claim a partial top-up pays), `InsufficientOrgReserve` if the
+    /// reserve is still short, and `PayoutTransferFailed` if the backend wallet cannot
+    /// receive USDC (the claim stays recorded). Marks the payout processed exactly as the
+    /// immediate path does. Returns the amount paid.
     pub fn settle_pending_payout(env: Env, caller: Address, policy_id: u64) -> i128 {
         // Only the wired PayoutReceiver may settle: it clears its own pending marker and marks
         // the policy claimed in the same call. Settled any other way, the Treasury record would
@@ -597,19 +613,34 @@ impl Treasury {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, TreasuryError::NoPendingPayout));
+        let head = queue_head(&env, &pending.org);
+        if pending.queue_index != head {
+            panic_with_error!(&env, TreasuryError::NotPendingQueueHead);
+        }
         let available = org_reserve_of(&env, &pending.org);
         if available < pending.amount {
             panic_with_error!(&env, TreasuryError::InsufficientOrgReserve);
         }
 
-        // Clear the pending record and the org's pending total BEFORE paying (CEI).
+        // Clear the pending record, pop the queue head, and lower the org's pending total.
+        // A failed transfer below reverts all of it, so the claim stays recorded.
         env.storage().persistent().remove(&key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::OrgQueueAt(pending.org.clone(), head));
+        set_persistent(
+            &env,
+            DataKey::OrgQueueHead(pending.org.clone()),
+            &(head + 1),
+        );
         set_persistent(
             &env,
             DataKey::OrgPendingPayouts(pending.org.clone()),
             &(org_pending_payouts_of(&env, &pending.org) - pending.amount),
         );
-        pay_out(&env, policy_id, &pending.org, pending.amount, available);
+        if !pay_out(&env, policy_id, &pending.org, pending.amount, available) {
+            panic_with_error!(&env, TreasuryError::PayoutTransferFailed);
+        }
         PendingPayoutSettled {
             policy_id,
             org: pending.org,
@@ -790,6 +821,42 @@ impl Treasury {
         org_pending_payouts_of(&env, &org)
     }
 
+    /// The policy id of `org`'s oldest unsettled pending payout — the only one
+    /// `settle_pending_payout` (and so `PayoutReceiver::settle_pending_claim`) accepts — or
+    /// `None` when the org has none.
+    pub fn pending_payout_head(env: Env, org: Address) -> Option<u64> {
+        let head = queue_head(&env, &org);
+        if head >= queue_tail(&env, &org) {
+            return None;
+        }
+        env.storage()
+            .persistent()
+            .get(&DataKey::OrgQueueAt(org, head))
+    }
+
+    /// Number of `org`'s unsettled pending payouts.
+    pub fn pending_payout_count(env: Env, org: Address) -> u64 {
+        queue_tail(&env, &org) - queue_head(&env, &org)
+    }
+
+    /// PERMISSIONLESS keep-alive: extend every Treasury entry of `policy_id`
+    /// (`PremiumReceived`, `PayoutProcessed`, `PendingPayout` and its queue slot) and the
+    /// instance to the network maximum TTL. Absent entries are skipped. Called by
+    /// `PayoutReceiver::extend_policy_ttl`; anyone may call it directly.
+    pub fn extend_policy_ttl(env: Env, policy_id: u64) {
+        instance_bump(&env);
+        ttl::extend_persistent_if_present(&env, &DataKey::PremiumReceived(policy_id));
+        ttl::extend_persistent_if_present(&env, &DataKey::PayoutProcessed(policy_id));
+        let pending: Option<PendingPayout> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingPayout(policy_id));
+        if let Some(p) = pending {
+            ttl::extend_persistent(&env, &DataKey::PendingPayout(policy_id));
+            ttl::extend_persistent_if_present(&env, &DataKey::OrgQueueAt(p.org, p.queue_index));
+        }
+    }
+
     /// Port of `getBalance` (USDC balance of this contract).
     pub fn get_balance(env: Env) -> i128 {
         usdc(&env).balance(&env.current_contract_address())
@@ -855,9 +922,7 @@ fn usdc(env: &Env) -> TokenClient<'_> {
 }
 
 fn instance_bump(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    ttl::extend_instance(env);
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -932,11 +997,37 @@ fn require_payout_receiver(env: &Env, caller: &Address) {
     }
 }
 
-/// Debit `amount` from `org`'s reserve (which holds `available`), mark the policy's payout
-/// processed, transfer to the backend wallet, and emit the payout events + solvency signal.
-/// Shared by the immediate and the pending-settlement paths so both settle identically.
-fn pay_out(env: &Env, policy_id: u64, org: &Address, amount: i128, available: i128) {
-    // Update state BEFORE the external transfer (CEI).
+/// Transfer `amount` to the backend wallet; if that succeeds, debit it from `org`'s reserve
+/// (which holds `available`), mark the policy's payout processed, and emit the payout events +
+/// solvency signal. Shared by the immediate and the pending-settlement paths so both settle
+/// identically.
+///
+/// Returns `false`, with nothing moved and no state written, when the transfer fails: the
+/// USDC issuer can deauthorize the wallet's trustline (`auth_revocable`), and the wallet may
+/// have none. `try_transfer` contains the failure instead of reverting the caller.
+///
+/// The transfer runs before the bookkeeping. That is safe on Soroban: a contract cannot be
+/// re-entered, and the SAC is the only callee.
+fn pay_out(env: &Env, policy_id: u64, org: &Address, amount: i128, available: i128) -> bool {
+    let backend: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::BackendWallet)
+        .unwrap();
+    let sent = matches!(
+        usdc(env).try_transfer(&env.current_contract_address(), &backend, &amount),
+        Ok(Ok(()))
+    );
+    if !sent {
+        PayoutTransferFailed {
+            policy_id,
+            recipient: backend,
+            amount,
+        }
+        .publish(env);
+        return false;
+    }
+
     set_payout_processed(env, policy_id);
     set_scalar(env, &DataKey::TotalPayouts, get_total_payouts(env) + amount);
     let remaining = available - amount;
@@ -946,15 +1037,6 @@ fn pay_out(env: &Env, policy_id: u64, org: &Address, amount: i128, available: i1
         &DataKey::TotalOrgReserves,
         get_total_org_reserves(env) - amount,
     );
-
-    // Transfer USDC to backend wallet (M-Pesa offramp). A contract auto-authorizes its own
-    // balance moves.
-    let backend: Address = env
-        .storage()
-        .instance()
-        .get(&DataKey::BackendWallet)
-        .unwrap();
-    usdc(env).transfer(&env.current_contract_address(), &backend, &amount);
 
     PayoutSent {
         policy_id,
@@ -979,93 +1061,106 @@ fn pay_out(env: &Env, policy_id: u64, org: &Address, amount: i128, available: i1
         }
         .publish(env);
     }
+    true
+}
+
+/// Record a verified claim the org cannot pay now as pending, at the tail of the org's
+/// first-in-first-out queue, and add it to the org's pending total.
+fn record_pending(env: &Env, policy_id: u64, org: &Address, amount: i128, available: i128) {
+    let tail = queue_tail(env, org);
+    let pending = PendingPayout {
+        org: org.clone(),
+        amount,
+        recorded_at: env.ledger().timestamp(),
+        queue_index: tail,
+    };
+    set_persistent(env, DataKey::PendingPayout(policy_id), &pending);
+    set_persistent(env, DataKey::OrgQueueAt(org.clone(), tail), &policy_id);
+    set_persistent(env, DataKey::OrgQueueTail(org.clone()), &(tail + 1));
+    set_persistent(
+        env,
+        DataKey::OrgPendingPayouts(org.clone()),
+        &(org_pending_payouts_of(env, org) + amount),
+    );
+    PayoutPending {
+        policy_id,
+        org: org.clone(),
+        amount,
+        available,
+    }
+    .publish(env);
+}
+
+fn queue_head(env: &Env, org: &Address) -> u64 {
+    get_persistent(env, &DataKey::OrgQueueHead(org.clone())).unwrap_or(0)
+}
+
+fn queue_tail(env: &Env, org: &Address) -> u64 {
+    get_persistent(env, &DataKey::OrgQueueTail(org.clone())).unwrap_or(0)
 }
 
 fn org_pending_payouts_of(env: &Env, org: &Address) -> i128 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::OrgPendingPayouts(org.clone()))
-        .unwrap_or(0)
+    get_persistent(env, &DataKey::OrgPendingPayouts(org.clone())).unwrap_or(0)
+}
+
+/// Read a persistent entry and, when present, extend it to the network maximum TTL: every
+/// money-path read of a per-policy / per-org entry is a touch (see `microcrop_shared::ttl`).
+fn get_persistent<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: &DataKey,
+) -> Option<V> {
+    let v: Option<V> = env.storage().persistent().get(key);
+    if v.is_some() {
+        ttl::extend_persistent(env, key);
+    }
+    v
 }
 
 fn set_persistent<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: DataKey, v: &V) {
     env.storage().persistent().set(&key, v);
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+    ttl::extend_persistent(env, &key);
 }
 
 // ----- persistent per-org / per-policy accessors (with TTL bump on write) -----
 
 fn org_reserve_of(env: &Env, org: &Address) -> i128 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::OrgReserve(org.clone()))
-        .unwrap_or(0)
+    get_persistent(env, &DataKey::OrgReserve(org.clone())).unwrap_or(0)
 }
 
 fn set_org_reserve(env: &Env, org: &Address, v: i128) {
     let key = DataKey::OrgReserve(org.clone());
     env.storage().persistent().set(&key, &v);
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+    ttl::extend_persistent(env, &key);
 }
 
 fn is_premium_received(env: &Env, policy_id: u64) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::PremiumReceived(policy_id))
-        .unwrap_or(false)
+    get_persistent(env, &DataKey::PremiumReceived(policy_id)).unwrap_or(false)
 }
 
 fn set_premium_received(env: &Env, policy_id: u64) {
     let key = DataKey::PremiumReceived(policy_id);
     env.storage().persistent().set(&key, &true);
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+    ttl::extend_persistent(env, &key);
 }
 
 fn is_payout_processed(env: &Env, policy_id: u64) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::PayoutProcessed(policy_id))
-        .unwrap_or(false)
+    get_persistent(env, &DataKey::PayoutProcessed(policy_id)).unwrap_or(false)
 }
 
 fn set_payout_processed(env: &Env, policy_id: u64) {
     let key = DataKey::PayoutProcessed(policy_id);
     env.storage().persistent().set(&key, &true);
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+    ttl::extend_persistent(env, &key);
 }
 
 fn set_persistent_u32(env: &Env, key: DataKey, v: u32) {
     env.storage().persistent().set(&key, &v);
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+    ttl::extend_persistent(env, &key);
 }
 
 fn set_persistent_bool(env: &Env, key: DataKey, v: bool) {
     env.storage().persistent().set(&key, &v);
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+    ttl::extend_persistent(env, &key);
 }
 
 /// Effective reserve ratio for an org (explicit per-org value if set — including 0 — else the

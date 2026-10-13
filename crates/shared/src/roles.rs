@@ -15,11 +15,8 @@ use crate::errors::CommonError;
 use crate::types::Role;
 
 // Role grants are persistent entries; without a bump they archive after the network minimum
-// TTL and every role-gated call has to restore them first. Extend on grant and whenever a
-// grant is found (~5s ledgers => 17,280/day).
-const DAY_IN_LEDGERS: u32 = 17_280;
-const ROLE_TTL_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
-const ROLE_TTL_EXTEND_TO: u32 = 90 * DAY_IN_LEDGERS;
+// TTL and every role-gated call has to restore them first. Extend to the network maximum on
+// grant and whenever a grant is found (see [`crate::ttl`]).
 
 /// Storage key for a role grant. Lives in each contract's own storage namespace, so the
 /// same key type is reused across contracts without collision.
@@ -34,9 +31,7 @@ pub fn has_role(env: &Env, role: Role, who: &Address) -> bool {
     let key = RoleKey::Role(role, who.clone());
     let held: bool = env.storage().persistent().get(&key).unwrap_or(false);
     if held {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, ROLE_TTL_THRESHOLD, ROLE_TTL_EXTEND_TO);
+        crate::ttl::extend_persistent(env, &key);
     }
     held
 }
@@ -46,9 +41,7 @@ pub fn has_role(env: &Env, role: Role, who: &Address) -> bool {
 pub fn grant_role(env: &Env, role: Role, who: &Address) {
     let key = RoleKey::Role(role, who.clone());
     env.storage().persistent().set(&key, &true);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, ROLE_TTL_THRESHOLD, ROLE_TTL_EXTEND_TO);
+    crate::ttl::extend_persistent(env, &key);
 }
 
 /// Revoke `role` from `who`.

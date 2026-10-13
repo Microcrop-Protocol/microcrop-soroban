@@ -26,6 +26,9 @@ pub trait IPolicyManager {
     fn mark_as_claimed(env: Env, caller: Address, policy_id: u64);
     fn mark_claim_pending(env: Env, caller: Address, policy_id: u64);
     fn increment_claim_count(env: Env, caller: Address, farmer: Address);
+    /// Permissionless: extend every PolicyManager (and, best effort, PolicyNft) entry of
+    /// `policy_id` to the network maximum TTL.
+    fn extend_policy_ttl(env: Env, policy_id: u64);
 }
 
 /// Client for `Treasury` — used by `PayoutReceiver` to disburse an authorized payout.
@@ -37,6 +40,8 @@ pub trait ITreasury {
     /// Pays a recorded pending payout in full once the org reserve covers it. Returns the
     /// amount paid.
     fn settle_pending_payout(env: Env, caller: Address, policy_id: u64) -> i128;
+    /// Permissionless: extend every Treasury entry of `policy_id` to the network maximum TTL.
+    fn extend_policy_ttl(env: Env, policy_id: u64);
 }
 
 /// Client for `PolicyNft` — used by `PolicyManager` on activation (mint) and lifecycle
@@ -45,6 +50,9 @@ pub trait ITreasury {
 pub trait IPolicyNft {
     fn policy_nft_exists(env: Env, policy_id: u64) -> bool;
     fn update_policy_status(env: Env, caller: Address, policy_id: u64, is_active: bool);
+    /// Permissionless: extend the certificate entries of `policy_id` (if minted) to the
+    /// network maximum TTL.
+    fn extend_policy_ttl(env: Env, policy_id: u64);
     #[allow(clippy::too_many_arguments)]
     fn mint_policy(
         env: Env,

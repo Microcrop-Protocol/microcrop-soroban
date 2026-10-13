@@ -330,6 +330,12 @@
                   "u64": "7"
                 },
                 {
+                  "i64": "-1286389"
+                },
+                {
+                  "i64": "36817223"
+                },
+                {
                   "i128": "10000000000"
                 },
                 {
@@ -339,7 +345,7 @@
                   "u32": 90
                 },
                 {
-                  "u32": 0
+                  "u32": 4
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -1161,7 +1167,7 @@
                       "symbol": "coverage_type"
                     },
                     "val": {
-                      "u32": 0
+                      "u32": 4
                     }
                   },
                   {
@@ -1399,7 +1405,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1429,7 +1435,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1489,7 +1495,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 120960
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1685,7 +1691,7 @@
                       "symbol": "coverage_type"
                     },
                     "val": {
-                      "u32": 0
+                      "u32": 4
                     }
                   },
                   {
@@ -1718,6 +1724,22 @@
                     },
                     "val": {
                       "u64": "1"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lat_e6"
+                    },
+                    "val": {
+                      "i64": "-1286389"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lon_e6"
+                    },
+                    "val": {
+                      "i64": "36817223"
                     }
                   },
                   {
@@ -1804,7 +1826,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1834,7 +1856,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1864,7 +1886,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1894,7 +1916,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1964,6 +1986,60 @@
               "durability": "persistent",
               "val": {
                 "i128": "0"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXI7N",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "OrgQueueHead"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "1"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXI7N",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "OrgQueueTail"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "1"
               }
             }
           },
@@ -2080,7 +2156,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2110,7 +2186,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2140,7 +2216,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2170,7 +2246,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2314,7 +2390,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2474,7 +2550,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2504,7 +2580,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2534,7 +2610,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2618,7 +2694,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
       },
       {
         "entry": {

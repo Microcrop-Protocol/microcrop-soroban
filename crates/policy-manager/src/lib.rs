@@ -19,8 +19,9 @@
 //!   `try_update_policy_status` (best-effort; never bricks the lifecycle transition — Finding 5).
 //!
 //! ## Storage TTL
-//! Instance + persistent entries are bumped on access so live policies never expire. The
-//! bump amounts are well under the test-env `max_entry_ttl` so `#[cfg(test)]` runs cleanly.
+//! Instance + persistent entries are extended to the network maximum on every touch
+//! (`microcrop_shared::ttl`; ~180 days on mainnet/testnet, shorter than a 365-day policy).
+//! `extend_policy_ttl(policy_id)` is the permissionless keep-alive for one policy.
 
 use soroban_sdk::{
     contract, contractevent, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
@@ -30,7 +31,7 @@ use soroban_sdk::{
 use microcrop_shared::{
     errors::{CommonError, PolicyError},
     interfaces::PolicyNftClient,
-    roles,
+    roles, ttl,
     types::{CoverageType, Policy, PolicyStatus, Role},
 };
 
@@ -53,17 +54,13 @@ pub const SECONDS_PER_DAY: u64 = 86_400;
 /// and a Soroban transaction (simulation included) may touch at most 100 footprint entries;
 /// a page of 100 plus the count and the instance overflows that, so pages stop at 50.
 pub const MAX_PAGE_SIZE: u32 = 50;
+/// Largest valid `|lat_e6|` (90 degrees x 1e6).
+pub const MAX_LAT_E6: i64 = 90_000_000;
+/// Largest valid `|lon_e6|` (180 degrees x 1e6).
+pub const MAX_LON_E6: i64 = 180_000_000;
 /// Rolling claim window: 365 days. A claim counts against the cap until it is exactly this
 /// old. (The EVM's fixed `timestamp / 365d` bucket let six claims pay across a bucket edge.)
 pub const CLAIM_WINDOW_SECS: u64 = 365 * SECONDS_PER_DAY;
-
-// ---- TTL bump amounts (ledgers). ~17280 ledgers/day at 5s close. ----
-const DAY_IN_LEDGERS: u32 = 17_280;
-/// Bump when remaining TTL drops below ~30 days...
-const BUMP_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
-/// ...extending the entry to ~400 days out, longer than a 365-day policy and the 365-day
-/// claim window. The host clamps this to the network `max_entry_ttl` (it does not error).
-const BUMP_EXTEND_TO: u32 = 400 * DAY_IN_LEDGERS;
 
 /// Storage keys. `PolicyNft`/`PolicyCounter` are instance; the rest are persistent.
 #[contracttype]
@@ -245,15 +242,21 @@ impl PolicyManager {
 
     // ---- domain logic ----
 
-    /// Port of `createPolicy` (BACKEND). Validates farmer/org/sum/premium/duration and the
-    /// combined open-policy cap (ACTIVE + PENDING <= 5); creates PENDING policy; records
-    /// backing `org`; increments pending counter. Returns the new policy id.
+    /// Port of `createPolicy` (BACKEND). Validates farmer/org/sum/premium/duration, the plot
+    /// coordinates and the combined open-policy cap; creates PENDING policy; records backing
+    /// `org`; increments pending counter. Returns the new policy id.
+    ///
+    /// `lat_e6` / `lon_e6` are the insured plot's coordinates in degrees x 1e6, rounded the
+    /// way the Lit signer rounds them (`Math.round(deg * 1e6)`). PayoutReceiver only accepts
+    /// a determination whose signed coordinates match them (no EVM equivalent).
     #[allow(clippy::too_many_arguments)]
     pub fn create_policy(
         env: Env,
         caller: Address,
         farmer: Address,
         plot_id: u64,
+        lat_e6: i64,
+        lon_e6: i64,
         sum_insured: i128,
         premium: i128,
         duration_days: u32,
@@ -285,6 +288,13 @@ impl PolicyManager {
             panic_with_error!(&env, PolicyError::InvalidDuration);
         }
 
+        // Validate the plot coordinates (degrees x 1e6).
+        if !(-MAX_LAT_E6..=MAX_LAT_E6).contains(&lat_e6)
+            || !(-MAX_LON_E6..=MAX_LON_E6).contains(&lon_e6)
+        {
+            panic_with_error!(&env, PolicyError::InvalidCoordinates);
+        }
+
         // Cap open policies (ACTIVE + PENDING) PLUS claims already paid in the rolling window.
         // Each open policy can become at most one claim, so keeping this sum <= the claim cap
         // means every policy the farmer pays for can still pay out (audit finding 3).
@@ -310,6 +320,8 @@ impl PolicyManager {
             id: policy_id,
             farmer: farmer.clone(),
             plot_id,
+            lat_e6,
+            lon_e6,
             sum_insured,
             premium,
             start_date,
@@ -632,6 +644,23 @@ impl PolicyManager {
         .publish(&env);
     }
 
+    /// PERMISSIONLESS keep-alive: extend every PolicyManager entry of `policy_id` (`Policy`,
+    /// `PendingCounted`) and the instance to the network maximum TTL, then, best effort, the
+    /// policy's certificate in PolicyNft. A 365-day policy outlives one ~180-day TTL, so the
+    /// backend calls this (through `PayoutReceiver::extend_policy_ttl`) for open policies.
+    /// Reverts `PolicyDoesNotExist` for an unknown policy.
+    pub fn extend_policy_ttl(env: Env, policy_id: u64) {
+        // load_policy extends the Policy entry.
+        Self::load_policy(&env, policy_id);
+        ttl::extend_persistent_if_present(&env, &DataKey::PendingCounted(policy_id));
+        Self::bump_instance(&env);
+        let policy_nft: Option<Address> = env.storage().instance().get(&DataKey::PolicyNft);
+        if let Some(addr) = policy_nft {
+            // Best effort: a failing NFT call must not block the policy's own keep-alive.
+            let _ = PolicyNftClient::new(&env, &addr).try_extend_policy_ttl(&policy_id);
+        }
+    }
+
     // ---- views ----
 
     /// Port of `getPolicy`. Reverts `PolicyDoesNotExist` if unknown.
@@ -874,15 +903,11 @@ impl PolicyManager {
     }
 
     fn bump_instance(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(BUMP_THRESHOLD, BUMP_EXTEND_TO);
+        ttl::extend_instance(env);
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, BUMP_THRESHOLD, BUMP_EXTEND_TO);
+        ttl::extend_persistent(env, key);
     }
 }
 
