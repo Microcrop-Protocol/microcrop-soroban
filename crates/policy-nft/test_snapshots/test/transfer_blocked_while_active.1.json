@@ -292,7 +292,7 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "DistributorPolicies"
+                    "symbol": "DistributorCount"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -301,11 +301,37 @@
               },
               "durability": "persistent",
               "val": {
+                "u32": 1
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 518400
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
                 "vec": [
                   {
-                    "u64": "9"
+                    "symbol": "DistributorPolicy"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  },
+                  {
+                    "u32": 0
                   }
                 ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "9"
               }
             }
           },

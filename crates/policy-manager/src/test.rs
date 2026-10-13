@@ -16,8 +16,8 @@ use microcrop_shared::{
 };
 
 use crate::{
-    PolicyManager, PolicyManagerClient, MAX_SUM_INSURED, MIN_SUM_INSURED, SECONDS_PER_DAY,
-    SECONDS_PER_YEAR,
+    PolicyManager, PolicyManagerClient, MAX_PAGE_SIZE, MAX_SUM_INSURED, MIN_SUM_INSURED,
+    SECONDS_PER_DAY, SECONDS_PER_YEAR,
 };
 
 // ---- minimal PolicyNFT mock matching the IPolicyNft cross-contract interface ----
@@ -191,7 +191,7 @@ fn create_activate_claim_happy_path() {
     );
     assert!(c.client.is_policy_active(&id));
     assert_eq!(
-        c.client.get_farmer_policies(&c.farmer),
+        c.client.get_farmer_policies(&c.farmer, &0, &10),
         soroban_sdk::vec![&c.env, 1u64]
     );
 
@@ -516,4 +516,40 @@ fn sum_insured_bounds_are_seven_decimal_usdc() {
         create(MAX_SUM_INSURED + 1),
         PolicyError::SumInsuredTooHigh as u32,
     );
+}
+
+#[test]
+fn farmer_index_is_per_entry_and_paginated_past_100() {
+    // Finding 10: the farmer index used to be one Vec entry rewritten on every create. It is
+    // now one entry per policy, read in pages of at most MAX_PAGE_SIZE (50). Each policy is
+    // cancelled while PENDING so the open-policy cap does not stop the loop.
+    let c = setup();
+    for _ in 0..150 {
+        let id = create_default(&c);
+        c.client.cancel_policy(&c.backend, &id);
+    }
+    assert_eq!(c.client.get_farmer_policy_count(&c.farmer), 150);
+    assert_eq!(MAX_PAGE_SIZE, 50);
+
+    let mut seen = 0u64;
+    let mut start = 0u32;
+    while start < 150 {
+        let page = c.client.get_farmer_policies(&c.farmer, &start, &50);
+        assert_eq!(page.len(), 50);
+        for id in page.iter() {
+            seen += 1;
+            assert_eq!(id, seen);
+        }
+        start += 50;
+    }
+    assert_eq!(seen, 150);
+
+    assert_eq!(c.client.get_farmer_policies(&c.farmer, &0, &100).len(), 50);
+    assert_eq!(
+        c.client
+            .get_farmer_policies(&c.farmer, &140, &u32::MAX)
+            .len(),
+        10
+    );
+    assert_eq!(c.client.get_farmer_policies(&c.farmer, &150, &10).len(), 0);
 }

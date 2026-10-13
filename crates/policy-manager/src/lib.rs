@@ -45,6 +45,10 @@ pub const MAX_DURATION_DAYS: u32 = 365;
 pub const MAX_ACTIVE_POLICIES_PER_FARMER: u32 = 5;
 pub const MAX_CLAIMS_PER_FARMER_PER_YEAR: u32 = 3;
 pub const SECONDS_PER_DAY: u64 = 86_400;
+/// Hard maximum page size for the paginated index views. Each id is its own ledger entry,
+/// and a Soroban transaction (simulation included) may touch at most 100 footprint entries;
+/// a page of 100 plus the count and the instance overflows that, so pages stop at 50.
+pub const MAX_PAGE_SIZE: u32 = 50;
 /// `getCurrentYear = timestamp / (365 * 86400)`.
 pub const SECONDS_PER_YEAR: u64 = 365 * 86_400;
 
@@ -65,8 +69,12 @@ pub enum DataKey {
     PolicyCounter,
     /// policy_id -> Policy.
     Policy(u64),
-    /// farmer -> list of their policy ids.
-    FarmerPolicies(Address),
+    /// farmer -> number of policies ever created for them (length of the index below).
+    FarmerPolicyCount(Address),
+    /// (farmer, index) -> policy id. One entry per policy: a single `Vec` entry rewritten on
+    /// every create hit the entry-size cap after ~5,450 policies and then blocked
+    /// `create_policy` for a shared farmer address (audit finding 10).
+    FarmerPolicyAt(Address, u32),
     /// farmer -> count of ACTIVE policies.
     FarmerActiveCount(Address),
     /// farmer -> count of PENDING (created, not yet activated) policies.
@@ -291,13 +299,14 @@ impl PolicyManager {
         };
         Self::save_policy(&env, &policy);
 
-        // Update the farmer's policy list.
-        let mut list = Self::farmer_policies_vec(&env, &farmer);
-        list.push_back(policy_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::FarmerPolicies(farmer.clone()), &list);
-        Self::bump_persistent(&env, &DataKey::FarmerPolicies(farmer.clone()));
+        // Append to the farmer's policy index: one entry per policy + a count.
+        let count_key = DataKey::FarmerPolicyCount(farmer.clone());
+        let n: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let item_key = DataKey::FarmerPolicyAt(farmer.clone(), n);
+        env.storage().persistent().set(&item_key, &policy_id);
+        env.storage().persistent().set(&count_key, &(n + 1));
+        Self::bump_persistent(&env, &item_key);
+        Self::bump_persistent(&env, &count_key);
 
         // Increment the pending counter and mark the policy as counted (Finding 8).
         Self::set_farmer_pending_count(&env, &farmer, current_open_pending_inc(&env, &farmer));
@@ -546,9 +555,33 @@ impl PolicyManager {
         Self::load_policy(&env, policy_id)
     }
 
-    /// Port of `getFarmerPolicies`.
-    pub fn get_farmer_policies(env: Env, farmer: Address) -> Vec<u64> {
-        Self::farmer_policies_vec(&env, &farmer)
+    /// Port of `getFarmerPolicies`, paginated: up to `limit` policy ids starting at index
+    /// `start`, in creation order. `limit` is capped at [`MAX_PAGE_SIZE`]; a `start` past the
+    /// end returns an empty list. Use [`Self::get_farmer_policy_count`] for the total.
+    pub fn get_farmer_policies(env: Env, farmer: Address, start: u32, limit: u32) -> Vec<u64> {
+        let p = env.storage().persistent();
+        let count: u32 = p
+            .get(&DataKey::FarmerPolicyCount(farmer.clone()))
+            .unwrap_or(0);
+        let end = start.saturating_add(limit.min(MAX_PAGE_SIZE)).min(count);
+        let mut out = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            let id: u64 = p
+                .get(&DataKey::FarmerPolicyAt(farmer.clone(), i))
+                .unwrap_or_else(|| panic_with_error!(&env, PolicyError::PolicyDoesNotExist));
+            out.push_back(id);
+            i += 1;
+        }
+        out
+    }
+
+    /// Number of policies ever created for `farmer` (the length of the paged index).
+    pub fn get_farmer_policy_count(env: Env, farmer: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FarmerPolicyCount(farmer))
+            .unwrap_or(0)
     }
 
     /// Port of `getFarmerActiveCount`.
@@ -629,13 +662,6 @@ impl PolicyManager {
             }
             None => panic_with_error!(env, PolicyError::PolicyDoesNotExist),
         }
-    }
-
-    fn farmer_policies_vec(env: &Env, farmer: &Address) -> Vec<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::FarmerPolicies(farmer.clone()))
-            .unwrap_or_else(|| Vec::new(env))
     }
 
     fn farmer_active_count(env: &Env, farmer: &Address) -> u32 {
