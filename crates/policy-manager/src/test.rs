@@ -78,6 +78,7 @@ mod nft_mock {
 struct Ctx {
     env: Env,
     client: PolicyManagerClient<'static>,
+    admin: Address,
     backend: Address,
     oracle: Address,
     farmer: Address,
@@ -109,6 +110,7 @@ fn setup() -> Ctx {
     Ctx {
         env,
         client,
+        admin,
         backend,
         oracle,
         farmer,
@@ -175,9 +177,12 @@ fn create_activate_claim_happy_path() {
     assert_eq!(p.org, c.org);
     // Coverage window: end == start + 30 days.
     assert_eq!(p.end_date, p.start_date + 30 * SECONDS_PER_DAY);
-    // PENDING policy is not yet active; org exposure not counted.
+    // PENDING policy is not yet active, but its org exposure is counted from creation.
     assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
-    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
     assert!(!c.client.is_policy_active(&id));
 
     // Activate.
@@ -388,7 +393,8 @@ fn cancel_active_releases_exposure() {
         MIN_SUM_INSURED
     );
 
-    c.client.cancel_policy(&c.backend, &id);
+    // ACTIVE cover: Admin only (finding 6).
+    c.client.cancel_policy(&c.admin, &id);
     assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Cancelled);
     assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
     assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
@@ -402,12 +408,16 @@ fn expire_before_end_reverts_then_succeeds_after() {
     let p = c.client.get_policy(&id);
 
     // Not yet past end date.
-    let res = c.client.try_expire_policy(&c.backend, &id);
+    let res = c.client.try_expire_policy(&id);
+    assert_err(res, PolicyError::PolicyNotYetExpired as u32);
+    // Exactly at end_date is still covered.
+    c.env.ledger().set_timestamp(p.end_date);
+    let res = c.client.try_expire_policy(&id);
     assert_err(res, PolicyError::PolicyNotYetExpired as u32);
 
     // Advance beyond end date.
     c.env.ledger().set_timestamp(p.end_date + 1);
-    c.client.expire_policy(&c.backend, &id);
+    c.client.expire_policy(&id);
     assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Expired);
     assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
     assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
@@ -552,4 +562,137 @@ fn farmer_index_is_per_entry_and_paginated_past_100() {
         10
     );
     assert_eq!(c.client.get_farmer_policies(&c.farmer, &150, &10).len(), 0);
+}
+
+// ---------------- Finding 4: exposure counted at create ----------------
+
+#[test]
+fn cancel_pending_releases_exposure_exactly_once() {
+    let c = setup();
+    let a = create_default(&c);
+    let b = create_default(&c);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        2 * MIN_SUM_INSURED
+    );
+
+    c.client.cancel_policy(&c.backend, &a);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
+    // A second cancel of the same policy reverts and releases nothing more.
+    let res = c.client.try_cancel_policy(&c.backend, &a);
+    assert_err(res, PolicyError::InvalidPolicyStatus as u32);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
+
+    // Activation does not add the exposure a second time.
+    activate_default(&c, b);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
+}
+
+// ---------------- Finding 6: Backend cancels PENDING only ----------------
+
+#[test]
+fn backend_cannot_cancel_active_policy() {
+    let c = setup();
+    let id = create_default(&c);
+    activate_default(&c, id);
+    let res = c.client.try_cancel_policy(&c.backend, &id);
+    assert_err(res, PolicyError::CancelActiveRequiresAdmin as u32);
+    // Nothing changed.
+    assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Active);
+    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 1);
+    assert_eq!(
+        c.client.org_outstanding_sum_insured(&c.org),
+        MIN_SUM_INSURED
+    );
+}
+
+#[test]
+fn admin_can_cancel_pending_and_active() {
+    let c = setup();
+    let pending = create_default(&c);
+    let active = create_default(&c);
+    activate_default(&c, active);
+    c.client.cancel_policy(&c.admin, &pending);
+    c.client.cancel_policy(&c.admin, &active);
+    assert_eq!(
+        c.client.get_policy(&pending).status,
+        PolicyStatus::Cancelled
+    );
+    assert_eq!(c.client.get_policy(&active).status, PolicyStatus::Cancelled);
+    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
+}
+
+#[test]
+fn stranger_cannot_cancel() {
+    let c = setup();
+    let id = create_default(&c);
+    let res = c.client.try_cancel_policy(&Address::generate(&c.env), &id);
+    assert_err(res, CommonError::Unauthorized as u32);
+}
+
+// ---------------- Finding 7: expiry is permissionless + idempotent ----------------
+
+#[test]
+fn expire_needs_no_role_and_no_auth() {
+    let c = setup();
+    let id = create_default(&c);
+    activate_default(&c, id);
+    let p = c.client.get_policy(&id);
+    c.env.ledger().set_timestamp(p.end_date + 1);
+
+    // Drop every mocked authorization: if expire_policy called require_auth anywhere, this
+    // would fail.
+    c.env.set_auths(&[]);
+    c.client.expire_policy(&id);
+    assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Expired);
+    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
+}
+
+#[test]
+fn expire_is_idempotent() {
+    let c = setup();
+    let a = create_default(&c);
+    let b = create_default(&c);
+    activate_default(&c, a);
+    activate_default(&c, b);
+    let p = c.client.get_policy(&a);
+    c.env.ledger().set_timestamp(p.end_date + 1);
+
+    c.client.expire_policy(&a);
+    let outstanding = c.client.org_outstanding_sum_insured(&c.org);
+    let active = c.client.get_farmer_active_count(&c.farmer);
+    assert_eq!(outstanding, MIN_SUM_INSURED); // b is still counted
+    assert_eq!(active, 1);
+
+    // Second call: no error, no second release.
+    c.client.expire_policy(&a);
+    assert_eq!(c.client.get_policy(&a).status, PolicyStatus::Expired);
+    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), outstanding);
+    assert_eq!(c.client.get_farmer_active_count(&c.farmer), active);
+}
+
+#[test]
+fn expire_rejects_pending_and_closed_policies() {
+    let c = setup();
+    let pending = create_default(&c);
+    let p = c.client.get_policy(&pending);
+    c.env.ledger().set_timestamp(p.end_date + 1);
+    assert_err(
+        c.client.try_expire_policy(&pending),
+        PolicyError::InvalidPolicyStatus as u32,
+    );
+    c.client.cancel_policy(&c.backend, &pending);
+    assert_err(
+        c.client.try_expire_policy(&pending),
+        PolicyError::InvalidPolicyStatus as u32,
+    );
 }

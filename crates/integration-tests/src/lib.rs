@@ -504,3 +504,45 @@ fn revoking_a_role_is_visible_through_has_role() {
         "revoke must be visible via has_role"
     );
 }
+
+// ============ Finding 4: a PENDING policy's premium backs its own exposure ============
+
+#[test]
+fn pending_policy_premium_is_reserve_not_surplus() {
+    let w = deploy();
+    let premium: i128 = 10_000_000_000; // 1,000 USDC; 900 USDC net to the org reserve.
+    let policy_id = w.pm.create_policy(
+        &w.backend,
+        &w.farmer,
+        &7u64,
+        &SUM_INSURED,
+        &premium,
+        &DURATION_DAYS,
+        &CoverageType::Drought,
+        &w.org,
+    );
+    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Pending);
+    // Exposure is counted while PENDING.
+    assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), SUM_INSURED);
+
+    w.pay_premium(policy_id, premium);
+    let net = premium - premium / 10;
+    let required = w.treasury.reserve_required(&w.org);
+    assert_eq!(required, SUM_INSURED * 3_000 / 10_000);
+
+    // The org cannot take the reserve below what the PENDING policy needs.
+    let to = Address::generate(&w.env);
+    assert!(w
+        .treasury
+        .try_withdraw_org_surplus(&w.org, &(net - required + 1), &to)
+        .is_err());
+    w.treasury
+        .withdraw_org_surplus(&w.org, &(net - required), &to);
+    assert_eq!(w.treasury.org_reserve(&w.org), required);
+
+    // Cancelling the PENDING policy releases the exposure, and the requirement with it.
+    w.pm.cancel_policy(&w.backend, &policy_id);
+    assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), 0);
+    assert_eq!(w.treasury.reserve_required(&w.org), 0);
+    w.assert_solvent();
+}

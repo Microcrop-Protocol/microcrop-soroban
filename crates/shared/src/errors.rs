@@ -43,6 +43,9 @@ pub enum PolicyError {
     PolicyNftNotSet = 113,
     OrgNotSetForPolicy = 114,
     OrgAlreadySet = 115,
+    /// Only `Role::Admin` may cancel an ACTIVE policy; `Role::Backend` may cancel PENDING
+    /// ones only. Stops cover being cancelled after a loss to dodge the payout.
+    CancelActiveRequiresAdmin = 116,
 }
 
 /// `Treasury` domain errors. Range 200..=299.

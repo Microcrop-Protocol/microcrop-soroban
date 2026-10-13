@@ -42,9 +42,11 @@ pub enum PolicyStatus {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum Role {
-    /// `DEFAULT_ADMIN_ROLE` + `ADMIN_ROLE` — grants/revokes roles, config, pause.
+    /// `DEFAULT_ADMIN_ROLE` + `ADMIN_ROLE` — grants/revokes roles, config, pause, and the
+    /// escape hatch of cancelling an ACTIVE policy.
     Admin = 0,
-    /// `BACKEND_ROLE` — create/activate/cancel/expire policies; receive premiums.
+    /// `BACKEND_ROLE` — create/activate policies, cancel PENDING ones; receive premiums.
+    /// (Cancelling ACTIVE cover is Admin-only; expiry is permissionless.)
     Backend = 1,
     /// `ORACLE_ROLE` — mark claimed / increment claim count (PayoutReceiver only).
     Oracle = 2,

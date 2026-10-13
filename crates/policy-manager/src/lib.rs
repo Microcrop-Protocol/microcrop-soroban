@@ -28,7 +28,7 @@ use soroban_sdk::{
 };
 
 use microcrop_shared::{
-    errors::PolicyError,
+    errors::{CommonError, PolicyError},
     interfaces::PolicyNftClient,
     roles,
     types::{CoverageType, Policy, PolicyStatus, Role},
@@ -83,7 +83,10 @@ pub enum DataKey {
     FarmerClaimCount(Address, u64),
     /// policy_id -> whether it was counted in the pending counter at creation.
     PendingCounted(u64),
-    /// org -> outstanding (ACTIVE, unpaid) sum insured aggregated across products.
+    /// org -> outstanding (PENDING + ACTIVE, unpaid) sum insured aggregated across products.
+    /// Counted from `create_policy` so a premium paid on a PENDING policy is reserve, not
+    /// withdrawable surplus (audit finding 4); released exactly once when the policy leaves
+    /// PENDING/ACTIVE (cancel, expire, claim).
     OrgOutstanding(Address),
 }
 
@@ -133,10 +136,10 @@ pub struct PolicyCancelled {
     pub cancelled_at: u64,
 }
 
-/// `PolicyExpiredByBackend(policyId, expiredAt)`.
+/// `PolicyExpired(policyId, expiredAt)` — anyone may expire an ended policy.
 #[contractevent]
 #[derive(Clone)]
-pub struct PolicyExpiredByBackend {
+pub struct PolicyExpired {
     #[topic]
     pub policy_id: u64,
     pub expired_at: u64,
@@ -308,6 +311,12 @@ impl PolicyManager {
         Self::bump_persistent(&env, &item_key);
         Self::bump_persistent(&env, &count_key);
 
+        // The org's exposure starts now, not at activation: the premium can arrive while the
+        // policy is PENDING, and until it is counted here the org could withdraw it as surplus
+        // and the policy would activate with no reserve behind it (audit finding 4).
+        let outstanding = Self::org_outstanding(&env, &org);
+        Self::set_org_outstanding(&env, &org, outstanding + sum_insured);
+
         // Increment the pending counter and mark the policy as counted (Finding 8).
         Self::set_farmer_pending_count(&env, &farmer, current_open_pending_inc(&env, &farmer));
         env.storage()
@@ -333,7 +342,8 @@ impl PolicyManager {
     }
 
     /// Port of `activatePolicy` (BACKEND). PENDING->ACTIVE, resets coverage window to now,
-    /// moves the farmer slot pending->active, adds sum insured to org outstanding, mints the NFT.
+    /// moves the farmer slot pending->active, mints the NFT. Org exposure is unchanged: it was
+    /// counted at `create_policy`.
     pub fn activate_policy(
         env: Env,
         caller: Address,
@@ -394,9 +404,7 @@ impl PolicyManager {
             }
         }
 
-        // ACTIVE coverage adds to the org's outstanding exposure (drives Treasury solvency).
-        let outstanding = Self::org_outstanding(&env, &policy.org);
-        Self::set_org_outstanding(&env, &policy.org, outstanding + policy.sum_insured);
+        // (The org's outstanding exposure was already counted at create_policy.)
 
         // Mint the NFT certificate to the farmer. PolicyManager acts as itself (Minter).
         let nft = PolicyNftClient::new(&env, &policy_nft);
@@ -476,20 +484,33 @@ impl PolicyManager {
         .publish(&env);
     }
 
-    /// Port of `cancelPolicy` (BACKEND). PENDING/ACTIVE -> CANCELLED with the matching
+    /// Port of `cancelPolicy`. PENDING/ACTIVE -> CANCELLED with the matching
     /// counter/exposure/NFT bookkeeping.
+    ///
+    /// `Role::Backend` may cancel a PENDING policy only. Cancelling ACTIVE cover needs
+    /// `Role::Admin` (an operational escape hatch): otherwise the org's staff could cancel a
+    /// policy through the backend after a loss and keep the payout (audit finding 6).
     pub fn cancel_policy(env: Env, caller: Address, policy_id: u64) {
-        roles::require_role(&env, &caller, Role::Backend);
+        caller.require_auth();
+        let is_admin = roles::has_role(&env, Role::Admin, &caller);
+        if !is_admin && !roles::has_role(&env, Role::Backend, &caller) {
+            panic_with_error!(&env, CommonError::Unauthorized);
+        }
 
         let mut policy = Self::load_policy(&env, policy_id);
 
         if policy.status != PolicyStatus::Pending && policy.status != PolicyStatus::Active {
             panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
         }
+        if policy.status == PolicyStatus::Active && !is_admin {
+            panic_with_error!(&env, PolicyError::CancelActiveRequiresAdmin);
+        }
+
+        // Both PENDING and ACTIVE policies carry org exposure (counted at create_policy).
+        Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
 
         if policy.status == PolicyStatus::Active {
             Self::decrement_active(&env, &policy.farmer);
-            Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
             Self::deactivate_policy_nft(&env, policy_id);
         } else {
             // PENDING: release its reserved open-policy slot (only if it was counted — Finding 8).
@@ -520,12 +541,18 @@ impl PolicyManager {
         .publish(&env);
     }
 
-    /// Port of `expirePolicy` (BACKEND). ACTIVE -> EXPIRED once past end date.
-    pub fn expire_policy(env: Env, caller: Address, policy_id: u64) {
-        roles::require_role(&env, &caller, Role::Backend);
-
+    /// Port of `expirePolicy`. ACTIVE -> EXPIRED once past end date.
+    ///
+    /// Permissionless: the `now > end_date` check is the only gate, so the org's reserve and
+    /// the farmer's slot are not held hostage to the backend acting (audit finding 7).
+    /// Idempotent: expiring an already-EXPIRED policy is a no-op (no second release, no
+    /// event); any other non-ACTIVE status reverts `InvalidPolicyStatus`.
+    pub fn expire_policy(env: Env, policy_id: u64) {
         let mut policy = Self::load_policy(&env, policy_id);
 
+        if policy.status == PolicyStatus::Expired {
+            return;
+        }
         if policy.status != PolicyStatus::Active {
             panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
         }
@@ -541,7 +568,7 @@ impl PolicyManager {
         Self::save_policy(&env, &policy);
 
         Self::bump_instance(&env);
-        PolicyExpiredByBackend {
+        PolicyExpired {
             policy_id,
             expired_at: env.ledger().timestamp(),
         }
