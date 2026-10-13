@@ -19,8 +19,9 @@
 //!   `try_update_policy_status` (best-effort; never bricks the lifecycle transition — Finding 5).
 //!
 //! ## Storage TTL
-//! Instance + persistent entries are bumped on access so live policies never expire. The
-//! bump amounts are well under the test-env `max_entry_ttl` so `#[cfg(test)]` runs cleanly.
+//! Instance + persistent entries are extended to the network maximum on every touch
+//! (`microcrop_shared::ttl`; ~180 days on mainnet/testnet, shorter than a 365-day policy).
+//! `extend_policy_ttl(policy_id)` is the permissionless keep-alive for one policy.
 
 use soroban_sdk::{
     contract, contractevent, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
@@ -28,31 +29,38 @@ use soroban_sdk::{
 };
 
 use microcrop_shared::{
-    errors::PolicyError,
+    errors::{CommonError, PolicyError},
     interfaces::PolicyNftClient,
-    roles,
+    roles, ttl,
     types::{CoverageType, Policy, PolicyStatus, Role},
 };
 
 // ============ Constants (ported 1:1) ============
-/// 100 USDC (6dp).
-pub const MIN_SUM_INSURED: i128 = 100_000_000;
-/// 1,000,000 USDC (6dp).
-pub const MAX_SUM_INSURED: i128 = 1_000_000_000_000;
+/// 100 USDC in base units. Stellar USDC (a Stellar Asset Contract) has **7 decimals**, so
+/// 1 USDC = 10_000_000. The EVM source used 6dp (`100_000_000`); that value is 10 USDC here.
+pub const MIN_SUM_INSURED: i128 = 1_000_000_000;
+/// 1,000,000 USDC in base units (7dp).
+pub const MAX_SUM_INSURED: i128 = 10_000_000_000_000;
 pub const MIN_DURATION_DAYS: u32 = 30;
 pub const MAX_DURATION_DAYS: u32 = 365;
-pub const MAX_ACTIVE_POLICIES_PER_FARMER: u32 = 5;
+/// Cap on a farmer's open policies (PENDING + ACTIVE) PLUS claims paid in the rolling claim
+/// window. Equal to the claim cap, so every policy a farmer pays a premium on can still pay
+/// out (audit finding 3; was 5 open against 3 claims).
+pub const MAX_ACTIVE_POLICIES_PER_FARMER: u32 = 3;
+/// Claims per farmer in any rolling [`CLAIM_WINDOW_SECS`] window.
 pub const MAX_CLAIMS_PER_FARMER_PER_YEAR: u32 = 3;
 pub const SECONDS_PER_DAY: u64 = 86_400;
-/// `getCurrentYear = timestamp / (365 * 86400)`.
-pub const SECONDS_PER_YEAR: u64 = 365 * 86_400;
-
-// ---- TTL bump amounts (ledgers). ~17280 ledgers/day at 5s close. ----
-const DAY_IN_LEDGERS: u32 = 17_280;
-/// Bump when remaining TTL drops below ~30 days...
-const BUMP_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
-/// ...extending the entry to ~90 days out (< test-env `max_entry_ttl`).
-const BUMP_EXTEND_TO: u32 = 90 * DAY_IN_LEDGERS;
+/// Hard maximum page size for the paginated index views. Each id is its own ledger entry,
+/// and a Soroban transaction (simulation included) may touch at most 100 footprint entries;
+/// a page of 100 plus the count and the instance overflows that, so pages stop at 50.
+pub const MAX_PAGE_SIZE: u32 = 50;
+/// Largest valid `|lat_e6|` (90 degrees x 1e6).
+pub const MAX_LAT_E6: i64 = 90_000_000;
+/// Largest valid `|lon_e6|` (180 degrees x 1e6).
+pub const MAX_LON_E6: i64 = 180_000_000;
+/// Rolling claim window: 365 days. A claim counts against the cap until it is exactly this
+/// old. (The EVM's fixed `timestamp / 365d` bucket let six claims pay across a bucket edge.)
+pub const CLAIM_WINDOW_SECS: u64 = 365 * SECONDS_PER_DAY;
 
 /// Storage keys. `PolicyNft`/`PolicyCounter` are instance; the rest are persistent.
 #[contracttype]
@@ -64,17 +72,25 @@ pub enum DataKey {
     PolicyCounter,
     /// policy_id -> Policy.
     Policy(u64),
-    /// farmer -> list of their policy ids.
-    FarmerPolicies(Address),
+    /// farmer -> number of policies ever created for them (length of the index below).
+    FarmerPolicyCount(Address),
+    /// (farmer, index) -> policy id. One entry per policy: a single `Vec` entry rewritten on
+    /// every create hit the entry-size cap after ~5,450 policies and then blocked
+    /// `create_policy` for a shared farmer address (audit finding 10).
+    FarmerPolicyAt(Address, u32),
     /// farmer -> count of ACTIVE policies.
     FarmerActiveCount(Address),
     /// farmer -> count of PENDING (created, not yet activated) policies.
     FarmerPendingCount(Address),
-    /// (farmer, year) -> claim count.
-    FarmerClaimCount(Address, u64),
+    /// farmer -> timestamps of their most recent claims, oldest first, at most
+    /// `MAX_CLAIMS_PER_FARMER_PER_YEAR` long (bounded; the oldest is dropped on overflow).
+    FarmerClaimTimes(Address),
     /// policy_id -> whether it was counted in the pending counter at creation.
     PendingCounted(u64),
-    /// org -> outstanding (ACTIVE, unpaid) sum insured aggregated across products.
+    /// org -> outstanding (PENDING + ACTIVE, unpaid) sum insured aggregated across products.
+    /// Counted from `create_policy` so a premium paid on a PENDING policy is reserve, not
+    /// withdrawable surplus (audit finding 4); released exactly once when the policy leaves
+    /// PENDING/ACTIVE (cancel, expire, claim).
     OrgOutstanding(Address),
 }
 
@@ -115,6 +131,15 @@ pub struct PolicyClaimed {
     pub claimed_at: u64,
 }
 
+/// A verified claim is waiting for the org reserve (ACTIVE -> CLAIM_PENDING).
+#[contractevent]
+#[derive(Clone)]
+pub struct PolicyClaimPending {
+    #[topic]
+    pub policy_id: u64,
+    pub recorded_at: u64,
+}
+
 /// `PolicyCancelled(policyId, cancelledAt)`.
 #[contractevent]
 #[derive(Clone)]
@@ -124,10 +149,10 @@ pub struct PolicyCancelled {
     pub cancelled_at: u64,
 }
 
-/// `PolicyExpiredByBackend(policyId, expiredAt)`.
+/// `PolicyExpired(policyId, expiredAt)` — anyone may expire an ended policy.
 #[contractevent]
 #[derive(Clone)]
-pub struct PolicyExpiredByBackend {
+pub struct PolicyExpired {
     #[topic]
     pub policy_id: u64,
     pub expired_at: u64,
@@ -149,15 +174,15 @@ pub struct PolicyNftUpdateSkipped {
     pub policy_id: u64,
 }
 
-/// `ClaimCountIncremented(farmer, year, newCount)`.
+/// `ClaimCountIncremented(farmer, claimedAt, claimsInWindow)` — `claims_in_window` counts
+/// this claim and every other one in the rolling 365-day window ending now.
 #[contractevent]
 #[derive(Clone)]
 pub struct ClaimCountIncremented {
     #[topic]
     pub farmer: Address,
-    #[topic]
-    pub year: u64,
-    pub new_count: u32,
+    pub claimed_at: u64,
+    pub claims_in_window: u32,
 }
 
 #[contract]
@@ -217,15 +242,21 @@ impl PolicyManager {
 
     // ---- domain logic ----
 
-    /// Port of `createPolicy` (BACKEND). Validates farmer/org/sum/premium/duration and the
-    /// combined open-policy cap (ACTIVE + PENDING <= 5); creates PENDING policy; records
-    /// backing `org`; increments pending counter. Returns the new policy id.
+    /// Port of `createPolicy` (BACKEND). Validates farmer/org/sum/premium/duration, the plot
+    /// coordinates and the combined open-policy cap; creates PENDING policy; records backing
+    /// `org`; increments pending counter. Returns the new policy id.
+    ///
+    /// `lat_e6` / `lon_e6` are the insured plot's coordinates in degrees x 1e6, rounded the
+    /// way the Lit signer rounds them (`Math.round(deg * 1e6)`). PayoutReceiver only accepts
+    /// a determination whose signed coordinates match them (no EVM equivalent).
     #[allow(clippy::too_many_arguments)]
     pub fn create_policy(
         env: Env,
         caller: Address,
         farmer: Address,
         plot_id: u64,
+        lat_e6: i64,
+        lon_e6: i64,
         sum_insured: i128,
         premium: i128,
         duration_days: u32,
@@ -257,10 +288,27 @@ impl PolicyManager {
             panic_with_error!(&env, PolicyError::InvalidDuration);
         }
 
-        // Cap TOTAL open policies (ACTIVE + PENDING) at creation time (Finding 5).
+        // Validate the plot coordinates (degrees x 1e6).
+        if !(-MAX_LAT_E6..=MAX_LAT_E6).contains(&lat_e6)
+            || !(-MAX_LON_E6..=MAX_LON_E6).contains(&lon_e6)
+        {
+            panic_with_error!(&env, PolicyError::InvalidCoordinates);
+        }
+
+        // Only all-cause cover is sold: the crop-damage methodology cannot attribute a loss to
+        // one peril, so any other coverage type could take a premium and never pay
+        // (PayoutReceiver step 6c keeps the same check as defence in depth).
+        if coverage_type != CoverageType::Comprehensive {
+            panic_with_error!(&env, PolicyError::CoverageNotOffered);
+        }
+
+        // Cap open policies (ACTIVE + PENDING) PLUS claims already paid in the rolling window.
+        // Each open policy can become at most one claim, so keeping this sum <= the claim cap
+        // means every policy the farmer pays for can still pay out (audit finding 3).
         let current_open =
             Self::farmer_active_count(&env, &farmer) + Self::farmer_pending_count(&env, &farmer);
-        if current_open >= MAX_ACTIVE_POLICIES_PER_FARMER {
+        let recent_claims = Self::claims_in_window(&env, &farmer);
+        if current_open + recent_claims >= MAX_ACTIVE_POLICIES_PER_FARMER {
             panic_with_error!(&env, PolicyError::TooManyActivePolicies);
         }
 
@@ -279,6 +327,8 @@ impl PolicyManager {
             id: policy_id,
             farmer: farmer.clone(),
             plot_id,
+            lat_e6,
+            lon_e6,
             sum_insured,
             premium,
             start_date,
@@ -290,13 +340,20 @@ impl PolicyManager {
         };
         Self::save_policy(&env, &policy);
 
-        // Update the farmer's policy list.
-        let mut list = Self::farmer_policies_vec(&env, &farmer);
-        list.push_back(policy_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::FarmerPolicies(farmer.clone()), &list);
-        Self::bump_persistent(&env, &DataKey::FarmerPolicies(farmer.clone()));
+        // Append to the farmer's policy index: one entry per policy + a count.
+        let count_key = DataKey::FarmerPolicyCount(farmer.clone());
+        let n: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let item_key = DataKey::FarmerPolicyAt(farmer.clone(), n);
+        env.storage().persistent().set(&item_key, &policy_id);
+        env.storage().persistent().set(&count_key, &(n + 1));
+        Self::bump_persistent(&env, &item_key);
+        Self::bump_persistent(&env, &count_key);
+
+        // The org's exposure starts now, not at activation: the premium can arrive while the
+        // policy is PENDING, and until it is counted here the org could withdraw it as surplus
+        // and the policy would activate with no reserve behind it (audit finding 4).
+        let outstanding = Self::org_outstanding(&env, &org);
+        Self::set_org_outstanding(&env, &org, outstanding + sum_insured);
 
         // Increment the pending counter and mark the policy as counted (Finding 8).
         Self::set_farmer_pending_count(&env, &farmer, current_open_pending_inc(&env, &farmer));
@@ -323,7 +380,8 @@ impl PolicyManager {
     }
 
     /// Port of `activatePolicy` (BACKEND). PENDING->ACTIVE, resets coverage window to now,
-    /// moves the farmer slot pending->active, adds sum insured to org outstanding, mints the NFT.
+    /// moves the farmer slot pending->active, mints the NFT. Org exposure is unchanged: it was
+    /// counted at `create_policy`.
     pub fn activate_policy(
         env: Env,
         caller: Address,
@@ -349,6 +407,11 @@ impl PolicyManager {
         if policy.status != PolicyStatus::Pending {
             panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
         }
+        // A PENDING policy past its end date is expirable by anyone; activating it instead
+        // would revive cover the org's exposure may already have been released for.
+        if env.ledger().timestamp() > policy.end_date {
+            panic_with_error!(&env, PolicyError::PolicyExpired);
+        }
 
         // The backing org is always set by create_policy on a fresh chain; the guard is kept for
         // parity (Finding 7). `Policy.org` can never be address(0) in this port.
@@ -369,24 +432,9 @@ impl PolicyManager {
 
         // Move the farmer's slot PENDING -> ACTIVE.
         Self::set_farmer_active_count(&env, &policy.farmer, current_active + 1);
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingCounted(policy_id))
-            .unwrap_or(false)
-        {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::PendingCounted(policy_id));
-            let pending = Self::farmer_pending_count(&env, &policy.farmer);
-            if pending > 0 {
-                Self::set_farmer_pending_count(&env, &policy.farmer, pending - 1);
-            }
-        }
+        Self::release_pending_slot(&env, policy_id, &policy.farmer);
 
-        // ACTIVE coverage adds to the org's outstanding exposure (drives Treasury solvency).
-        let outstanding = Self::org_outstanding(&env, &policy.org);
-        Self::set_org_outstanding(&env, &policy.org, outstanding + policy.sum_insured);
+        // (The org's outstanding exposure was already counted at create_policy.)
 
         // Mint the NFT certificate to the farmer. PolicyManager acts as itself (Minter).
         let nft = PolicyNftClient::new(&env, &policy_nft);
@@ -414,25 +462,37 @@ impl PolicyManager {
         .publish(&env);
     }
 
-    /// Port of `markAsClaimed` (ORACLE = PayoutReceiver). ACTIVE->CLAIMED, decrements active
-    /// count, releases org exposure, deactivates NFT (best-effort).
+    /// Port of `markAsClaimed` (ORACLE = PayoutReceiver). ACTIVE or CLAIM_PENDING -> CLAIMED,
+    /// deactivates NFT (best-effort). From ACTIVE it also decrements the active count and
+    /// releases the org exposure; from CLAIM_PENDING those were already released by
+    /// `mark_claim_pending`, so they are not released twice.
+    ///
+    /// An ACTIVE policy must still be within its coverage window. A CLAIM_PENDING policy is
+    /// not checked against `end_date`: its determination was verified inside the window and
+    /// the claim is only waiting for the org reserve, so it must not lapse.
     pub fn mark_as_claimed(env: Env, caller: Address, policy_id: u64) {
         roles::require_role(&env, &caller, Role::Oracle);
 
         let mut policy = Self::load_policy(&env, policy_id);
 
-        if policy.status != PolicyStatus::Active {
-            panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
-        }
-        if env.ledger().timestamp() > policy.end_date {
-            panic_with_error!(&env, PolicyError::PolicyExpired);
-        }
+        let was_active = match policy.status {
+            PolicyStatus::Active => {
+                if env.ledger().timestamp() > policy.end_date {
+                    panic_with_error!(&env, PolicyError::PolicyExpired);
+                }
+                true
+            }
+            PolicyStatus::ClaimPending => false,
+            _ => panic_with_error!(&env, PolicyError::InvalidPolicyStatus),
+        };
 
         policy.status = PolicyStatus::Claimed;
         Self::save_policy(&env, &policy);
 
-        Self::decrement_active(&env, &policy.farmer);
-        Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
+        if was_active {
+            Self::decrement_active(&env, &policy.farmer);
+            Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
+        }
         Self::deactivate_policy_nft(&env, policy_id);
 
         Self::bump_instance(&env);
@@ -443,60 +503,100 @@ impl PolicyManager {
         .publish(&env);
     }
 
-    /// Port of `incrementClaimCount` (ORACLE). Enforces <= 3 claims/farmer/year.
-    pub fn increment_claim_count(env: Env, caller: Address, farmer: Address) {
+    /// ORACLE (PayoutReceiver). ACTIVE -> CLAIM_PENDING: a valid determination was verified
+    /// but the org reserve cannot pay it yet. The policy keeps its soulbound certificate until
+    /// `mark_as_claimed` settles it, and it cannot be expired or cancelled meanwhile. No port
+    /// equivalent in Solidity (audit findings 9/11).
+    ///
+    /// The active slot and the org exposure are released HERE, not at settlement. The claim
+    /// itself already counts against the farmer's cap (as a claim in the window) and against
+    /// the org's required reserve (as a pending payout of the full amount, in Treasury), so
+    /// keeping the slot and the exposure too would count the same policy twice.
+    pub fn mark_claim_pending(env: Env, caller: Address, policy_id: u64) {
         roles::require_role(&env, &caller, Role::Oracle);
 
-        let year = env.ledger().timestamp() / SECONDS_PER_YEAR;
-        let current = Self::farmer_claim_count(&env, &farmer, year);
-        let new_count = current + 1;
-        if new_count > MAX_CLAIMS_PER_FARMER_PER_YEAR {
-            panic_with_error!(&env, PolicyError::TooManyClaimsThisYear);
+        let mut policy = Self::load_policy(&env, policy_id);
+        if policy.status != PolicyStatus::Active {
+            panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::FarmerClaimCount(farmer.clone(), year), &new_count);
-        Self::bump_persistent(&env, &DataKey::FarmerClaimCount(farmer.clone(), year));
+        if env.ledger().timestamp() > policy.end_date {
+            panic_with_error!(&env, PolicyError::PolicyExpired);
+        }
 
-        ClaimCountIncremented {
-            farmer,
-            year,
-            new_count,
+        policy.status = PolicyStatus::ClaimPending;
+        Self::save_policy(&env, &policy);
+
+        Self::decrement_active(&env, &policy.farmer);
+        Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
+
+        Self::bump_instance(&env);
+        PolicyClaimPending {
+            policy_id,
+            recorded_at: env.ledger().timestamp(),
         }
         .publish(&env);
     }
 
-    /// Port of `cancelPolicy` (BACKEND). PENDING/ACTIVE -> CANCELLED with the matching
+    /// Port of `incrementClaimCount` (ORACLE). Enforces <= 3 claims per farmer in any
+    /// rolling 365-day window: rejects while the oldest of the farmer's last three claims is
+    /// less than [`CLAIM_WINDOW_SECS`] old.
+    pub fn increment_claim_count(env: Env, caller: Address, farmer: Address) {
+        roles::require_role(&env, &caller, Role::Oracle);
+
+        let now = env.ledger().timestamp();
+        let in_window = Self::claims_in_window(&env, &farmer);
+        if in_window >= MAX_CLAIMS_PER_FARMER_PER_YEAR {
+            panic_with_error!(&env, PolicyError::TooManyClaimsThisYear);
+        }
+
+        let key = DataKey::FarmerClaimTimes(farmer.clone());
+        let mut times = Self::claim_times(&env, &farmer);
+        times.push_back(now);
+        while times.len() > MAX_CLAIMS_PER_FARMER_PER_YEAR {
+            times.pop_front();
+        }
+        env.storage().persistent().set(&key, &times);
+        Self::bump_persistent(&env, &key);
+
+        ClaimCountIncremented {
+            farmer,
+            claimed_at: now,
+            claims_in_window: in_window + 1,
+        }
+        .publish(&env);
+    }
+
+    /// Port of `cancelPolicy`. PENDING/ACTIVE -> CANCELLED with the matching
     /// counter/exposure/NFT bookkeeping.
+    ///
+    /// `Role::Backend` may cancel a PENDING policy only. Cancelling ACTIVE cover needs
+    /// `Role::Admin` (an operational escape hatch): otherwise the org's staff could cancel a
+    /// policy through the backend after a loss and keep the payout (audit finding 6).
     pub fn cancel_policy(env: Env, caller: Address, policy_id: u64) {
-        roles::require_role(&env, &caller, Role::Backend);
+        caller.require_auth();
+        let is_admin = roles::has_role(&env, Role::Admin, &caller);
+        if !is_admin && !roles::has_role(&env, Role::Backend, &caller) {
+            panic_with_error!(&env, CommonError::Unauthorized);
+        }
 
         let mut policy = Self::load_policy(&env, policy_id);
 
         if policy.status != PolicyStatus::Pending && policy.status != PolicyStatus::Active {
             panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
         }
+        if policy.status == PolicyStatus::Active && !is_admin {
+            panic_with_error!(&env, PolicyError::CancelActiveRequiresAdmin);
+        }
+
+        // Both PENDING and ACTIVE policies carry org exposure (counted at create_policy).
+        Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
 
         if policy.status == PolicyStatus::Active {
             Self::decrement_active(&env, &policy.farmer);
-            Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
             Self::deactivate_policy_nft(&env, policy_id);
         } else {
             // PENDING: release its reserved open-policy slot (only if it was counted — Finding 8).
-            if env
-                .storage()
-                .persistent()
-                .get(&DataKey::PendingCounted(policy_id))
-                .unwrap_or(false)
-            {
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::PendingCounted(policy_id));
-                let pending = Self::farmer_pending_count(&env, &policy.farmer);
-                if pending > 0 {
-                    Self::set_farmer_pending_count(&env, &policy.farmer, pending - 1);
-                }
-            }
+            Self::release_pending_slot(&env, policy_id, &policy.farmer);
         }
 
         policy.status = PolicyStatus::Cancelled;
@@ -510,32 +610,72 @@ impl PolicyManager {
         .publish(&env);
     }
 
-    /// Port of `expirePolicy` (BACKEND). ACTIVE -> EXPIRED once past end date.
-    pub fn expire_policy(env: Env, caller: Address, policy_id: u64) {
-        roles::require_role(&env, &caller, Role::Backend);
-
+    /// Port of `expirePolicy`. ACTIVE or PENDING -> EXPIRED once past end date.
+    ///
+    /// Permissionless: the `now > end_date` check is the only gate, so the org's reserve and
+    /// the farmer's slot are not held hostage to the backend acting (audit finding 7).
+    /// A PENDING policy's `end_date` is its creation time plus its duration, so one that was
+    /// never activated also lapses: its org exposure (counted at `create_policy`) and its
+    /// pending slot are released, and it can no longer be activated.
+    /// Idempotent: expiring an already-EXPIRED policy is a no-op (no second release, no
+    /// event); any other status reverts `InvalidPolicyStatus`.
+    pub fn expire_policy(env: Env, policy_id: u64) {
         let mut policy = Self::load_policy(&env, policy_id);
 
-        if policy.status != PolicyStatus::Active {
+        if policy.status == PolicyStatus::Expired {
+            return;
+        }
+        if policy.status != PolicyStatus::Active && policy.status != PolicyStatus::Pending {
             panic_with_error!(&env, PolicyError::InvalidPolicyStatus);
         }
         if env.ledger().timestamp() <= policy.end_date {
             panic_with_error!(&env, PolicyError::PolicyNotYetExpired);
         }
 
-        Self::decrement_active(&env, &policy.farmer);
+        if policy.status == PolicyStatus::Active {
+            Self::decrement_active(&env, &policy.farmer);
+            Self::deactivate_policy_nft(&env, policy_id);
+        } else {
+            Self::release_pending_slot(&env, policy_id, &policy.farmer);
+        }
         Self::release_org_exposure(&env, &policy.org, policy.sum_insured);
-        Self::deactivate_policy_nft(&env, policy_id);
 
         policy.status = PolicyStatus::Expired;
         Self::save_policy(&env, &policy);
 
         Self::bump_instance(&env);
-        PolicyExpiredByBackend {
+        PolicyExpired {
             policy_id,
             expired_at: env.ledger().timestamp(),
         }
         .publish(&env);
+    }
+
+    /// PERMISSIONLESS keep-alive: extend every PolicyManager entry of `policy_id` (`Policy`,
+    /// `PendingCounted`) and the instance to the network maximum TTL, then, best effort, the
+    /// policy's certificate in PolicyNft. A 365-day policy outlives one ~180-day TTL, so the
+    /// backend calls this (through `PayoutReceiver::extend_policy_ttl`) for open policies.
+    /// Reverts `PolicyDoesNotExist` for an unknown policy.
+    pub fn extend_policy_ttl(env: Env, policy_id: u64) {
+        // load_policy extends the Policy entry.
+        let policy = Self::load_policy(&env, policy_id);
+        ttl::extend_persistent_if_present(&env, &DataKey::PendingCounted(policy_id));
+        // The per-farmer and per-org entries this policy's create, claim and release paths read.
+        for key in [
+            DataKey::FarmerClaimTimes(policy.farmer.clone()),
+            DataKey::FarmerActiveCount(policy.farmer.clone()),
+            DataKey::FarmerPendingCount(policy.farmer.clone()),
+            DataKey::FarmerPolicyCount(policy.farmer.clone()),
+            DataKey::OrgOutstanding(policy.org.clone()),
+        ] {
+            ttl::extend_persistent_if_present(&env, &key);
+        }
+        Self::bump_instance(&env);
+        let policy_nft: Option<Address> = env.storage().instance().get(&DataKey::PolicyNft);
+        if let Some(addr) = policy_nft {
+            // Best effort: a failing NFT call must not block the policy's own keep-alive.
+            let _ = PolicyNftClient::new(&env, &addr).try_extend_policy_ttl(&policy_id);
+        }
     }
 
     // ---- views ----
@@ -545,9 +685,36 @@ impl PolicyManager {
         Self::load_policy(&env, policy_id)
     }
 
-    /// Port of `getFarmerPolicies`.
-    pub fn get_farmer_policies(env: Env, farmer: Address) -> Vec<u64> {
-        Self::farmer_policies_vec(&env, &farmer)
+    /// Port of `getFarmerPolicies`, paginated: up to `limit` policy ids starting at index
+    /// `start`, in creation order. `limit` is capped at [`MAX_PAGE_SIZE`]; a `start` past the
+    /// end returns an empty list. Use [`Self::get_farmer_policy_count`] for the total.
+    pub fn get_farmer_policies(env: Env, farmer: Address, start: u32, limit: u32) -> Vec<u64> {
+        let p = env.storage().persistent();
+        let count: u32 = p
+            .get(&DataKey::FarmerPolicyCount(farmer.clone()))
+            .unwrap_or(0);
+        let end = start.saturating_add(limit.min(MAX_PAGE_SIZE)).min(count);
+        let mut out = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            let key = DataKey::FarmerPolicyAt(farmer.clone(), i);
+            let id: u64 = p
+                .get(&key)
+                .unwrap_or_else(|| panic_with_error!(&env, PolicyError::PolicyDoesNotExist));
+            // Reads keep old index entries live, so paging never hits an archived entry.
+            Self::bump_persistent(&env, &key);
+            out.push_back(id);
+            i += 1;
+        }
+        out
+    }
+
+    /// Number of policies ever created for `farmer` (the length of the paged index).
+    pub fn get_farmer_policy_count(env: Env, farmer: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FarmerPolicyCount(farmer))
+            .unwrap_or(0)
     }
 
     /// Port of `getFarmerActiveCount`.
@@ -555,15 +722,21 @@ impl PolicyManager {
         Self::farmer_active_count(&env, &farmer)
     }
 
-    /// Port of `getFarmerClaimCount`.
-    pub fn get_farmer_claim_count(env: Env, farmer: Address, year: u64) -> u32 {
-        Self::farmer_claim_count(&env, &farmer, year)
+    /// Claims by `farmer` in the rolling 365-day window ending now. (The EVM took a `year`
+    /// bucket; the window replaces it.)
+    pub fn get_farmer_claim_count(env: Env, farmer: Address) -> u32 {
+        Self::claims_in_window(&env, &farmer)
     }
 
-    /// Port of `canFarmerClaim`.
+    /// Timestamps of the farmer's most recent claims, oldest first (at most 3).
+    pub fn get_farmer_claim_times(env: Env, farmer: Address) -> Vec<u64> {
+        Self::claim_times(&env, &farmer)
+    }
+
+    /// Port of `canFarmerClaim`. Uses the same rolling-window predicate as
+    /// `increment_claim_count`, so the two always agree.
     pub fn can_farmer_claim(env: Env, farmer: Address) -> bool {
-        let year = env.ledger().timestamp() / SECONDS_PER_YEAR;
-        Self::farmer_claim_count(&env, &farmer, year) < MAX_CLAIMS_PER_FARMER_PER_YEAR
+        Self::claims_in_window(&env, &farmer) < MAX_CLAIMS_PER_FARMER_PER_YEAR
     }
 
     /// Port of `isPolicyActive`.
@@ -573,18 +746,14 @@ impl PolicyManager {
             .persistent()
             .get::<_, Policy>(&DataKey::Policy(policy_id))
         {
-            Some(p) => {
-                p.status == PolicyStatus::Active && env.ledger().timestamp() <= p.end_date
-            }
+            Some(p) => p.status == PolicyStatus::Active && env.ledger().timestamp() <= p.end_date,
             None => false,
         }
     }
 
     /// Port of `policyExists`.
     pub fn policy_exists(env: Env, policy_id: u64) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Policy(policy_id))
+        env.storage().persistent().has(&DataKey::Policy(policy_id))
     }
 
     /// Port of `policyOrg`. Reverts `PolicyDoesNotExist` for an unknown policy (Soroban has no
@@ -601,11 +770,6 @@ impl PolicyManager {
     /// Port of `getTotalPolicies` (the counter).
     pub fn get_total_policies(env: Env) -> u64 {
         Self::policy_counter(&env)
-    }
-
-    /// Port of `getCurrentYear` = `timestamp / (365 * 86400)`.
-    pub fn get_current_year(env: Env) -> u64 {
-        env.ledger().timestamp() / SECONDS_PER_YEAR
     }
 
     // ============ internal helpers ============
@@ -632,13 +796,6 @@ impl PolicyManager {
             }
             None => panic_with_error!(env, PolicyError::PolicyDoesNotExist),
         }
-    }
-
-    fn farmer_policies_vec(env: &Env, farmer: &Address) -> Vec<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::FarmerPolicies(farmer.clone()))
-            .unwrap_or_else(|| Vec::new(env))
     }
 
     fn farmer_active_count(env: &Env, farmer: &Address) -> u32 {
@@ -669,11 +826,24 @@ impl PolicyManager {
         Self::bump_persistent(env, &DataKey::FarmerPendingCount(farmer.clone()));
     }
 
-    fn farmer_claim_count(env: &Env, farmer: &Address, year: u64) -> u32 {
+    fn claim_times(env: &Env, farmer: &Address) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::FarmerClaimCount(farmer.clone(), year))
-            .unwrap_or(0)
+            .get(&DataKey::FarmerClaimTimes(farmer.clone()))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Claims younger than [`CLAIM_WINDOW_SECS`]: a claim at `t` counts while
+    /// `now < t + CLAIM_WINDOW_SECS` and stops counting at exactly 365 days.
+    fn claims_in_window(env: &Env, farmer: &Address) -> u32 {
+        let now = env.ledger().timestamp();
+        let mut n = 0u32;
+        for t in Self::claim_times(env, farmer).iter() {
+            if now < t.saturating_add(CLAIM_WINDOW_SECS) {
+                n += 1;
+            }
+        }
+        n
     }
 
     fn org_outstanding(env: &Env, org: &Address) -> i128 {
@@ -695,6 +865,19 @@ impl PolicyManager {
         let c = Self::farmer_active_count(env, farmer);
         if c > 0 {
             Self::set_farmer_active_count(env, farmer, c - 1);
+        }
+    }
+
+    /// Release a PENDING policy's slot in the farmer's pending count, only if `create_policy`
+    /// counted it (Finding 8). Removes the marker so the slot is released at most once.
+    fn release_pending_slot(env: &Env, policy_id: u64, farmer: &Address) {
+        let key = DataKey::PendingCounted(policy_id);
+        if env.storage().persistent().get(&key).unwrap_or(false) {
+            env.storage().persistent().remove(&key);
+            let pending = Self::farmer_pending_count(env, farmer);
+            if pending > 0 {
+                Self::set_farmer_pending_count(env, farmer, pending - 1);
+            }
         }
     }
 
@@ -737,15 +920,11 @@ impl PolicyManager {
     }
 
     fn bump_instance(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(BUMP_THRESHOLD, BUMP_EXTEND_TO);
+        ttl::extend_instance(env);
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, BUMP_THRESHOLD, BUMP_EXTEND_TO);
+        ttl::extend_persistent(env, key);
     }
 }
 

@@ -43,6 +43,15 @@ pub enum PolicyError {
     PolicyNftNotSet = 113,
     OrgNotSetForPolicy = 114,
     OrgAlreadySet = 115,
+    /// Only `Role::Admin` may cancel an ACTIVE policy; `Role::Backend` may cancel PENDING
+    /// ones only. Stops cover being cancelled after a loss to dodge the payout.
+    CancelActiveRequiresAdmin = 116,
+    /// `create_policy` with `|lat_e6| > 90_000_000` or `|lon_e6| > 180_000_000`.
+    InvalidCoordinates = 117,
+    /// `create_policy` with a coverage type other than `Comprehensive`. The only claim
+    /// methodology (crop damage) measures loss, not its cause, so single-peril cover could
+    /// never pay out. Rejected at sale so no premium is taken for it.
+    CoverageNotOffered = 118,
 }
 
 /// `Treasury` domain errors. Range 200..=299.
@@ -65,6 +74,37 @@ pub enum TreasuryError {
     BpsTooHigh = 212,
     WouldBreachReserve = 213,
     NoFeesToWithdraw = 214,
+    // 215 / 216 are the crate-local `treasury::PausedError` codes; do not reuse them here.
+    /// The USDC token passed to the constructor does not report `decimals() == 7`. Every
+    /// amount constant and the Lit signer's scaling assume 7dp (Stellar Asset Contract).
+    UsdcDecimalsMismatch = 217,
+    /// `set_org_reserve_ratio_bps` below `MIN_RESERVE_RATIO_BPS` (30%): the smallest valid
+    /// payout is 30% of cover, so a lower floor lets the org withdraw the money a claim needs.
+    ReserveRatioTooLow = 218,
+    /// `receive_premium` for a policy that is not PENDING or ACTIVE (cancelled, expired,
+    /// claimed or claim-pending): crediting it would hand the org withdrawable surplus.
+    PolicyNotOpenForPremium = 219,
+    /// `receive_premium` for an ACTIVE policy whose coverage already ended (`now > end_date`).
+    PolicyCoverageEnded = 220,
+    /// `settle_pending_payout` for a policy with no recorded pending payout (never recorded,
+    /// or already settled).
+    NoPendingPayout = 221,
+    /// `request_payout` for a policy that already has a recorded pending payout.
+    PayoutAlreadyPending = 222,
+    /// `receive_premium` with an amount other than the policy's recorded `premium`.
+    PremiumAmountMismatch = 223,
+    /// `settle_pending_payout` for a pending payout that is not at the head of its org's
+    /// first-in-first-out queue. Settle `pending_payout_head(org)` first.
+    NotPendingQueueHead = 224,
+    /// `settle_pending_payout` could not transfer USDC to the backend wallet (trustline
+    /// missing or deauthorized by the issuer). The claim stays recorded; rotate the wallet
+    /// with `set_backend_wallet` and settle again.
+    PayoutTransferFailed = 225,
+    /// `set_payout_receiver` while any org has an unsettled pending payout. Each pending
+    /// claim's marker lives in the current PayoutReceiver, so switching would strand it and,
+    /// with first-in-first-out settlement, block the org's whole queue. Settle first, or
+    /// upgrade the PayoutReceiver in place.
+    PayoutsStillPending = 226,
 }
 
 /// `PayoutReceiver` domain errors. Range 300..=399. Order mirrors the 12 validation steps.
@@ -90,6 +130,14 @@ pub enum PayoutError {
     FarmerClaimLimitExceeded = 315,
     DeterminationAlreadyConsumed = 316,
     InvalidSignature = 317,
+    // 318 is the crate-local `payout_receiver::PausedError::ContractPaused`.
+    /// `settle_pending_claim` for a policy with no claim awaiting funding.
+    NoPendingClaim = 319,
+    /// The policy's coverage type is not one the CROP_DAMAGE methodology settles (only
+    /// `CoverageType::Comprehensive`; see `CoverageType`).
+    CoverageNotSettledByMethodology = 320,
+    /// The signed `latitude_e6` / `longitude_e6` are not the insured plot's coordinates.
+    PlotLocationMismatch = 321,
 }
 
 /// `PolicyNft` domain errors. Range 400..=499.

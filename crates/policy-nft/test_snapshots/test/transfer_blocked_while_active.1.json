@@ -78,7 +78,7 @@
                   "string": "Acre Africa"
                 },
                 {
-                  "i128": "1000000000"
+                  "i128": "10000000000"
                 },
                 {
                   "i128": "50000000"
@@ -271,7 +271,7 @@
                       "symbol": "sum_insured"
                     },
                     "val": {
-                      "i128": "1000000000"
+                      "i128": "10000000000"
                     }
                   }
                 ]
@@ -280,7 +280,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -292,7 +292,7 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "DistributorPolicies"
+                    "symbol": "DistributorCount"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -301,17 +301,43 @@
               },
               "durability": "persistent",
               "val": {
-                "vec": [
-                  {
-                    "u64": "9"
-                  }
-                ]
+                "u32": 1
               }
             }
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "DistributorPolicy"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  },
+                  {
+                    "u32": 0
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "9"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -338,7 +364,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -365,7 +391,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 518400
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -395,7 +421,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -425,7 +451,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -485,7 +511,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 120960
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -519,7 +545,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 120960
+        "live_until": 6311999
       }
     ]
   },

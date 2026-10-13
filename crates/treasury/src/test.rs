@@ -12,24 +12,25 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
     Address, Env,
 };
 
-use microcrop_shared::types::Role;
+use microcrop_shared::types::{CoverageType, Policy, PolicyStatus, Role};
 
 use crate::{Treasury, TreasuryClient};
 
 // ---------------- Mock PolicyManager ----------------
-// The real PolicyManager is a separate crate (still a stub); Treasury only needs the two v3
-// per-org reads. This mock exposes exactly the `PolicyManagerClient` methods Treasury calls:
-// `policy_org(policy_id)` and `org_outstanding_sum_insured(org)`.
+// The Treasury reads a policy (status, end date, org) and an org's outstanding exposure. This
+// mock exposes exactly the `PolicyManagerClient` methods Treasury calls: `get_policy`,
+// `policy_org` and `org_outstanding_sum_insured`. `set_org` stores an ACTIVE policy with a
+// far end date; `set_status` / `set_end_date` move it for the status-gate tests.
 
 #[contracttype]
 #[derive(Clone)]
 enum MockKey {
-    Org(u64),
+    Policy(u64),
     Outstanding(Address),
 }
 
@@ -39,7 +40,48 @@ struct MockPm;
 #[contractimpl]
 impl MockPm {
     pub fn set_org(env: Env, policy_id: u64, org: Address) {
-        env.storage().persistent().set(&MockKey::Org(policy_id), &org);
+        let p = Policy {
+            id: policy_id,
+            farmer: org.clone(),
+            plot_id: 1,
+            lat_e6: 0,
+            lon_e6: 0,
+            sum_insured: 1_000_000_000,
+            premium: 1_000_000,
+            start_date: 0,
+            end_date: u64::MAX,
+            coverage_type: CoverageType::Drought,
+            status: PolicyStatus::Active,
+            created_at: 0,
+            org,
+        };
+        env.storage()
+            .persistent()
+            .set(&MockKey::Policy(policy_id), &p);
+    }
+
+    pub fn set_status(env: Env, policy_id: u64, status: PolicyStatus) {
+        let mut p = Self::get_policy(env.clone(), policy_id);
+        p.status = status;
+        env.storage()
+            .persistent()
+            .set(&MockKey::Policy(policy_id), &p);
+    }
+
+    pub fn set_premium(env: Env, policy_id: u64, premium: i128) {
+        let mut p = Self::get_policy(env.clone(), policy_id);
+        p.premium = premium;
+        env.storage()
+            .persistent()
+            .set(&MockKey::Policy(policy_id), &p);
+    }
+
+    pub fn set_end_date(env: Env, policy_id: u64, end_date: u64) {
+        let mut p = Self::get_policy(env.clone(), policy_id);
+        p.end_date = end_date;
+        env.storage()
+            .persistent()
+            .set(&MockKey::Policy(policy_id), &p);
     }
 
     pub fn set_outstanding(env: Env, org: Address, amount: i128) {
@@ -49,11 +91,15 @@ impl MockPm {
     }
 
     // --- methods invoked by Treasury via PolicyManagerClient ---
-    pub fn policy_org(env: Env, policy_id: u64) -> Address {
+    pub fn get_policy(env: Env, policy_id: u64) -> Policy {
         env.storage()
             .persistent()
-            .get(&MockKey::Org(policy_id))
+            .get(&MockKey::Policy(policy_id))
             .unwrap()
+    }
+
+    pub fn policy_org(env: Env, policy_id: u64) -> Address {
+        Self::get_policy(env, policy_id).org
     }
 
     pub fn org_outstanding_sum_insured(env: Env, org: Address) -> i128 {
@@ -61,6 +107,20 @@ impl MockPm {
             .persistent()
             .get(&MockKey::Outstanding(org))
             .unwrap_or(0)
+    }
+}
+
+// ---------------- Mock 6-decimal token ----------------
+// Stands in for a non-Stellar USDC (e.g. a bridged 6dp token). Only `decimals()` is called by
+// the Treasury constructor.
+
+#[contract]
+struct SixDecimalToken;
+
+#[contractimpl]
+impl SixDecimalToken {
+    pub fn decimals(_env: Env) -> u32 {
+        6
     }
 }
 
@@ -78,6 +138,7 @@ struct Ctx<'a> {
     payout_receiver: Address,
     org: Address,
     pm_id: Address,
+    sac: soroban_sdk::testutils::StellarAssetContract,
 }
 
 fn setup<'a>() -> Ctx<'a> {
@@ -124,6 +185,7 @@ fn setup<'a>() -> Ctx<'a> {
         payout_receiver,
         org,
         pm_id,
+        sac,
     }
 }
 
@@ -153,7 +215,8 @@ fn premium_split_and_payout_happy_path() {
     // policy 1 backs `org`.
     c.pm().set_org(&1u64, &c.org);
 
-    // Fund the backend payer with USDC and let it pay a 1_000_000 (1 USDC, 6dp) premium.
+    // Fund the backend payer with USDC and let it pay a 1_000_000 base-unit premium
+    // (0.1 USDC: the SAC has 7 decimals).
     c.token_admin.mint(&c.backend, &1_000_000);
     c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
 
@@ -184,6 +247,7 @@ fn premium_split_and_payout_happy_path() {
 fn per_org_fee_override_is_honored() {
     let c = setup();
     c.pm().set_org(&7u64, &c.org);
+    c.pm().set_premium(&7u64, &2_000_000);
     // Explicit 500 bps (5%) fee for this org.
     c.treasury.set_org_fee_bps(&c.admin, &c.org, &500u32);
 
@@ -193,7 +257,10 @@ fn per_org_fee_override_is_honored() {
     // 5% of 2_000_000 = 100_000 fee; net 1_900_000.
     assert_eq!(c.treasury.accumulated_fees(), 100_000);
     assert_eq!(c.treasury.org_reserve(&c.org), 1_900_000);
-    assert_eq!(c.treasury.calculate_platform_fee(&2_000_000, &c.org), 100_000);
+    assert_eq!(
+        c.treasury.calculate_platform_fee(&2_000_000, &c.org),
+        100_000
+    );
     c.assert_solvent();
 }
 
@@ -215,15 +282,25 @@ fn explicit_zero_fee_bps_is_honored_over_global() {
 // ---------------- Guards ----------------
 
 #[test]
-#[should_panic(expected = "#204")] // InsufficientOrgReserve
-fn payout_exceeding_org_reserve_reverts() {
+fn payout_exceeding_org_reserve_is_recorded_pending_not_paid() {
     let c = setup();
     c.pm().set_org(&1u64, &c.org);
     c.token_admin.mint(&c.backend, &1_000_000);
     c.treasury.receive_premium(&c.backend, &1u64, &1_000_000); // org reserve = 900_000
-    // Ask for more than the org holds.
-    c.treasury
+
+    // Ask for more than the org holds: no revert, nothing paid, the full amount recorded.
+    let paid_now = c
+        .treasury
         .request_payout(&c.payout_receiver, &1u64, &900_001);
+    assert!(!paid_now);
+    assert_eq!(c.token.balance(&c.backend_wallet), 0);
+    assert_eq!(c.treasury.org_reserve(&c.org), 900_000);
+    assert!(!c.treasury.is_payout_processed(&1u64));
+    let pending = c.treasury.get_pending_payout(&1u64).unwrap();
+    assert_eq!(pending.amount, 900_001);
+    assert_eq!(pending.org, c.org);
+    assert_eq!(c.treasury.org_pending_payouts(&c.org), 900_001);
+    c.assert_solvent();
 }
 
 #[test]
@@ -258,7 +335,8 @@ fn payout_without_premium_reverts() {
     // failure is specifically PremiumNotReceived (not InsufficientOrgReserve).
     c.token_admin.mint(&c.org, &1_000_000);
     c.treasury.deposit_reserve(&c.org, &c.org, &1_000_000);
-    c.treasury.request_payout(&c.payout_receiver, &5u64, &100_000);
+    c.treasury
+        .request_payout(&c.payout_receiver, &5u64, &100_000);
 }
 
 #[test]
@@ -288,21 +366,21 @@ fn zero_premium_reverts() {
 #[test]
 fn deposit_and_withdraw_surplus() {
     let c = setup();
-    // Org has 1000 outstanding sum insured at the default 2000 bps (20%) ratio => required 200.
+    // Org has 1000 outstanding sum insured at the default 3000 bps (30%) ratio => required 300.
     c.pm().set_outstanding(&c.org, &1_000);
 
     c.token_admin.mint(&c.org, &1_000);
     c.treasury.deposit_reserve(&c.org, &c.org, &1_000);
     assert_eq!(c.treasury.org_reserve(&c.org), 1_000);
-    assert_eq!(c.treasury.reserve_required(&c.org), 200);
+    assert_eq!(c.treasury.reserve_required(&c.org), 300);
     assert!(c.treasury.meets_reserve_requirements(&c.org));
     c.assert_solvent();
 
-    // Withdraw surplus down to exactly the required reserve (1000 - 800 = 200).
+    // Withdraw surplus down to exactly the required reserve (1000 - 700 = 300).
     let to = Address::generate(&c.env);
-    c.treasury.withdraw_org_surplus(&c.org, &800, &to);
-    assert_eq!(c.treasury.org_reserve(&c.org), 200);
-    assert_eq!(c.token.balance(&to), 800);
+    c.treasury.withdraw_org_surplus(&c.org, &700, &to);
+    assert_eq!(c.treasury.org_reserve(&c.org), 300);
+    assert_eq!(c.token.balance(&to), 700);
     c.assert_solvent();
 }
 
@@ -310,12 +388,12 @@ fn deposit_and_withdraw_surplus() {
 #[should_panic(expected = "#213")] // WouldBreachReserve
 fn withdraw_below_required_reserve_reverts() {
     let c = setup();
-    c.pm().set_outstanding(&c.org, &1_000); // required = 200
+    c.pm().set_outstanding(&c.org, &1_000); // required = 300
     c.token_admin.mint(&c.org, &1_000);
     c.treasury.deposit_reserve(&c.org, &c.org, &1_000);
     let to = Address::generate(&c.env);
-    // Leaving 199 < required 200.
-    c.treasury.withdraw_org_surplus(&c.org, &801, &to);
+    // Leaving 299 < required 300.
+    c.treasury.withdraw_org_surplus(&c.org, &701, &to);
 }
 
 // ---------------- Fees / emergency ----------------
@@ -403,4 +481,587 @@ fn set_platform_fee_above_max_reverts() {
 fn set_org_fee_above_max_reverts() {
     let c = setup();
     c.treasury.set_org_fee_bps(&c.admin, &c.org, &3_001u32);
+}
+
+// ---------------- Token precision (finding 5) ----------------
+
+#[test]
+fn usdc_sac_reports_seven_decimals() {
+    let c = setup();
+    // The SAC the harness registers is what Stellar USDC is: 7 decimals.
+    assert_eq!(c.token.decimals(), crate::USDC_DECIMALS);
+    assert_eq!(crate::USDC_DECIMALS, 7);
+}
+
+#[test]
+#[should_panic(expected = "#217")] // UsdcDecimalsMismatch
+fn constructor_rejects_a_non_seven_decimal_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let backend_wallet = Address::generate(&env);
+    let six_dp = env.register(SixDecimalToken, ());
+    env.register(Treasury, (six_dp, backend_wallet, admin));
+}
+
+// ---------------- Reserve floor (finding 2) ----------------
+
+#[test]
+fn default_reserve_ratio_is_thirty_percent() {
+    assert_eq!(crate::DEFAULT_RESERVE_RATIO_BPS, 3_000);
+    assert_eq!(crate::MIN_RESERVE_RATIO_BPS, 3_000);
+}
+
+#[test]
+#[should_panic(expected = "#218")] // ReserveRatioTooLow
+fn set_org_reserve_ratio_below_floor_reverts() {
+    let c = setup();
+    c.treasury
+        .set_org_reserve_ratio_bps(&c.admin, &c.org, &2_999u32);
+}
+
+#[test]
+fn set_org_reserve_ratio_at_floor_and_above_is_accepted() {
+    let c = setup();
+    c.pm().set_outstanding(&c.org, &10_000);
+    c.treasury
+        .set_org_reserve_ratio_bps(&c.admin, &c.org, &3_000u32);
+    assert_eq!(c.treasury.reserve_required(&c.org), 3_000);
+    c.treasury
+        .set_org_reserve_ratio_bps(&c.admin, &c.org, &5_000u32);
+    assert_eq!(c.treasury.reserve_required(&c.org), 5_000);
+}
+
+#[test]
+fn smallest_valid_payout_survives_a_maximal_surplus_withdrawal() {
+    // The org withdraws every unit it is allowed to; a 30% claim (the minimum a
+    // determination can carry) must still be payable from what is left.
+    let c = setup();
+    let sum_insured: i128 = 1_000_000;
+    c.pm().set_org(&1u64, &c.org);
+    c.pm().set_outstanding(&c.org, &sum_insured);
+    c.token_admin.mint(&c.org, &sum_insured);
+    c.treasury.deposit_reserve(&c.org, &c.org, &sum_insured);
+    c.pm().set_premium(&1u64, &100_000);
+    c.token_admin.mint(&c.backend, &100_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &100_000); // +90_000 net
+
+    let required = c.treasury.reserve_required(&c.org);
+    assert_eq!(required, sum_insured * 3_000 / 10_000);
+    let surplus = c.treasury.org_reserve(&c.org) - required;
+    let to = Address::generate(&c.env);
+    c.treasury.withdraw_org_surplus(&c.org, &surplus, &to);
+    assert_eq!(c.treasury.org_reserve(&c.org), required);
+
+    // 30% payout drains the floor exactly; it does not revert.
+    c.treasury
+        .request_payout(&c.payout_receiver, &1u64, &(sum_insured * 3_000 / 10_000));
+    assert_eq!(c.treasury.org_reserve(&c.org), 0);
+    c.assert_solvent();
+}
+
+// ---------------- Premium only for open policies (finding 8) ----------------
+
+fn premium_on_status(status: PolicyStatus) {
+    let c = setup();
+    c.pm().set_org(&1u64, &c.org);
+    c.pm().set_status(&1u64, &status);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+}
+
+#[test]
+fn premium_accepted_for_pending_policy() {
+    premium_on_status(PolicyStatus::Pending);
+}
+
+#[test]
+#[should_panic(expected = "#219")] // PolicyNotOpenForPremium
+fn premium_rejected_for_cancelled_policy() {
+    premium_on_status(PolicyStatus::Cancelled);
+}
+
+#[test]
+#[should_panic(expected = "#219")]
+fn premium_rejected_for_expired_policy() {
+    premium_on_status(PolicyStatus::Expired);
+}
+
+#[test]
+#[should_panic(expected = "#219")]
+fn premium_rejected_for_claimed_policy() {
+    premium_on_status(PolicyStatus::Claimed);
+}
+
+#[test]
+#[should_panic(expected = "#220")] // PolicyCoverageEnded
+fn premium_rejected_for_active_policy_past_end_date() {
+    let c = setup();
+    c.env.ledger().set_timestamp(10_000);
+    c.pm().set_org(&1u64, &c.org);
+    c.pm().set_end_date(&1u64, &9_999u64);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+}
+
+#[test]
+fn premium_accepted_for_active_policy_on_its_end_date() {
+    let c = setup();
+    c.env.ledger().set_timestamp(10_000);
+    c.pm().set_org(&1u64, &c.org);
+    c.pm().set_end_date(&1u64, &10_000u64);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+    assert!(c.treasury.is_premium_received(&1u64));
+}
+
+// ---------------- Pending payouts (findings 9 and 11) ----------------
+
+/// Premium of 1_000_000 for policy 1 (net 900_000 reserve), then a 2_000_000 payout that
+/// the reserve cannot cover, so it is recorded as pending.
+fn setup_with_pending<'a>() -> Ctx<'a> {
+    let c = setup();
+    c.pm().set_org(&1u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+    assert!(!c
+        .treasury
+        .request_payout(&c.payout_receiver, &1u64, &2_000_000));
+    c
+}
+
+#[test]
+fn pending_payout_is_part_of_reserve_required() {
+    let c = setup_with_pending();
+    c.pm().set_outstanding(&c.org, &1_000_000);
+    // 30% of outstanding + the full pending payout.
+    assert_eq!(c.treasury.reserve_required(&c.org), 300_000 + 2_000_000);
+    assert!(!c.treasury.meets_reserve_requirements(&c.org));
+
+    // Top up to exactly the requirement: still nothing withdrawable.
+    c.token_admin.mint(&c.org, &1_400_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &1_400_000);
+    assert_eq!(c.treasury.org_reserve(&c.org), 2_300_000);
+    let to = Address::generate(&c.env);
+    assert!(c
+        .treasury
+        .try_withdraw_org_surplus(&c.org, &1, &to)
+        .is_err());
+}
+
+#[test]
+fn settle_pending_payout_pays_the_full_amount_once() {
+    let c = setup_with_pending();
+
+    // Still short: reverts and keeps the record.
+    assert!(c
+        .treasury
+        .try_settle_pending_payout(&c.payout_receiver, &1u64)
+        .is_err());
+    assert!(c.treasury.get_pending_payout(&1u64).is_some());
+
+    // Top up and settle: exactly the recorded amount leaves, to the backend wallet.
+    c.token_admin.mint(&c.org, &1_100_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &1_100_000);
+    let paid = c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    assert_eq!(paid, 2_000_000);
+    assert_eq!(c.token.balance(&c.backend_wallet), 2_000_000);
+    assert_eq!(c.treasury.org_reserve(&c.org), 0);
+    assert!(c.treasury.is_payout_processed(&1u64));
+    assert!(c.treasury.get_pending_payout(&1u64).is_none());
+    assert_eq!(c.treasury.org_pending_payouts(&c.org), 0);
+    assert_eq!(c.treasury.get_total_payouts(), 2_000_000);
+    c.assert_solvent();
+}
+
+#[test]
+#[should_panic(expected = "#221")] // NoPendingPayout
+fn settle_pending_payout_twice_reverts() {
+    let c = setup_with_pending();
+    c.token_admin.mint(&c.org, &2_000_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &2_000_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+}
+
+#[test]
+#[should_panic(expected = "#222")] // PayoutAlreadyPending
+fn second_request_while_pending_reverts() {
+    let c = setup_with_pending();
+    c.treasury.request_payout(&c.payout_receiver, &1u64, &100);
+}
+
+#[test]
+#[should_panic(expected = "#203")] // PayoutAlreadyProcessed
+fn request_after_settlement_reverts() {
+    let c = setup_with_pending();
+    c.token_admin.mint(&c.org, &2_000_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &2_000_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    c.treasury.request_payout(&c.payout_receiver, &1u64, &100);
+}
+
+#[test]
+#[should_panic(expected = "#211")] // NotPayoutReceiver
+fn settle_pending_payout_only_from_payout_receiver() {
+    let c = setup_with_pending();
+    let rogue = Address::generate(&c.env);
+    c.treasury.grant_role(&c.admin, &Role::Payout, &rogue);
+    c.treasury.settle_pending_payout(&rogue, &1u64);
+}
+
+#[test]
+#[should_panic(expected = "#215")] // Paused
+fn settle_pending_payout_blocked_while_paused() {
+    let c = setup_with_pending();
+    c.token_admin.mint(&c.org, &2_000_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &2_000_000);
+    c.treasury.pause(&c.admin);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+}
+
+// ---------------- Per-policy flags outlive a 365-day policy ----------------
+
+#[test]
+fn premium_flag_ttl_is_the_network_maximum() {
+    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let c = setup();
+    // The measured mainnet/testnet limit: 3,110,400 ledgers, ~180 days.
+    c.env
+        .ledger()
+        .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    c.pm().set_org(&1u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+    let ttl = c.env.as_contract(&c.treasury_id, || {
+        c.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::PremiumReceived(1))
+    });
+    assert_eq!(ttl, NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    // ...which is shorter than MAX_DURATION_DAYS (365): a long policy needs
+    // `extend_policy_ttl` (see the deployment runbook).
+    assert!(ttl < 365 * 17_280);
+}
+
+// ---------------- New claims queue behind pending ones ----------------
+
+#[test]
+fn new_claim_cannot_be_paid_from_money_owed_to_a_pending_claim() {
+    // Policy 1: 900_000 reserve, 2_000_000 pending.
+    let c = setup_with_pending();
+    // Policy 2 (same org): another 900_000 net, then the org tops up 1_200_000.
+    c.pm().set_org(&2u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &2u64, &1_000_000);
+    c.token_admin.mint(&c.org, &1_200_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &1_200_000);
+    assert_eq!(c.treasury.org_reserve(&c.org), 3_000_000);
+
+    // 1_500_000 fits the reserve (3_000_000) but not the part not owed to policy 1
+    // (1_000_000), so it is recorded pending instead of being paid ahead of policy 1.
+    assert!(!c
+        .treasury
+        .request_payout(&c.payout_receiver, &2u64, &1_500_000));
+    assert_eq!(c.token.balance(&c.backend_wallet), 0);
+    assert_eq!(c.treasury.org_pending_payouts(&c.org), 3_500_000);
+
+    // A claim that fits the unowed part is still paid at once.
+    c.pm().set_org(&3u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &3u64, &1_000_000);
+    c.token_admin.mint(&c.org, &3_600_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &3_600_000);
+    // reserve 7_500_000, pending 3_500_000, unowed 4_000_000.
+    assert!(c
+        .treasury
+        .request_payout(&c.payout_receiver, &3u64, &4_000_000));
+    assert_eq!(c.token.balance(&c.backend_wallet), 4_000_000);
+
+    // The two pending claims are both still fully covered.
+    assert_eq!(c.treasury.org_reserve(&c.org), 3_500_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &2u64);
+    assert_eq!(c.token.balance(&c.backend_wallet), 7_500_000);
+    assert_eq!(c.treasury.org_reserve(&c.org), 0);
+    assert_eq!(c.treasury.org_pending_payouts(&c.org), 0);
+    c.assert_solvent();
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // CommonError::NotConfigured
+fn settle_pending_payout_requires_a_wired_payout_receiver() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let backend = Address::generate(&env);
+    let payout = Address::generate(&env);
+    let org = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_admin = StellarAssetClient::new(&env, &sac.address());
+    let treasury_id = env.register(
+        Treasury,
+        (sac.address(), Address::generate(&env), admin.clone()),
+    );
+    let treasury = TreasuryClient::new(&env, &treasury_id);
+    let pm_id = env.register(MockPm, ());
+    treasury.set_policy_manager(&admin, &pm_id);
+    // No set_payout_receiver.
+    treasury.grant_role(&admin, &Role::Backend, &backend);
+    treasury.grant_role(&admin, &Role::Payout, &payout);
+    MockPmClient::new(&env, &pm_id).set_org(&1u64, &org);
+    token_admin.mint(&backend, &1_000_000);
+    treasury.receive_premium(&backend, &1u64, &1_000_000);
+    assert!(!treasury.request_payout(&payout, &1u64, &2_000_000));
+    token_admin.mint(&org, &2_000_000);
+    treasury.deposit_reserve(&org, &org, &2_000_000);
+
+    // Settling from a bare Payout-role holder would clear the Treasury record while the
+    // PayoutReceiver marker and the CLAIM_PENDING status stay behind; refuse it.
+    treasury.settle_pending_payout(&payout, &1u64);
+}
+
+// ---------------- Premium must be exactly the priced amount ----------------
+
+#[test]
+fn premium_short_payment_reverts() {
+    let c = setup();
+    c.pm().set_org(&1u64, &c.org); // premium 1_000_000
+    c.token_admin.mint(&c.backend, &2_000_000);
+    let res = c.treasury.try_receive_premium(&c.backend, &1u64, &999_999);
+    assert_eq!(
+        res,
+        Err(Ok(
+            microcrop_shared::errors::TreasuryError::PremiumAmountMismatch.into()
+        ))
+    );
+    assert!(!c.treasury.is_premium_received(&1u64));
+    assert_eq!(c.treasury.org_reserve(&c.org), 0);
+}
+
+#[test]
+fn premium_over_payment_reverts() {
+    let c = setup();
+    c.pm().set_org(&1u64, &c.org);
+    c.token_admin.mint(&c.backend, &2_000_000);
+    let res = c
+        .treasury
+        .try_receive_premium(&c.backend, &1u64, &1_000_001);
+    assert_eq!(
+        res,
+        Err(Ok(
+            microcrop_shared::errors::TreasuryError::PremiumAmountMismatch.into()
+        ))
+    );
+    // The exact amount is accepted.
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+    assert!(c.treasury.is_premium_received(&1u64));
+}
+
+// ---------------- Pending payouts settle first-in-first-out per org ----------------
+
+/// Policies 1 and 2 (same org) each record a pending payout: 2_000_000 then 500_000.
+fn setup_with_two_pending<'a>() -> Ctx<'a> {
+    let c = setup_with_pending(); // policy 1: 2_000_000 pending, reserve 900_000
+    c.pm().set_org(&2u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &2u64, &1_000_000); // reserve 1_800_000
+    assert!(!c
+        .treasury
+        .request_payout(&c.payout_receiver, &2u64, &500_000));
+    c
+}
+
+#[test]
+fn pending_payouts_settle_in_arrival_order_only() {
+    use microcrop_shared::errors::TreasuryError;
+
+    let c = setup_with_two_pending();
+    assert_eq!(c.treasury.pending_payout_head(&c.org), Some(1));
+    assert_eq!(c.treasury.pending_payout_count(&c.org), 2);
+    assert_eq!(c.treasury.get_pending_payout(&1u64).unwrap().queue_index, 0);
+    assert_eq!(c.treasury.get_pending_payout(&2u64).unwrap().queue_index, 1);
+
+    // The reserve (1_800_000) covers the later, smaller claim but not the head. The later
+    // claim may not jump the queue.
+    assert_eq!(
+        c.treasury
+            .try_settle_pending_payout(&c.payout_receiver, &2u64),
+        Err(Ok(TreasuryError::NotPendingQueueHead.into()))
+    );
+    assert_eq!(
+        c.treasury
+            .try_settle_pending_payout(&c.payout_receiver, &1u64),
+        Err(Ok(TreasuryError::InsufficientOrgReserve.into()))
+    );
+
+    // Top up to cover the head: it settles, and the next claim becomes the head.
+    c.token_admin.mint(&c.org, &200_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &200_000); // reserve 2_000_000
+    assert_eq!(
+        c.treasury.settle_pending_payout(&c.payout_receiver, &1u64),
+        2_000_000
+    );
+    assert_eq!(c.treasury.pending_payout_head(&c.org), Some(2));
+    assert_eq!(c.treasury.pending_payout_count(&c.org), 1);
+
+    c.token_admin.mint(&c.org, &500_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &500_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &2u64);
+    assert_eq!(c.treasury.pending_payout_head(&c.org), None);
+    assert_eq!(c.treasury.pending_payout_count(&c.org), 0);
+    assert_eq!(c.treasury.org_pending_payouts(&c.org), 0);
+    assert_eq!(c.token.balance(&c.backend_wallet), 2_500_000);
+    c.assert_solvent();
+}
+
+#[test]
+fn pending_queues_are_per_org() {
+    let c = setup_with_pending(); // org: policy 1 pending
+    let other = Address::generate(&c.env);
+    c.pm().set_org(&5u64, &other);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &5u64, &1_000_000); // other reserve 900_000
+    assert!(!c
+        .treasury
+        .request_payout(&c.payout_receiver, &5u64, &1_000_000));
+    assert_eq!(c.treasury.pending_payout_head(&other), Some(5));
+    assert_eq!(c.treasury.get_pending_payout(&5u64).unwrap().queue_index, 0);
+
+    // The other org's claim settles while `org`'s head is still unfunded.
+    c.token_admin.mint(&other, &100_000);
+    c.treasury.deposit_reserve(&other, &other, &100_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &5u64);
+    assert_eq!(c.treasury.pending_payout_head(&c.org), Some(1));
+    assert_eq!(c.treasury.pending_payout_head(&other), None);
+}
+
+// ---------------- A frozen backend wallet does not lose the claim ----------------
+
+#[test]
+fn deauthorized_backend_wallet_records_the_claim_as_pending() {
+    use microcrop_shared::errors::TreasuryError;
+
+    let c = setup();
+    c.pm().set_org(&1u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000); // reserve 900_000
+
+    // Circle's Stellar USDC issuers have AUTH_REVOCABLE (checked 2026-10-13: mainnet
+    // GA5ZSEJ..., testnet GBBD47IF...), so they can deauthorize the backend wallet's USDC.
+    c.sac
+        .issuer()
+        .set_flag(soroban_sdk::testutils::IssuerFlags::RevocableFlag);
+    c.token_admin.set_authorized(&c.backend_wallet, &false);
+
+    // The reserve covers the claim, but the transfer cannot land: no revert, nothing moved,
+    // the full claim queued.
+    assert!(!c
+        .treasury
+        .request_payout(&c.payout_receiver, &1u64, &400_000));
+    assert_eq!(c.token.balance(&c.backend_wallet), 0);
+    assert_eq!(c.treasury.org_reserve(&c.org), 900_000);
+    assert!(!c.treasury.is_payout_processed(&1u64));
+    assert_eq!(
+        c.treasury.get_pending_payout(&1u64).unwrap().amount,
+        400_000
+    );
+    assert_eq!(c.treasury.pending_payout_head(&c.org), Some(1));
+    c.assert_solvent();
+
+    // Settling to the same frozen wallet reverts and keeps the claim.
+    assert_eq!(
+        c.treasury
+            .try_settle_pending_payout(&c.payout_receiver, &1u64),
+        Err(Ok(TreasuryError::PayoutTransferFailed.into()))
+    );
+    assert!(c.treasury.get_pending_payout(&1u64).is_some());
+    assert_eq!(c.treasury.pending_payout_head(&c.org), Some(1));
+
+    // The admin rotates the wallet; the claim settles to the new one in full.
+    let new_wallet = Address::generate(&c.env);
+    c.treasury.set_backend_wallet(&c.admin, &new_wallet);
+    assert_eq!(
+        c.treasury.settle_pending_payout(&c.payout_receiver, &1u64),
+        400_000
+    );
+    assert_eq!(c.token.balance(&new_wallet), 400_000);
+    assert_eq!(c.treasury.org_reserve(&c.org), 500_000);
+    assert!(c.treasury.is_payout_processed(&1u64));
+    assert_eq!(c.treasury.pending_payout_head(&c.org), None);
+    c.assert_solvent();
+}
+
+// ---------------- TTL keep-alive ----------------
+
+#[test]
+fn extend_policy_ttl_bumps_the_policy_flags_and_pending_record() {
+    use crate::DataKey;
+    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let c = setup();
+    c.env
+        .ledger()
+        .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    c.pm().set_org(&1u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+    assert!(!c
+        .treasury
+        .request_payout(&c.payout_receiver, &1u64, &2_000_000));
+
+    let ttl = |k: &DataKey| {
+        c.env
+            .as_contract(&c.treasury_id, || c.env.storage().persistent().get_ttl(k))
+    };
+    let seq = c.env.ledger().sequence();
+    c.env.ledger().set_sequence_number(seq + 150 * 17_280);
+    let aged = NETWORK_MAX_ENTRY_TTL_LEDGERS - 150 * 17_280;
+    assert_eq!(ttl(&DataKey::PremiumReceived(1)), aged);
+    assert_eq!(ttl(&DataKey::PendingPayout(1)), aged);
+
+    c.env.set_auths(&[]);
+    c.treasury.extend_policy_ttl(&1u64);
+    for k in [
+        DataKey::PremiumReceived(1),
+        DataKey::PendingPayout(1),
+        DataKey::OrgQueueAt(c.org.clone(), 0),
+    ] {
+        assert_eq!(ttl(&k), NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    }
+    // A policy with no Treasury entries is a no-op, not a revert.
+    c.treasury.extend_policy_ttl(&42u64);
+}
+
+#[test]
+fn payout_receiver_cannot_be_switched_while_a_claim_is_pending() {
+    use microcrop_shared::errors::TreasuryError;
+    let c = setup_with_pending();
+    assert_eq!(c.treasury.total_pending_payout_count(), 1);
+
+    // Switching now would strand the claim (its marker lives in the current receiver) and
+    // block the org's queue behind it.
+    let new_pr = Address::generate(&c.env);
+    assert_eq!(
+        c.treasury.try_set_payout_receiver(&c.admin, &new_pr),
+        Err(Ok(TreasuryError::PayoutsStillPending.into()))
+    );
+
+    // Once the claim settles, the switch goes through.
+    c.token_admin.mint(&c.org, &1_100_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &1_100_000);
+    c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
+    assert_eq!(c.treasury.total_pending_payout_count(), 0);
+    c.treasury.set_payout_receiver(&c.admin, &new_pr);
+}
+
+#[test]
+fn total_pending_count_tracks_every_org_queue() {
+    let c = setup_with_two_pending();
+    assert_eq!(c.treasury.total_pending_payout_count(), 2);
+    assert_eq!(c.treasury.pending_payout_count(&c.org), 2);
 }

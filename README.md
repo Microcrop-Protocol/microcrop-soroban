@@ -88,17 +88,18 @@ Package names (for `-p`): `microcrop-shared`, `microcrop-policy-manager`,
 
 ```
 cargo build --target wasm32v1-none --release   ->  4/4 WASM contracts built
-    microcrop_policy_manager.wasm    ~44 KB
-    microcrop_treasury.wasm          ~47 KB
-    microcrop_payout_receiver.wasm   ~44 KB
-    microcrop_policy_nft.wasm        ~27 KB
+    microcrop_policy_manager.wasm    ~58 KB
+    microcrop_treasury.wasm          ~73 KB
+    microcrop_payout_receiver.wasm   ~56 KB
+    microcrop_policy_nft.wasm        ~35 KB
 
-cargo test                                     ->  66/66 passed, 0 failed
-    microcrop-payout-receiver   20 passed   (real secp256k1 sign→recover round-trip)
-    microcrop-treasury          18 passed   (premium split, per-org solvency, replay)
-    microcrop-policy-manager    17 passed   (lifecycle, caps, exposure, roles)
-    microcrop-policy-nft        11 passed   (mint, soulbound transfer, PM-only status)
-    microcrop-shared             0 tests    (types/errors only)
+cargo test --workspace                         ->  146/146 passed, 0 failed
+    microcrop-treasury          48 passed   (premium split, per-org solvency, FIFO pending queue, frozen wallet, receiver-switch guard, 7dp)
+    microcrop-policy-manager    38 passed   (lifecycle, caps, claim window, exposure, roles, plot coords, coverage, TTL)
+    microcrop-payout-receiver   31 passed   (real secp256k1 sign→recover round-trip, pending claims, coverage + plot binding)
+    microcrop-policy-nft        12 passed   (mint, soulbound transfer, PM-only status, paging)
+    microcrop-integration-tests 17 passed   (all four real contracts on one Env)
+    microcrop-shared             0 tests    (types/errors/TTL helpers only)
 ```
 
 ## Security-critical invariants (preserved from the Solidity)
@@ -111,13 +112,31 @@ cargo test                                     ->  66/66 passed, 0 failed
    (overflow-trapping i128), plus the weighted-damage invariant `60*w + 40*s == bp`
    (satellite-only: `100*s == bp`), threshold `bp ≥ 3000`, freshness `MAX_REPORT_AGE = 3600`.
    The signed `payout_amount` is verified against the re-derived value, never trusted.
+   The determination must also be about the insured plot (signed `latitude_e6` /
+   `longitude_e6` within 1 micro-degree of the coordinates `create_policy` stored) and the
+   policy must be `CoverageType::Comprehensive`, the only cover the cause-agnostic
+   CROP_DAMAGE index settles. `create_policy` refuses any other coverage type
+   (`CoverageNotOffered`, 118), so cover that could never pay is never sold.
 3. **Triple replay guard.** temporary `ConsumedDetermination(digest)` + persistent
    `PolicyPaid(policy_id)` + Treasury `PayoutProcessed(policy_id)`.
-4. **Per-org solvency.** Payouts debit only the policy's org reserve
-   (`InsufficientOrgReserve` if short — loud, never silent); `reserve_required =
-   outstanding_sum_insured * ratio_bps / 10_000`; withdrawals are surplus-only; the
-   invariant `usdc.balance(this) >= Σ org_reserve + accumulated_fees` holds after every op.
-5. **Access control.** Every state-changing fn takes an explicit `caller: Address`, calls
+4. **Per-org solvency.** Payouts debit only the policy's org reserve. If it is short, the
+   verified claim is recorded as a pending payout for the full amount (never dropped,
+   never paid partially) and `settle_pending_claim` pays it once the reserve covers it;
+   an org's pending claims settle strictly first-in-first-out (only the queue head,
+   `Treasury::pending_payout_head(org)`); a USDC transfer the backend wallet cannot receive
+   (issuer freeze, missing trustline) is queued the same way instead of reverting;
+   a new claim is paid at once only from the reserve not owed to pending claims;
+   `receive_premium` takes exactly the policy's `premium`;
+   `reserve_required = outstanding_sum_insured * ratio_bps / 10_000 + pending payouts`,
+   with a 30% ratio floor; withdrawals are surplus-only; the invariant
+   `usdc.balance(this) >= Σ org_reserve + accumulated_fees` holds after every op.
+   Amounts are USDC base units at **7 decimals** (the Stellar Asset Contract).
+5. **Storage TTL.** Every touch extends long-lived entries to the network maximum
+   (`max_entry_ttl` = 3,110,400 ledgers, ~180 days, on mainnet and testnet as of
+   2026-10-13). A 365-day policy outlives that, so the backend calls the permissionless
+   `PayoutReceiver::extend_policy_ttl(policy_id)` (bumps the policy's entries in all four
+   contracts) at least every ~150 days for every open or pending policy.
+6. **Access control.** Every state-changing fn takes an explicit `caller: Address`, calls
    `caller.require_auth()`, and checks the `microcrop_shared::roles` registry (the
    AccessControl replacement).
 
@@ -149,7 +168,8 @@ stellar contract deploy \
   -- --admin <ADMIN_G...>
 
 # Treasury  __constructor(usdc, backend_wallet, admin)
-#   usdc = the Stellar Asset Contract (SEP-41) address of USDC on the target network
+#   usdc = the Stellar Asset Contract (SEP-41) address of USDC on the target network.
+#   The constructor panics (UsdcDecimalsMismatch, #217) unless usdc.decimals() == 7.
 stellar contract deploy \
   --wasm target/wasm32v1-none/release/microcrop_treasury.wasm \
   --source-account deployer --network testnet --alias treasury \

@@ -14,6 +14,10 @@ use soroban_sdk::{contracttype, panic_with_error, Address, Env};
 use crate::errors::CommonError;
 use crate::types::Role;
 
+// Role grants are persistent entries; without a bump they archive after the network minimum
+// TTL and every role-gated call has to restore them first. Extend to the network maximum on
+// grant and whenever a grant is found (see [`crate::ttl`]).
+
 /// Storage key for a role grant. Lives in each contract's own storage namespace, so the
 /// same key type is reused across contracts without collision.
 #[contracttype]
@@ -22,20 +26,22 @@ pub enum RoleKey {
     Role(Role, Address),
 }
 
-/// True if `who` holds `role` in the current contract.
+/// True if `who` holds `role` in the current contract. A held grant has its TTL extended.
 pub fn has_role(env: &Env, role: Role, who: &Address) -> bool {
-    env.storage()
-        .persistent()
-        .get(&RoleKey::Role(role, who.clone()))
-        .unwrap_or(false)
+    let key = RoleKey::Role(role, who.clone());
+    let held: bool = env.storage().persistent().get(&key).unwrap_or(false);
+    if held {
+        crate::ttl::extend_persistent(env, &key);
+    }
+    held
 }
 
 /// Grant `role` to `who` (no authorization check — callers must gate this, e.g. via
 /// `require_role(env, caller, Role::Admin)` or during `__constructor`).
 pub fn grant_role(env: &Env, role: Role, who: &Address) {
-    env.storage()
-        .persistent()
-        .set(&RoleKey::Role(role, who.clone()), &true);
+    let key = RoleKey::Role(role, who.clone());
+    env.storage().persistent().set(&key, &true);
+    crate::ttl::extend_persistent(env, &key);
 }
 
 /// Revoke `role` from `who`.

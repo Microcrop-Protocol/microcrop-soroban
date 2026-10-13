@@ -56,10 +56,10 @@ fn mint(f: &Fixture, farmer: &Address, distributor: &Address, policy_id: u64) ->
         &policy_id,
         distributor,
         &String::from_str(&f.env, "Acre Africa"),
-        &1_000_000_000i128, // sum insured (1000 USDC, 6dp)
-        &50_000_000i128,    // premium
-        &1_700_000_000u64,  // start
-        &1_730_000_000u64,  // end
+        &10_000_000_000i128, // sum insured (1000 USDC, 7dp)
+        &50_000_000i128,     // premium
+        &1_700_000_000u64,   // start
+        &1_730_000_000u64,   // end
         &CoverageType::Drought,
         &String::from_str(&f.env, "Nakuru"),
         &42u64, // plot id
@@ -98,13 +98,14 @@ fn mint_happy_path_sets_owner_certificate_and_indexes() {
     assert_eq!(cert.policy_id, 7);
     assert_eq!(cert.farmer, farmer);
     assert_eq!(cert.distributor, distributor);
-    assert_eq!(cert.sum_insured, 1_000_000_000i128);
+    assert_eq!(cert.sum_insured, 10_000_000_000i128);
     assert_eq!(cert.plot_id, 42);
     assert_eq!(cert.coverage_type, CoverageType::Drought);
     assert!(cert.is_active);
 
     // distributorPolicies[distributor] == [7].
-    let list = f.client.get_distributor_policies(&distributor);
+    let list = f.client.get_distributor_policies(&distributor, &0, &10);
+    assert_eq!(f.client.get_distributor_policy_count(&distributor), 1);
     assert_eq!(list.len(), 1);
     assert_eq!(list.get(0).unwrap(), 7);
 }
@@ -269,4 +270,60 @@ fn owner_of_unknown_token_reverts() {
     let f = setup();
     let res = f.client.try_owner_of(&404u64);
     assert_eq!(res, Err(Ok(NftError::TokenNotFound.into())));
+}
+
+#[test]
+fn distributor_index_is_per_entry_and_paginated_past_100() {
+    // Finding 1: the index used to be one Vec entry rewritten on every mint. It is now one
+    // entry per token, read in pages of at most MAX_PAGE_SIZE (50: a transaction may touch
+    // at most 100 ledger entries, so a page of 100 would itself fail).
+    let f = setup();
+    let farmer = Address::generate(&f.env);
+    let distributor = Address::generate(&f.env);
+    for id in 1..=150u64 {
+        mint(&f, &farmer, &distributor, id);
+    }
+    assert_eq!(f.client.get_distributor_policy_count(&distributor), 150);
+    assert_eq!(crate::MAX_PAGE_SIZE, 50);
+
+    // Walk all 150 in three full pages.
+    let mut seen = 0u64;
+    let mut start = 0u32;
+    while start < 150 {
+        let page = f.client.get_distributor_policies(&distributor, &start, &50);
+        assert_eq!(page.len(), 50);
+        for id in page.iter() {
+            seen += 1;
+            assert_eq!(id, seen);
+        }
+        start += 50;
+    }
+    assert_eq!(seen, 150);
+
+    // limit is capped at MAX_PAGE_SIZE, even when the caller asks for 100 or u32::MAX.
+    assert_eq!(
+        f.client
+            .get_distributor_policies(&distributor, &0, &100)
+            .len(),
+        50
+    );
+    assert_eq!(
+        f.client
+            .get_distributor_policies(&distributor, &120, &u32::MAX)
+            .len(),
+        30
+    );
+    // Past the end is empty, not a revert; so is an unknown distributor.
+    assert_eq!(
+        f.client
+            .get_distributor_policies(&distributor, &150, &10)
+            .len(),
+        0
+    );
+    assert_eq!(
+        f.client
+            .get_distributor_policies(&Address::generate(&f.env), &0, &10)
+            .len(),
+        0
+    );
 }

@@ -98,16 +98,22 @@
                   "u64": "1"
                 },
                 {
-                  "i128": "100000000"
+                  "i64": "-1286389"
                 },
                 {
-                  "i128": "10000000"
+                  "i64": "36817223"
+                },
+                {
+                  "i128": "1000000000"
+                },
+                {
+                  "i128": "100000000"
                 },
                 {
                   "u32": 30
                 },
                 {
-                  "u32": 0
+                  "u32": 4
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
@@ -248,7 +254,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -275,7 +281,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -287,7 +293,37 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "FarmerPolicies"
+                    "symbol": "FarmerPolicyAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  },
+                  {
+                    "u32": 0
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "1"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "FarmerPolicyCount"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -296,17 +332,13 @@
               },
               "durability": "persistent",
               "val": {
-                "vec": [
-                  {
-                    "u64": "1"
-                  }
-                ]
+                "u32": 1
               }
             }
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -327,13 +359,13 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "100000000"
+                "i128": "1000000000"
               }
             }
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -360,7 +392,7 @@
                       "symbol": "coverage_type"
                     },
                     "val": {
-                      "u32": 0
+                      "u32": 4
                     }
                   },
                   {
@@ -397,6 +429,22 @@
                   },
                   {
                     "key": {
+                      "symbol": "lat_e6"
+                    },
+                    "val": {
+                      "i64": "-1286389"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lon_e6"
+                    },
+                    "val": {
+                      "i64": "36817223"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "org"
                     },
                     "val": {
@@ -416,7 +464,7 @@
                       "symbol": "premium"
                     },
                     "val": {
-                      "i128": "10000000"
+                      "i128": "100000000"
                     }
                   },
                   {
@@ -440,7 +488,7 @@
                       "symbol": "sum_insured"
                     },
                     "val": {
-                      "i128": "100000000"
+                      "i128": "1000000000"
                     }
                   }
                 ]
@@ -449,7 +497,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -479,7 +527,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -509,7 +557,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -539,7 +587,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -569,7 +617,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -617,7 +665,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -721,7 +769,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1555200
+        "live_until": 6311999
       }
     ]
   },

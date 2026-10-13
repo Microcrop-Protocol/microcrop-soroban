@@ -1,5 +1,7 @@
 //! Ported data types. Field order and integer widths are load-bearing:
-//! - money (USDC, 6dp) -> `i128` (the token-native amount type)
+//! - money (USDC, **7dp** — the Stellar Asset Contract's `decimals()`; 1 USDC = 10_000_000)
+//!   -> `i128` (the token-native amount type). The EVM contracts used 6dp; do not copy
+//!   their literals.
 //! - ids / timestamps  -> `u64`
 //! - basis points / percents / flags -> `u32`
 //! - geo / signed evidence (Solidity `int256`) -> `i128`
@@ -11,6 +13,14 @@ use soroban_sdk::{contracttype, Address, String};
 
 /// Coverage kinds — ordinals 0..4 preserved from `PolicyManager.CoverageType` /
 /// `PolicyNFT.CoverageType`.
+///
+/// Settlement mapping: the only determination kind is CROP_DAMAGE (`crop-dualindex-1.0`), a
+/// cause-agnostic damage index (60% weather, 40% NDVI). It measures how much of the crop was
+/// lost, not which peril caused the loss, so it can only settle cover that pays for loss from
+/// any covered cause: `Comprehensive`. `Drought`, `Flood`, `Both` and `ExcessRain` name a
+/// peril the index cannot attribute, and `submit_determination` rejects them
+/// (`CoverageNotSettledByMethodology`). The EVM backend already creates every on-chain policy
+/// as `Comprehensive` (`policy.writer.js`, `blockchain.worker.js`).
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -22,7 +32,8 @@ pub enum CoverageType {
     Comprehensive = 4,
 }
 
-/// Policy lifecycle states — ordinals 0..4 preserved from `PolicyManager.PolicyStatus`.
+/// Policy lifecycle states — ordinals 0..4 preserved from `PolicyManager.PolicyStatus`;
+/// `ClaimPending` (5) is Soroban-only.
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -32,6 +43,11 @@ pub enum PolicyStatus {
     Expired = 2,
     Cancelled = 3,
     Claimed = 4,
+    /// A valid determination was verified but the org reserve could not pay it in full. The
+    /// claim is recorded in Treasury and settles via `PayoutReceiver::settle_pending_claim`
+    /// once the reserve covers it. The policy cannot expire, be cancelled, or be settled by
+    /// another determination while in this state; it moves to `Claimed` on settlement.
+    ClaimPending = 5,
 }
 
 /// Access-control roles. Replaces the `keccak256("..._ROLE")` `bytes32` role ids of
@@ -40,9 +56,11 @@ pub enum PolicyStatus {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum Role {
-    /// `DEFAULT_ADMIN_ROLE` + `ADMIN_ROLE` — grants/revokes roles, config, pause.
+    /// `DEFAULT_ADMIN_ROLE` + `ADMIN_ROLE` — grants/revokes roles, config, pause, and the
+    /// escape hatch of cancelling an ACTIVE policy.
     Admin = 0,
-    /// `BACKEND_ROLE` — create/activate/cancel/expire policies; receive premiums.
+    /// `BACKEND_ROLE` — create/activate policies, cancel PENDING ones; receive premiums.
+    /// (Cancelling ACTIVE cover is Admin-only; expiry is permissionless.)
     Backend = 1,
     /// `ORACLE_ROLE` — mark claimed / increment claim count (PayoutReceiver only).
     Oracle = 2,
@@ -64,6 +82,11 @@ pub struct Policy {
     pub id: u64,
     pub farmer: Address,
     pub plot_id: u64,
+    /// Insured plot latitude, degrees x 1e6 (signed). Set by the backend at `create_policy`;
+    /// a determination's signed `latitude_e6` must match it (PayoutReceiver step 6d).
+    pub lat_e6: i64,
+    /// Insured plot longitude, degrees x 1e6 (signed). See `lat_e6`.
+    pub lon_e6: i64,
     pub sum_insured: i128,
     pub premium: i128,
     pub start_date: u64,
@@ -104,7 +127,7 @@ pub struct CropDetermination {
     pub weather_damage: u32,
     /// whole percent 0..100
     pub satellite_damage: u32,
-    /// USDC base units (6dp)
+    /// USDC base units (7dp, Stellar SAC: 1 USDC = 10_000_000)
     pub payout_amount: i128,
     /// unix seconds
     pub assessed_at: u64,

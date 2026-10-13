@@ -28,7 +28,8 @@
 //! - ERC721 `_owners` -> persistent `DataKey::Owner(u64)`.
 //! - `policyToToken` -> persistent `DataKey::PolicyToToken(u64)` (presence == minted; the
 //!   Solidity `!= 0` sentinel becomes a `has(..)` check, so `policy_id == 0` is still rejected).
-//! - `distributorPolicies` -> persistent `DataKey::DistributorPolicies(Address)`.
+//! - `distributorPolicies` -> persistent `DataKey::DistributorCount(Address)` +
+//!   `DataKey::DistributorPolicy(Address, u32)` (one entry per token; read in pages).
 //! - The on-chain `tokenURI` (SVG/JSON) + `baseExternalURI` are DROPPED (rendered off-chain).
 //! - Solidity zero-address guards on `farmer` collapse to the fact that Soroban `Address`
 //!   values are always well-formed; the load-bearing `policy_id == 0` guard is kept.
@@ -41,19 +42,20 @@ use soroban_sdk::{
 
 use microcrop_shared::{
     errors::{CommonError, NftError},
-    roles,
+    roles, ttl,
     types::{CoverageType, PolicyCertificate, Role},
 };
 
 // ============ Storage TTL policy ============
-// ~5s ledgers => 17,280 ledgers/day. Certificates are long-lived registry records, so
-// persistent entries are bumped ~30 days on every touch; the instance (name/symbol/wiring)
-// ~7 days. Thresholds sit one day below the bump so a bump only happens when actually needed.
-const DAY_IN_LEDGERS: u32 = 17_280;
-const INSTANCE_BUMP_AMOUNT: u32 = 7 * DAY_IN_LEDGERS;
-const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
-const PERSISTENT_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
-const PERSISTENT_LIFETIME_THRESHOLD: u32 = PERSISTENT_BUMP_AMOUNT - DAY_IN_LEDGERS;
+// Certificates and the instance (name/symbol/PolicyManager wiring) are long-lived, so every
+// touch extends them to the network maximum (`microcrop_shared::ttl`; ~180 days on mainnet
+// and testnet). The instance was bumped only ~7 days on mint; an archived PolicyNft instance
+// would make every claim, cancel and expiry pay a restore first.
+
+/// Hard maximum page size for the paginated index views. Each id is its own ledger entry,
+/// and a Soroban transaction (simulation included) may touch at most 100 footprint entries;
+/// a page of 100 plus the count and the instance overflows that, so pages stop at 50.
+pub const MAX_PAGE_SIZE: u32 = 50;
 
 /// Storage keys. `PolicyManager`/`Name`/`Symbol` are instance; the rest are persistent.
 #[contracttype]
@@ -71,8 +73,12 @@ pub enum DataKey {
     Owner(u64),
     /// policy_id -> token_id (presence == minted; `tokenId == policyId`).
     PolicyToToken(u64),
-    /// distributor -> list of their token ids.
-    DistributorPolicies(Address),
+    /// distributor -> number of tokens minted for them (length of the index below).
+    DistributorCount(Address),
+    /// (distributor, index) -> token id. One entry per token, so the index never grows a
+    /// single ledger entry: a single `Vec` entry rewritten on every mint hit the entry-size
+    /// cap after ~5,450 policies and then blocked `activate_policy` (audit finding 1).
+    DistributorPolicy(Address, u32),
 }
 
 // ============ Events (ported 1:1 from the Solidity events) ============
@@ -229,18 +235,19 @@ impl PolicyNft {
         p.set(&DataKey::PolicyToToken(policy_id), &token_id);
         p.set(&DataKey::Owner(token_id), &farmer);
 
-        // distributorPolicies[distributor].push(tokenId).
-        let mut list: Vec<u64> = p
-            .get(&DataKey::DistributorPolicies(distributor.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        list.push_back(token_id);
-        p.set(&DataKey::DistributorPolicies(distributor.clone()), &list);
+        // distributorPolicies[distributor].push(tokenId), as one entry per token + a count.
+        let count_key = DataKey::DistributorCount(distributor.clone());
+        let n: u32 = p.get(&count_key).unwrap_or(0);
+        let item_key = DataKey::DistributorPolicy(distributor.clone(), n);
+        p.set(&item_key, &token_id);
+        p.set(&count_key, &(n + 1));
 
         // TTL bumps.
         Self::bump_persistent(&env, &DataKey::Certificate(token_id));
         Self::bump_persistent(&env, &DataKey::PolicyToToken(policy_id));
         Self::bump_persistent(&env, &DataKey::Owner(token_id));
-        Self::bump_persistent(&env, &DataKey::DistributorPolicies(distributor.clone()));
+        Self::bump_persistent(&env, &item_key);
+        Self::bump_persistent(&env, &count_key);
         Self::bump_instance(&env);
 
         PolicyNftMinted {
@@ -280,6 +287,7 @@ impl PolicyNft {
         cert.is_active = is_active;
         p.set(&DataKey::Certificate(token_id), &cert);
         Self::bump_persistent(&env, &DataKey::Certificate(token_id));
+        Self::bump_instance(&env);
 
         PolicyStatusUpdated {
             token_id,
@@ -315,12 +323,24 @@ impl PolicyNft {
         p.set(&DataKey::Owner(token_id), &to);
         Self::bump_persistent(&env, &DataKey::Owner(token_id));
 
-        Transfer {
-            from,
-            to,
-            token_id,
+        Transfer { from, to, token_id }.publish(&env);
+    }
+
+    /// PERMISSIONLESS TTL helper: extend the certificate entries of `policy_id`
+    /// (`PolicyToToken`, `Certificate`, `Owner`) and the instance to the network maximum.
+    /// A no-op for a policy that was never minted. Called best effort by
+    /// `PolicyManager::extend_policy_ttl`.
+    pub fn extend_policy_ttl(env: Env, policy_id: u64) {
+        Self::bump_instance(&env);
+        let token: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PolicyToToken(policy_id));
+        if let Some(token_id) = token {
+            Self::bump_persistent(&env, &DataKey::PolicyToToken(policy_id));
+            ttl::extend_persistent_if_present(&env, &DataKey::Certificate(token_id));
+            ttl::extend_persistent_if_present(&env, &DataKey::Owner(token_id));
         }
-        .publish(&env);
     }
 
     // ---- views ----
@@ -349,26 +369,51 @@ impl PolicyNft {
             .has(&DataKey::PolicyToToken(policy_id))
     }
 
-    /// Port of `getDistributorPolicies`.
-    pub fn get_distributor_policies(env: Env, distributor: Address) -> Vec<u64> {
+    /// Port of `getDistributorPolicies`, paginated: up to `limit` token ids starting at index
+    /// `start`, in mint order. `limit` is capped at [`MAX_PAGE_SIZE`]; a `start` past the end
+    /// returns an empty list. Use [`Self::get_distributor_policy_count`] for the total.
+    pub fn get_distributor_policies(
+        env: Env,
+        distributor: Address,
+        start: u32,
+        limit: u32,
+    ) -> Vec<u64> {
+        let p = env.storage().persistent();
+        let count: u32 = p
+            .get(&DataKey::DistributorCount(distributor.clone()))
+            .unwrap_or(0);
+        let end = start.saturating_add(limit.min(MAX_PAGE_SIZE)).min(count);
+        let mut out = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            let key = DataKey::DistributorPolicy(distributor.clone(), i);
+            let id: u64 = p
+                .get(&key)
+                .unwrap_or_else(|| panic_with_error!(&env, NftError::TokenNotFound));
+            // Reads keep old index entries live, so paging never hits an archived entry.
+            Self::bump_persistent(&env, &key);
+            out.push_back(id);
+            i += 1;
+        }
+        out
+    }
+
+    /// Number of certificates minted for `distributor` (the length of the paged index).
+    pub fn get_distributor_policy_count(env: Env, distributor: Address) -> u32 {
         env.storage()
             .persistent()
-            .get(&DataKey::DistributorPolicies(distributor))
-            .unwrap_or_else(|| Vec::new(&env))
+            .get(&DataKey::DistributorCount(distributor))
+            .unwrap_or(0)
     }
 
     // ---- internal helpers ----
 
     fn bump_instance(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        ttl::extend_instance(env);
     }
 
     fn bump_persistent(env: &Env, key: &DataKey) {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        ttl::extend_persistent(env, key);
     }
 }
 
