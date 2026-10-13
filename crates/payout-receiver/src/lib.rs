@@ -73,7 +73,9 @@ pub const WEIGHT_DENOMINATOR: u32 = 100;
 const DAY_IN_LEDGERS: u32 = 17_280;
 const INSTANCE_BUMP: u32 = 30 * DAY_IN_LEDGERS;
 const INSTANCE_THRESHOLD: u32 = INSTANCE_BUMP - DAY_IN_LEDGERS;
-const PERSIST_BUMP: u32 = 30 * DAY_IN_LEDGERS;
+/// ~400 days: longer than a 365-day policy, so `PolicyPaid` / `Report` / `ClaimPending`
+/// outlive it (was 30 days). The host clamps to the network's `max_entry_ttl`.
+const PERSIST_BUMP: u32 = 400 * DAY_IN_LEDGERS;
 const PERSIST_THRESHOLD: u32 = PERSIST_BUMP - DAY_IN_LEDGERS;
 const TEMP_BUMP: u32 = 7 * DAY_IN_LEDGERS;
 const TEMP_THRESHOLD: u32 = TEMP_BUMP - DAY_IN_LEDGERS;

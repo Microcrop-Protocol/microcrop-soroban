@@ -705,3 +705,28 @@ fn settle_pending_payout_blocked_while_paused() {
     c.treasury.pause(&c.admin);
     c.treasury.settle_pending_payout(&c.payout_receiver, &1u64);
 }
+
+// ---------------- Per-policy flags outlive a 365-day policy ----------------
+
+#[test]
+fn premium_flag_ttl_covers_the_longest_policy() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let c = setup();
+    c.pm().set_org(&1u64, &c.org);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+    let ttl = c.env.as_contract(&c.treasury_id, || {
+        c.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::PremiumReceived(1))
+    });
+    // MAX_DURATION_DAYS = 365 at 17,280 ledgers/day. (The test host's max_entry_ttl is
+    // ~365.3 days, so the 400-day request is clamped to it.)
+    assert!(
+        ttl >= 365 * 17_280,
+        "PremiumReceived TTL {} < 365 days",
+        ttl
+    );
+}

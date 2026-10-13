@@ -822,3 +822,32 @@ fn mark_claim_pending_requires_oracle_and_live_active_cover() {
         PolicyError::PolicyExpired as u32,
     );
 }
+
+// ---------------- Role grants keep their TTL ----------------
+
+#[test]
+fn role_grant_ttl_is_set_on_grant_and_extended_on_use() {
+    use microcrop_shared::roles::RoleKey;
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let c = setup();
+    let day: u32 = 17_280;
+    let key = RoleKey::Role(Role::Backend, c.backend.clone());
+    let ttl = |c: &Ctx| {
+        c.env.as_contract(&c.client.address, || {
+            c.env.storage().persistent().get_ttl(&key)
+        })
+    };
+    assert!(ttl(&c) >= 90 * day - 1, "grant must extend the role TTL");
+
+    // 70 days later the remaining TTL is under the 30-day threshold; a role-gated call
+    // extends it back to ~90 days.
+    let seq = c.env.ledger().sequence();
+    c.env.ledger().set_sequence_number(seq + 70 * day);
+    assert!(ttl(&c) < 30 * day);
+    create_default(&c);
+    assert!(
+        ttl(&c) >= 90 * day - 1,
+        "a held role must be extended on use"
+    );
+}

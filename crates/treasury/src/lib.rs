@@ -68,7 +68,11 @@ pub const USDC_DECIMALS: u32 = 7;
 const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers => ~1 day
 const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
-const PERSISTENT_BUMP_AMOUNT: u32 = 90 * DAY_IN_LEDGERS;
+/// ~400 days: longer than MAX_DURATION_DAYS (365), so the per-policy flags
+/// (`PremiumReceived`, `PayoutProcessed`, `PendingPayout`) outlive the policy they guard.
+/// The host clamps a persistent extension to the network's `max_entry_ttl`, so on a network
+/// whose maximum is shorter the entry lives that long and is restored on access after.
+const PERSISTENT_BUMP_AMOUNT: u32 = 400 * DAY_IN_LEDGERS;
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = PERSISTENT_BUMP_AMOUNT - DAY_IN_LEDGERS;
 
 /// Crate-local paused guard errors. The shared `TreasuryError` enum (range 200..=214) has no
