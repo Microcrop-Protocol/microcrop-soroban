@@ -12,24 +12,25 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
     Address, Env,
 };
 
-use microcrop_shared::types::Role;
+use microcrop_shared::types::{CoverageType, Policy, PolicyStatus, Role};
 
 use crate::{Treasury, TreasuryClient};
 
 // ---------------- Mock PolicyManager ----------------
-// The real PolicyManager is a separate crate (still a stub); Treasury only needs the two v3
-// per-org reads. This mock exposes exactly the `PolicyManagerClient` methods Treasury calls:
-// `policy_org(policy_id)` and `org_outstanding_sum_insured(org)`.
+// The Treasury reads a policy (status, end date, org) and an org's outstanding exposure. This
+// mock exposes exactly the `PolicyManagerClient` methods Treasury calls: `get_policy`,
+// `policy_org` and `org_outstanding_sum_insured`. `set_org` stores an ACTIVE policy with a
+// far end date; `set_status` / `set_end_date` move it for the status-gate tests.
 
 #[contracttype]
 #[derive(Clone)]
 enum MockKey {
-    Org(u64),
+    Policy(u64),
     Outstanding(Address),
 }
 
@@ -39,9 +40,38 @@ struct MockPm;
 #[contractimpl]
 impl MockPm {
     pub fn set_org(env: Env, policy_id: u64, org: Address) {
+        let p = Policy {
+            id: policy_id,
+            farmer: org.clone(),
+            plot_id: 1,
+            sum_insured: 1_000_000_000,
+            premium: 1_000_000,
+            start_date: 0,
+            end_date: u64::MAX,
+            coverage_type: CoverageType::Drought,
+            status: PolicyStatus::Active,
+            created_at: 0,
+            org,
+        };
         env.storage()
             .persistent()
-            .set(&MockKey::Org(policy_id), &org);
+            .set(&MockKey::Policy(policy_id), &p);
+    }
+
+    pub fn set_status(env: Env, policy_id: u64, status: PolicyStatus) {
+        let mut p = Self::get_policy(env.clone(), policy_id);
+        p.status = status;
+        env.storage()
+            .persistent()
+            .set(&MockKey::Policy(policy_id), &p);
+    }
+
+    pub fn set_end_date(env: Env, policy_id: u64, end_date: u64) {
+        let mut p = Self::get_policy(env.clone(), policy_id);
+        p.end_date = end_date;
+        env.storage()
+            .persistent()
+            .set(&MockKey::Policy(policy_id), &p);
     }
 
     pub fn set_outstanding(env: Env, org: Address, amount: i128) {
@@ -51,11 +81,15 @@ impl MockPm {
     }
 
     // --- methods invoked by Treasury via PolicyManagerClient ---
-    pub fn policy_org(env: Env, policy_id: u64) -> Address {
+    pub fn get_policy(env: Env, policy_id: u64) -> Policy {
         env.storage()
             .persistent()
-            .get(&MockKey::Org(policy_id))
+            .get(&MockKey::Policy(policy_id))
             .unwrap()
+    }
+
+    pub fn policy_org(env: Env, policy_id: u64) -> Address {
+        Self::get_policy(env, policy_id).org
     }
 
     pub fn org_outstanding_sum_insured(env: Env, org: Address) -> i128 {
@@ -309,21 +343,21 @@ fn zero_premium_reverts() {
 #[test]
 fn deposit_and_withdraw_surplus() {
     let c = setup();
-    // Org has 1000 outstanding sum insured at the default 2000 bps (20%) ratio => required 200.
+    // Org has 1000 outstanding sum insured at the default 3000 bps (30%) ratio => required 300.
     c.pm().set_outstanding(&c.org, &1_000);
 
     c.token_admin.mint(&c.org, &1_000);
     c.treasury.deposit_reserve(&c.org, &c.org, &1_000);
     assert_eq!(c.treasury.org_reserve(&c.org), 1_000);
-    assert_eq!(c.treasury.reserve_required(&c.org), 200);
+    assert_eq!(c.treasury.reserve_required(&c.org), 300);
     assert!(c.treasury.meets_reserve_requirements(&c.org));
     c.assert_solvent();
 
-    // Withdraw surplus down to exactly the required reserve (1000 - 800 = 200).
+    // Withdraw surplus down to exactly the required reserve (1000 - 700 = 300).
     let to = Address::generate(&c.env);
-    c.treasury.withdraw_org_surplus(&c.org, &800, &to);
-    assert_eq!(c.treasury.org_reserve(&c.org), 200);
-    assert_eq!(c.token.balance(&to), 800);
+    c.treasury.withdraw_org_surplus(&c.org, &700, &to);
+    assert_eq!(c.treasury.org_reserve(&c.org), 300);
+    assert_eq!(c.token.balance(&to), 700);
     c.assert_solvent();
 }
 
@@ -331,12 +365,12 @@ fn deposit_and_withdraw_surplus() {
 #[should_panic(expected = "#213")] // WouldBreachReserve
 fn withdraw_below_required_reserve_reverts() {
     let c = setup();
-    c.pm().set_outstanding(&c.org, &1_000); // required = 200
+    c.pm().set_outstanding(&c.org, &1_000); // required = 300
     c.token_admin.mint(&c.org, &1_000);
     c.treasury.deposit_reserve(&c.org, &c.org, &1_000);
     let to = Address::generate(&c.env);
-    // Leaving 199 < required 200.
-    c.treasury.withdraw_org_surplus(&c.org, &801, &to);
+    // Leaving 299 < required 300.
+    c.treasury.withdraw_org_surplus(&c.org, &701, &to);
 }
 
 // ---------------- Fees / emergency ----------------
@@ -445,4 +479,114 @@ fn constructor_rejects_a_non_seven_decimal_token() {
     let backend_wallet = Address::generate(&env);
     let six_dp = env.register(SixDecimalToken, ());
     env.register(Treasury, (six_dp, backend_wallet, admin));
+}
+
+// ---------------- Reserve floor (finding 2) ----------------
+
+#[test]
+fn default_reserve_ratio_is_thirty_percent() {
+    assert_eq!(crate::DEFAULT_RESERVE_RATIO_BPS, 3_000);
+    assert_eq!(crate::MIN_RESERVE_RATIO_BPS, 3_000);
+}
+
+#[test]
+#[should_panic(expected = "#218")] // ReserveRatioTooLow
+fn set_org_reserve_ratio_below_floor_reverts() {
+    let c = setup();
+    c.treasury
+        .set_org_reserve_ratio_bps(&c.admin, &c.org, &2_999u32);
+}
+
+#[test]
+fn set_org_reserve_ratio_at_floor_and_above_is_accepted() {
+    let c = setup();
+    c.pm().set_outstanding(&c.org, &10_000);
+    c.treasury
+        .set_org_reserve_ratio_bps(&c.admin, &c.org, &3_000u32);
+    assert_eq!(c.treasury.reserve_required(&c.org), 3_000);
+    c.treasury
+        .set_org_reserve_ratio_bps(&c.admin, &c.org, &5_000u32);
+    assert_eq!(c.treasury.reserve_required(&c.org), 5_000);
+}
+
+#[test]
+fn smallest_valid_payout_survives_a_maximal_surplus_withdrawal() {
+    // The org withdraws every unit it is allowed to; a 30% claim (the minimum a
+    // determination can carry) must still be payable from what is left.
+    let c = setup();
+    let sum_insured: i128 = 1_000_000;
+    c.pm().set_org(&1u64, &c.org);
+    c.pm().set_outstanding(&c.org, &sum_insured);
+    c.token_admin.mint(&c.org, &sum_insured);
+    c.treasury.deposit_reserve(&c.org, &c.org, &sum_insured);
+    c.token_admin.mint(&c.backend, &100_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &100_000); // +90_000 net
+
+    let required = c.treasury.reserve_required(&c.org);
+    assert_eq!(required, sum_insured * 3_000 / 10_000);
+    let surplus = c.treasury.org_reserve(&c.org) - required;
+    let to = Address::generate(&c.env);
+    c.treasury.withdraw_org_surplus(&c.org, &surplus, &to);
+    assert_eq!(c.treasury.org_reserve(&c.org), required);
+
+    // 30% payout drains the floor exactly; it does not revert.
+    c.treasury
+        .request_payout(&c.payout_receiver, &1u64, &(sum_insured * 3_000 / 10_000));
+    assert_eq!(c.treasury.org_reserve(&c.org), 0);
+    c.assert_solvent();
+}
+
+// ---------------- Premium only for open policies (finding 8) ----------------
+
+fn premium_on_status(status: PolicyStatus) {
+    let c = setup();
+    c.pm().set_org(&1u64, &c.org);
+    c.pm().set_status(&1u64, &status);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+}
+
+#[test]
+fn premium_accepted_for_pending_policy() {
+    premium_on_status(PolicyStatus::Pending);
+}
+
+#[test]
+#[should_panic(expected = "#219")] // PolicyNotOpenForPremium
+fn premium_rejected_for_cancelled_policy() {
+    premium_on_status(PolicyStatus::Cancelled);
+}
+
+#[test]
+#[should_panic(expected = "#219")]
+fn premium_rejected_for_expired_policy() {
+    premium_on_status(PolicyStatus::Expired);
+}
+
+#[test]
+#[should_panic(expected = "#219")]
+fn premium_rejected_for_claimed_policy() {
+    premium_on_status(PolicyStatus::Claimed);
+}
+
+#[test]
+#[should_panic(expected = "#220")] // PolicyCoverageEnded
+fn premium_rejected_for_active_policy_past_end_date() {
+    let c = setup();
+    c.env.ledger().set_timestamp(10_000);
+    c.pm().set_org(&1u64, &c.org);
+    c.pm().set_end_date(&1u64, &9_999u64);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+}
+
+#[test]
+fn premium_accepted_for_active_policy_on_its_end_date() {
+    let c = setup();
+    c.env.ledger().set_timestamp(10_000);
+    c.pm().set_org(&1u64, &c.org);
+    c.pm().set_end_date(&1u64, &10_000u64);
+    c.token_admin.mint(&c.backend, &1_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+    assert!(c.treasury.is_premium_received(&1u64));
 }

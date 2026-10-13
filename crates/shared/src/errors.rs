@@ -69,6 +69,14 @@ pub enum TreasuryError {
     /// The USDC token passed to the constructor does not report `decimals() == 7`. Every
     /// amount constant and the Lit signer's scaling assume 7dp (Stellar Asset Contract).
     UsdcDecimalsMismatch = 217,
+    /// `set_org_reserve_ratio_bps` below `MIN_RESERVE_RATIO_BPS` (30%): the smallest valid
+    /// payout is 30% of cover, so a lower floor lets the org withdraw the money a claim needs.
+    ReserveRatioTooLow = 218,
+    /// `receive_premium` for a policy that is not PENDING or ACTIVE (cancelled, expired,
+    /// claimed or claim-pending): crediting it would hand the org withdrawable surplus.
+    PolicyNotOpenForPremium = 219,
+    /// `receive_premium` for an ACTIVE policy whose coverage already ended (`now > end_date`).
+    PolicyCoverageEnded = 220,
 }
 
 /// `PayoutReceiver` domain errors. Range 300..=399. Order mirrors the 12 validation steps.

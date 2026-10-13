@@ -33,18 +33,27 @@ use soroban_sdk::{
 };
 
 use microcrop_shared::{
-    errors::TreasuryError, interfaces::PolicyManagerClient, roles, types::Role,
+    errors::TreasuryError,
+    interfaces::PolicyManagerClient,
+    roles,
+    types::{PolicyStatus, Role},
 };
 
 // ============ Constants (ported 1:1) ============
-pub const MIN_RESERVE_PERCENT: u32 = 20;
+/// Legacy percent constant kept for parity; the enforced floor is [`MIN_RESERVE_RATIO_BPS`].
+pub const MIN_RESERVE_PERCENT: u32 = 30;
 pub const TARGET_RESERVE_PERCENT: u32 = 30;
 pub const MAX_PLATFORM_FEE_PERCENT: u32 = 20;
 /// Legacy percent denominator (100).
 pub const BASIS_POINTS: i128 = 100;
 /// True bps denominator (10000) for per-org reserve/fee math.
 pub const BPS_DENOMINATOR: i128 = 10_000;
-pub const DEFAULT_RESERVE_RATIO_BPS: u32 = 2_000;
+/// Reserve ratio applied to an org with no explicit ratio: 30% of outstanding cover.
+pub const DEFAULT_RESERVE_RATIO_BPS: u32 = 3_000;
+/// Lowest ratio the admin may set. It equals the smallest payout a determination can carry
+/// (`MIN_DAMAGE_THRESHOLD` = 3000 bp in PayoutReceiver): with a 20% floor the org could
+/// withdraw down to 20% of cover and every valid 30%+ claim would revert (audit finding 2).
+pub const MIN_RESERVE_RATIO_BPS: u32 = 3_000;
 pub const MAX_RESERVE_RATIO_BPS: u32 = 10_000;
 pub const MAX_FEE_BPS: u32 = 3_000;
 /// Default global platform fee percent set at construction (10%).
@@ -381,8 +390,10 @@ impl Treasury {
 
     // ---- domain logic ----
 
-    /// Port of `receivePremium` (BACKEND, when-not-paused). Splits per-org fee, credits
-    /// `org_reserve` + `accumulated_fees` + `total_premiums`, pulls USDC from `caller`.
+    /// Port of `receivePremium` (BACKEND, when-not-paused). Reads the policy from
+    /// PolicyManager and reverts unless it is PENDING, or ACTIVE and not past `end_date`.
+    /// Splits per-org fee, credits `org_reserve` + `accumulated_fees` + `total_premiums`,
+    /// pulls USDC from `caller`.
     pub fn receive_premium(env: Env, caller: Address, policy_id: u64, amount: i128) {
         roles::require_role(&env, &caller, Role::Backend);
         require_not_paused(&env);
@@ -395,8 +406,23 @@ impl Treasury {
             panic_with_error!(&env, TreasuryError::PremiumAlreadyReceived);
         }
 
-        // Resolve the backing org and split the per-org platform fee.
-        let org = resolve_org(&env, policy_id);
+        // Only an open policy can take a premium (audit finding 8). Crediting a cancelled,
+        // expired or claimed policy would add withdrawable surplus to the org with no cover
+        // behind it; an ACTIVE policy past its end date is just as closed.
+        let policy =
+            PolicyManagerClient::new(&env, &require_policy_manager(&env)).get_policy(&policy_id);
+        match policy.status {
+            PolicyStatus::Pending => {}
+            PolicyStatus::Active => {
+                if env.ledger().timestamp() > policy.end_date {
+                    panic_with_error!(&env, TreasuryError::PolicyCoverageEnded);
+                }
+            }
+            _ => panic_with_error!(&env, TreasuryError::PolicyNotOpenForPremium),
+        }
+
+        // The backing org comes from the same read; split the per-org platform fee.
+        let org = policy.org;
         let platform_fee = amount * fee_bps(&env, &org) / BPS_DENOMINATOR;
         let net_premium = amount - platform_fee;
 
@@ -575,12 +601,16 @@ impl Treasury {
         OrgSurplusWithdrawn { org, to, amount }.publish(&env);
     }
 
-    /// Port of `setOrgReserveRatioBps` (ADMIN). <= `MAX_RESERVE_RATIO_BPS`; sets presence flag.
+    /// Port of `setOrgReserveRatioBps` (ADMIN). `MIN_RESERVE_RATIO_BPS <= bps <=
+    /// MAX_RESERVE_RATIO_BPS`; sets presence flag.
     pub fn set_org_reserve_ratio_bps(env: Env, caller: Address, org: Address, bps: u32) {
         roles::require_role(&env, &caller, Role::Admin);
         instance_bump(&env);
         if bps > MAX_RESERVE_RATIO_BPS {
             panic_with_error!(&env, TreasuryError::BpsTooHigh);
+        }
+        if bps < MIN_RESERVE_RATIO_BPS {
+            panic_with_error!(&env, TreasuryError::ReserveRatioTooLow);
         }
         set_persistent_u32(&env, DataKey::OrgReserveRatioBps(org.clone()), bps);
         set_persistent_bool(&env, DataKey::OrgRatioSet(org.clone()), true);
