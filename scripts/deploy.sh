@@ -140,6 +140,18 @@ deploy() {                      # deploy <state-key> <wasm-name> [--ctor-args...
 ADMIN_ADDR="$(stellar keys address "$ADMIN_KEY" 2>/dev/null || echo "G_DRYRUN_ADMIN")"
 say "admin address: $ADMIN_ADDR"
 
+# The Treasury constructor refuses a token that does not report 7 decimals (error 217), but by
+# then three contracts are already deployed. Check first so a wrong USDC_SAC costs nothing.
+if [[ "$DRY_RUN" == "1" ]]; then
+  printf '  \033[2mDRY-RUN:\033[0m check decimals() of %s == 7\n' "$USDC_SAC" >&2
+else
+  USDC_DECIMALS="$(stellar contract invoke --id "$USDC_SAC" --source "$ADMIN_KEY" \
+      --network "$NETWORK" --send no -- decimals | tail -1 | tr -d '"[:space:]')"
+  [[ "$USDC_DECIMALS" == "7" ]] \
+    || die "USDC_SAC $USDC_SAC reports decimals() = '$USDC_DECIMALS'; the contracts need 7"
+  say "USDC_SAC decimals: 7"
+fi
+
 NFT="$(deploy policy_nft microcrop_policy_nft \
         --admin "$ADMIN_ADDR" --name "MicroCrop Policy" --symbol "MCP")"
 PM="$(deploy policy_manager microcrop_policy_manager \
