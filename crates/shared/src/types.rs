@@ -1,5 +1,7 @@
 //! Ported data types. Field order and integer widths are load-bearing:
-//! - money (USDC, 6dp) -> `i128` (the token-native amount type)
+//! - money (USDC, **7dp** — the Stellar Asset Contract's `decimals()`; 1 USDC = 10_000_000)
+//!   -> `i128` (the token-native amount type). The EVM contracts used 6dp; do not copy
+//!   their literals.
 //! - ids / timestamps  -> `u64`
 //! - basis points / percents / flags -> `u32`
 //! - geo / signed evidence (Solidity `int256`) -> `i128`
@@ -104,7 +106,7 @@ pub struct CropDetermination {
     pub weather_damage: u32,
     /// whole percent 0..100
     pub satellite_damage: u32,
-    /// USDC base units (6dp)
+    /// USDC base units (7dp, Stellar SAC: 1 USDC = 10_000_000)
     pub payout_amount: i128,
     /// unix seconds
     pub assessed_at: u64,

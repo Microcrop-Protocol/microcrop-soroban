@@ -144,7 +144,7 @@
                         "symbol": "payout_amount"
                       },
                       "val": {
-                        "i128": "500000"
+                        "i128": "5000000000"
                       }
                     },
                     {
@@ -160,7 +160,7 @@
                         "symbol": "sum_insured"
                       },
                       "val": {
-                        "i128": "1000000"
+                        "i128": "10000000000"
                       }
                     },
                     {
@@ -214,7 +214,7 @@
                   ]
                 },
                 {
-                  "bytes": "2aa9fe1468247e30a0bb7e988e12828779b16dcd7e3a521d710a3ffb6209135d31004f902749a9de4c945dbb6858fce66a97954b7d7fca82a9efc3bc11ee19bf"
+                  "bytes": "8aa9bc216b1d5125483a447f748d72388bd75debae1254d640dd9eea2e78b9a926784bfa9d2e96abe7620f30f0b2012b55ee890a19005b2a27dfdb112a14460d"
                 },
                 {
                   "u32": 0
@@ -342,7 +342,7 @@
                         "symbol": "amt"
                       },
                       "val": {
-                        "i128": "500000"
+                        "i128": "5000000000"
                       }
                     },
                     {
@@ -476,7 +476,7 @@
                               "symbol": "premium"
                             },
                             "val": {
-                              "i128": "50000"
+                              "i128": "500000000"
                             }
                           },
                           {
@@ -500,7 +500,7 @@
                               "symbol": "sum_insured"
                             },
                             "val": {
-                              "i128": "1000000"
+                              "i128": "10000000000"
                             }
                           }
                         ]
@@ -528,7 +528,7 @@
                     "symbol": "ConsumedDetermination"
                   },
                   {
-                    "bytes": "8d33b73261ddd440e184094ac64bf26bca4ca9fe3cd7af9d9d3a15cfd44115d7"
+                    "bytes": "8cca6b11c04a8dcb0ef991a81ac7a4b052d64bd4eae56786f2c9a4853ca51b43"
                   }
                 ]
               },
@@ -610,7 +610,7 @@
                       "symbol": "payout_amount"
                     },
                     "val": {
-                      "i128": "500000"
+                      "i128": "5000000000"
                     }
                   },
                   {

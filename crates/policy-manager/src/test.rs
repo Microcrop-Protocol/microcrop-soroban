@@ -123,7 +123,7 @@ fn create_default(c: &Ctx) -> u64 {
         &c.farmer,
         &1u64,            // plot_id
         &MIN_SUM_INSURED, // sum_insured (100 USDC)
-        &10_000_000i128,  // premium (10 USDC)
+        &100_000_000i128, // premium (10 USDC)
         &30u32,           // duration_days
         &CoverageType::Drought,
         &c.org,
@@ -213,7 +213,7 @@ fn create_rejects_sum_too_low() {
         &c.farmer,
         &1u64,
         &(MIN_SUM_INSURED - 1),
-        &10_000_000i128,
+        &100_000_000i128,
         &30u32,
         &CoverageType::Drought,
         &c.org,
@@ -229,7 +229,7 @@ fn create_rejects_sum_too_high() {
         &c.farmer,
         &1u64,
         &(MAX_SUM_INSURED + 1),
-        &10_000_000i128,
+        &100_000_000i128,
         &30u32,
         &CoverageType::Drought,
         &c.org,
@@ -262,7 +262,7 @@ fn create_rejects_bad_duration() {
         &c.farmer,
         &1u64,
         &MIN_SUM_INSURED,
-        &10_000_000i128,
+        &100_000_000i128,
         &29u32,
         &CoverageType::Drought,
         &c.org,
@@ -274,7 +274,7 @@ fn create_rejects_bad_duration() {
         &c.farmer,
         &1u64,
         &MIN_SUM_INSURED,
-        &10_000_000i128,
+        &100_000_000i128,
         &366u32,
         &CoverageType::Drought,
         &c.org,
@@ -295,7 +295,7 @@ fn create_enforces_open_policy_cap() {
         &c.farmer,
         &1u64,
         &MIN_SUM_INSURED,
-        &10_000_000i128,
+        &100_000_000i128,
         &30u32,
         &CoverageType::Drought,
         &c.org,
@@ -312,7 +312,7 @@ fn create_requires_backend_role() {
         &c.farmer,
         &1u64,
         &MIN_SUM_INSURED,
-        &10_000_000i128,
+        &100_000_000i128,
         &30u32,
         &CoverageType::Drought,
         &c.org,
@@ -370,7 +370,7 @@ fn cancel_pending_releases_slot() {
         &c.farmer,
         &1u64,
         &MIN_SUM_INSURED,
-        &10_000_000i128,
+        &100_000_000i128,
         &30u32,
         &CoverageType::Drought,
         &c.org,
@@ -471,7 +471,7 @@ fn activate_without_nft_set_reverts() {
         &farmer,
         &1u64,
         &MIN_SUM_INSURED,
-        &10_000_000i128,
+        &100_000_000i128,
         &30u32,
         &CoverageType::Drought,
         &org,
@@ -485,4 +485,35 @@ fn activate_without_nft_set_reverts() {
         &String::from_str(&env, "r"),
     );
     assert_err(res, PolicyError::PolicyNftNotSet as u32);
+}
+
+#[test]
+fn sum_insured_bounds_are_seven_decimal_usdc() {
+    // Stellar USDC has 7 decimals: 1 USDC = 10_000_000 base units.
+    const ONE_USDC: i128 = 10_000_000;
+    assert_eq!(MIN_SUM_INSURED, 100 * ONE_USDC);
+    assert_eq!(MAX_SUM_INSURED, 1_000_000 * ONE_USDC);
+
+    let c = setup();
+    let create = |sum: i128| {
+        c.client.try_create_policy(
+            &c.backend,
+            &Address::generate(&c.env),
+            &1u64,
+            &sum,
+            &100_000_000i128,
+            &30u32,
+            &CoverageType::Drought,
+            &c.org,
+        )
+    };
+    // Exactly 100 USDC and exactly 1,000,000 USDC are accepted.
+    assert!(create(MIN_SUM_INSURED).is_ok());
+    assert!(create(MAX_SUM_INSURED).is_ok());
+    // The old 6dp minimum (100_000_000) is only 10 USDC at 7dp and is rejected.
+    assert_err(create(100_000_000), PolicyError::SumInsuredTooLow as u32);
+    assert_err(
+        create(MAX_SUM_INSURED + 1),
+        PolicyError::SumInsuredTooHigh as u32,
+    );
 }

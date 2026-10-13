@@ -35,10 +35,11 @@ use microcrop_shared::{
 };
 
 // ============ Constants (ported 1:1) ============
-/// 100 USDC (6dp).
-pub const MIN_SUM_INSURED: i128 = 100_000_000;
-/// 1,000,000 USDC (6dp).
-pub const MAX_SUM_INSURED: i128 = 1_000_000_000_000;
+/// 100 USDC in base units. Stellar USDC (a Stellar Asset Contract) has **7 decimals**, so
+/// 1 USDC = 10_000_000. The EVM source used 6dp (`100_000_000`); that value is 10 USDC here.
+pub const MIN_SUM_INSURED: i128 = 1_000_000_000;
+/// 1,000,000 USDC in base units (7dp).
+pub const MAX_SUM_INSURED: i128 = 10_000_000_000_000;
 pub const MIN_DURATION_DAYS: u32 = 30;
 pub const MAX_DURATION_DAYS: u32 = 365;
 pub const MAX_ACTIVE_POLICIES_PER_FARMER: u32 = 5;

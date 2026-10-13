@@ -149,7 +149,7 @@ impl MockTreasury {
 // ============ Test fixture ============
 
 const NOW: u64 = 1_700_000_000;
-const SUM_INSURED: i128 = 1_000_000; // $1 at 6dp
+const SUM_INSURED: i128 = 10_000_000_000; // 1,000 USDC at 7dp (Stellar SAC)
 
 struct Fixture {
     env: Env,
@@ -162,14 +162,14 @@ struct Fixture {
 }
 
 /// A canonical, fully-consistent determination: weather present, 50/50 sub-scores ->
-/// bp = 60*50 + 40*50 = 5000; payout = SUM_INSURED * 5000 / 10000 = 500_000.
+/// bp = 60*50 + 40*50 = 5000; payout = SUM_INSURED * 5000 / 10000 = 5_000_000_000.
 fn base_det() -> CropDetermination {
     CropDetermination {
         on_chain_policy_id: 1,
         damage_percent_bp: 5_000,
         weather_damage: 50,
         satellite_damage: 50,
-        payout_amount: 500_000,
+        payout_amount: 5_000_000_000,
         assessed_at: NOW,
         latitude_e6: -1_286_389,
         longitude_e6: 36_817_223,
@@ -225,7 +225,7 @@ fn setup() -> Fixture {
         farmer,
         plot_id: 7,
         sum_insured: SUM_INSURED,
-        premium: 50_000,
+        premium: 500_000_000,
         start_date: NOW - 10,
         end_date: NOW + 1_000_000,
         coverage_type: CoverageType::Drought,
@@ -276,14 +276,14 @@ fn happy_path_verifies_and_pays_out() {
     // Payout re-derived on-chain and dispatched to Treasury.
     assert_eq!(f.treasury.calls(), 1);
     assert_eq!(f.treasury.last_pid(), 1);
-    assert_eq!(f.treasury.last_amt(), 500_000);
+    assert_eq!(f.treasury.last_amt(), 5_000_000_000);
 
     // Replay guards set + report stored.
     assert!(f.client.is_policy_paid(&1));
     let report = f.client.get_report(&1);
     assert_eq!(report.policy_id, 1);
     assert_eq!(report.damage_percentage, 5_000);
-    assert_eq!(report.payout_amount, 500_000);
+    assert_eq!(report.payout_amount, 5_000_000_000);
     assert_eq!(report.weather_damage, 50);
     assert_eq!(report.satellite_damage, 50);
 }
@@ -297,11 +297,11 @@ fn satellite_only_renormalizes_to_full_weight() {
     d.weather_damage = 0;
     d.satellite_damage = 40;
     d.damage_percent_bp = 4_000; // 100 * 40
-    d.payout_amount = SUM_INSURED * 4_000 / 10_000; // 400_000
+    d.payout_amount = SUM_INSURED * 4_000 / 10_000; // 4_000_000_000
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
 
     f.client.submit_determination(&f.relayer, &d, &sig, &recid);
-    assert_eq!(f.treasury.last_amt(), 400_000);
+    assert_eq!(f.treasury.last_amt(), 4_000_000_000);
 }
 
 // ============ Access + lifecycle guards ============
@@ -334,7 +334,7 @@ fn paused_blocks_submit() {
         farmer: farmer.clone(),
         plot_id: 7,
         sum_insured: SUM_INSURED,
-        premium: 50_000,
+        premium: 500_000_000,
         start_date: NOW - 10,
         end_date: NOW + 1_000_000,
         coverage_type: CoverageType::Drought,
@@ -503,7 +503,7 @@ fn sum_insured_mismatch_rejected() {
 fn wrong_payout_amount_rejected() {
     let f = setup();
     let mut d = base_det();
-    d.payout_amount = 499_999; // != SUM_INSURED * 5000 / 10000
+    d.payout_amount = 4_999_999_999; // != SUM_INSURED * 5000 / 10000
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
     let res = f
         .client
@@ -554,7 +554,7 @@ fn farmer_over_claim_limit_rejected() {
         farmer: farmer.clone(),
         plot_id: 7,
         sum_insured: SUM_INSURED,
-        premium: 50_000,
+        premium: 500_000_000,
         start_date: NOW - 10,
         end_date: NOW + 1_000_000,
         coverage_type: CoverageType::Drought,
@@ -618,7 +618,7 @@ fn signer_not_configured_rejected() {
         farmer,
         plot_id: 7,
         sum_insured: SUM_INSURED,
-        premium: 50_000,
+        premium: 500_000_000,
         start_date: NOW - 10,
         end_date: NOW + 1_000_000,
         coverage_type: CoverageType::Drought,

@@ -49,6 +49,9 @@ pub const MAX_RESERVE_RATIO_BPS: u32 = 10_000;
 pub const MAX_FEE_BPS: u32 = 3_000;
 /// Default global platform fee percent set at construction (10%).
 pub const DEFAULT_PLATFORM_FEE_PERCENT: u32 = 10;
+/// Stellar USDC (a Stellar Asset Contract) has 7 decimals: 1 USDC = 10_000_000 base units.
+/// The constructor refuses any other token precision.
+pub const USDC_DECIMALS: u32 = 7;
 
 // ============ TTL bump parameters ============
 // Soroban rents storage; entries expire unless their TTL is extended. We bump on every
@@ -254,7 +257,7 @@ pub enum DataKey {
     PremiumReceived(u64),
     /// policy_id -> payout processed?
     PayoutProcessed(u64),
-    /// org -> reserve balance (USDC 6dp).
+    /// org -> reserve balance (USDC base units, 7dp).
     OrgReserve(Address),
     /// org -> reserve ratio in true bps.
     OrgReserveRatioBps(Address),
@@ -273,7 +276,15 @@ pub struct Treasury;
 impl Treasury {
     /// Port of `initialize(usdc, backendWallet, admin)`. Grants ADMIN + UPGRADER, stores config,
     /// sets default platform fee (10%), zeroes global scalars, unpaused.
+    ///
+    /// Panics `UsdcDecimalsMismatch` unless the token reports `decimals() == USDC_DECIMALS`
+    /// (7). Every base-unit constant in this workspace, and the Lit signer's amount scaling,
+    /// assume the Stellar Asset Contract's 7 decimals; a token with any other precision would
+    /// make claims revert or pay a fraction, so it is refused at deploy time.
     pub fn __constructor(env: Env, usdc: Address, backend_wallet: Address, admin: Address) {
+        if TokenClient::new(&env, &usdc).decimals() != USDC_DECIMALS {
+            panic_with_error!(&env, TreasuryError::UsdcDecimalsMismatch);
+        }
         roles::grant_role(&env, Role::Admin, &admin);
         roles::grant_role(&env, Role::Upgrader, &admin);
         let s = env.storage().instance();

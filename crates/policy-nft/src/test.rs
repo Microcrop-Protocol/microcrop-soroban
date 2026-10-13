@@ -56,10 +56,10 @@ fn mint(f: &Fixture, farmer: &Address, distributor: &Address, policy_id: u64) ->
         &policy_id,
         distributor,
         &String::from_str(&f.env, "Acre Africa"),
-        &1_000_000_000i128, // sum insured (1000 USDC, 6dp)
-        &50_000_000i128,    // premium
-        &1_700_000_000u64,  // start
-        &1_730_000_000u64,  // end
+        &10_000_000_000i128, // sum insured (1000 USDC, 7dp)
+        &50_000_000i128,     // premium
+        &1_700_000_000u64,   // start
+        &1_730_000_000u64,   // end
         &CoverageType::Drought,
         &String::from_str(&f.env, "Nakuru"),
         &42u64, // plot id
@@ -98,7 +98,7 @@ fn mint_happy_path_sets_owner_certificate_and_indexes() {
     assert_eq!(cert.policy_id, 7);
     assert_eq!(cert.farmer, farmer);
     assert_eq!(cert.distributor, distributor);
-    assert_eq!(cert.sum_insured, 1_000_000_000i128);
+    assert_eq!(cert.sum_insured, 10_000_000_000i128);
     assert_eq!(cert.plot_id, 42);
     assert_eq!(cert.coverage_type, CoverageType::Drought);
     assert!(cert.is_active);

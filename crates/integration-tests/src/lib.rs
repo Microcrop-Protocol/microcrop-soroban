@@ -68,12 +68,12 @@ use microcrop_treasury::{Treasury, TreasuryClient};
 // ============ Fixed test parameters ============
 
 const NOW: u64 = 1_700_000_000;
-/// 1,000 USDC (6dp) — within PolicyManager's [MIN_SUM_INSURED, MAX_SUM_INSURED].
-const SUM_INSURED: i128 = 1_000_000_000;
+/// 1,000 USDC (7dp, Stellar SAC) — within PolicyManager's [MIN_SUM_INSURED, MAX_SUM_INSURED].
+const SUM_INSURED: i128 = 10_000_000_000;
 /// weather 50% + satellite 50% => 60*50 + 40*50 = 5000 bp (the weighted invariant).
 const DAMAGE_BP: u32 = 5_000;
 /// SUM_INSURED * 5000 / 10000.
-const PAYOUT: i128 = 500_000_000;
+const PAYOUT: i128 = 5_000_000_000;
 const DURATION_DAYS: u32 = 90;
 
 // ============ secp256k1 signing helpers (copied verbatim from payout-receiver/src/test.rs) ============
@@ -295,7 +295,7 @@ impl<'a> World<'a> {
 #[test]
 fn full_lifecycle_premium_to_payout() {
     let w = deploy();
-    let premium: i128 = 1_000_000_000; // 1,000 USDC; 10% fee => 900 USDC net to org reserve.
+    let premium: i128 = 10_000_000_000; // 1,000 USDC; 10% fee => 900 USDC net to org reserve.
 
     // --- create + activate; the REAL NFT is minted to the farmer ---
     let policy_id = w.create_and_activate(premium);
@@ -309,7 +309,7 @@ fn full_lifecycle_premium_to_payout() {
     // --- premium in: fee split, org reserve credited ---
     w.pay_premium(policy_id, premium);
     let platform_fee = premium / 10; // default global fee = 10%
-    let net = premium - platform_fee; // 900_000_000
+    let net = premium - platform_fee; // 9_000_000_000
     assert_eq!(w.treasury.accumulated_fees(), platform_fee);
     assert_eq!(w.treasury.org_reserve(&w.org), net);
     assert_eq!(w.treasury.get_available_for_payouts(&w.org), net);
@@ -349,7 +349,7 @@ fn full_lifecycle_premium_to_payout() {
 #[test]
 fn determination_replay_rejected() {
     let w = deploy();
-    let premium: i128 = 1_000_000_000;
+    let premium: i128 = 10_000_000_000;
     let policy_id = w.create_and_activate(premium);
     w.pay_premium(policy_id, premium);
 
@@ -388,11 +388,11 @@ fn payout_exceeding_org_reserve_rejected() {
     let w = deploy();
     // Tiny premium => net reserve (90 USDC) is far below the 500 USDC payout the determination
     // demands. The determination itself is fully valid; only Treasury per-org solvency blocks it.
-    let premium: i128 = 100_000_000; // 100 USDC; net after 10% fee = 90 USDC.
+    let premium: i128 = 1_000_000_000; // 100 USDC; net after 10% fee = 90 USDC.
     let policy_id = w.create_and_activate(premium);
     w.pay_premium(policy_id, premium);
 
-    let net = premium - premium / 10; // 90_000_000
+    let net = premium - premium / 10; // 900_000_000
     assert_eq!(w.treasury.org_reserve(&w.org), net);
     assert!(net < PAYOUT); // the whole point
 
@@ -418,7 +418,7 @@ fn payout_exceeding_org_reserve_rejected() {
 #[test]
 fn wrong_signer_determination_rejected() {
     let w = deploy();
-    let premium: i128 = 1_000_000_000;
+    let premium: i128 = 10_000_000_000;
     let policy_id = w.create_and_activate(premium);
     w.pay_premium(policy_id, premium);
 

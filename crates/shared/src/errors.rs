@@ -65,6 +65,10 @@ pub enum TreasuryError {
     BpsTooHigh = 212,
     WouldBreachReserve = 213,
     NoFeesToWithdraw = 214,
+    // 215 / 216 are the crate-local `treasury::PausedError` codes; do not reuse them here.
+    /// The USDC token passed to the constructor does not report `decimals() == 7`. Every
+    /// amount constant and the Lit signer's scaling assume 7dp (Stellar Asset Contract).
+    UsdcDecimalsMismatch = 217,
 }
 
 /// `PayoutReceiver` domain errors. Range 300..=399. Order mirrors the 12 validation steps.

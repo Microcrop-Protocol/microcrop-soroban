@@ -66,6 +66,20 @@ impl MockPm {
     }
 }
 
+// ---------------- Mock 6-decimal token ----------------
+// Stands in for a non-Stellar USDC (e.g. a bridged 6dp token). Only `decimals()` is called by
+// the Treasury constructor.
+
+#[contract]
+struct SixDecimalToken;
+
+#[contractimpl]
+impl SixDecimalToken {
+    pub fn decimals(_env: Env) -> u32 {
+        6
+    }
+}
+
 // ---------------- Test harness ----------------
 
 struct Ctx<'a> {
@@ -155,7 +169,8 @@ fn premium_split_and_payout_happy_path() {
     // policy 1 backs `org`.
     c.pm().set_org(&1u64, &c.org);
 
-    // Fund the backend payer with USDC and let it pay a 1_000_000 (1 USDC, 6dp) premium.
+    // Fund the backend payer with USDC and let it pay a 1_000_000 base-unit premium
+    // (0.1 USDC: the SAC has 7 decimals).
     c.token_admin.mint(&c.backend, &1_000_000);
     c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
 
@@ -409,4 +424,25 @@ fn set_platform_fee_above_max_reverts() {
 fn set_org_fee_above_max_reverts() {
     let c = setup();
     c.treasury.set_org_fee_bps(&c.admin, &c.org, &3_001u32);
+}
+
+// ---------------- Token precision (finding 5) ----------------
+
+#[test]
+fn usdc_sac_reports_seven_decimals() {
+    let c = setup();
+    // The SAC the harness registers is what Stellar USDC is: 7 decimals.
+    assert_eq!(c.token.decimals(), crate::USDC_DECIMALS);
+    assert_eq!(crate::USDC_DECIMALS, 7);
+}
+
+#[test]
+#[should_panic(expected = "#217")] // UsdcDecimalsMismatch
+fn constructor_rejects_a_non_seven_decimal_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let backend_wallet = Address::generate(&env);
+    let six_dp = env.register(SixDecimalToken, ());
+    env.register(Treasury, (six_dp, backend_wallet, admin));
 }

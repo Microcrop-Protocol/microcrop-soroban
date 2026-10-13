@@ -24,6 +24,13 @@
 //!   ‖ on_chain_policy_id ‖ damage_percent_bp ‖ weather_damage ‖ satellite_damage
 //!   ‖ payout_amount ‖ assessed_at            // 6 result words
 //!
+//! ## Money units
+//! `sum_insured` and `payout_amount` are USDC **base units at 7 decimals** (Stellar Asset
+//! Contract; 1 USDC = 10_000_000). The EVM path signs 6-decimal amounts. A Lit signer that
+//! scales by 1e6 for Stellar produces values 10x too small: `sum_insured` then fails step 6b
+//! (`SumInsuredMismatch`) on every determination. The signer must scale by 1e7 on Stellar and
+//! keep 1e6 on Base.
+//!
 //! ## Necessary changes vs EVM (documented for the Lit PKP team)
 //! - `block.chainid` (u256) -> `network_domain: BytesN<32>` (bind the Stellar network passphrase).
 //! - `address(this)` (20B) -> the contract `Address` serialized via its canonical XDR bytes
