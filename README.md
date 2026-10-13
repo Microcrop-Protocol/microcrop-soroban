@@ -93,12 +93,12 @@ cargo build --target wasm32v1-none --release   ->  4/4 WASM contracts built
     microcrop_payout_receiver.wasm   ~56 KB
     microcrop_policy_nft.wasm        ~35 KB
 
-cargo test --workspace                         ->  142/142 passed, 0 failed
-    microcrop-treasury          46 passed   (premium split, per-org solvency, FIFO pending queue, frozen wallet, 7dp)
-    microcrop-policy-manager    37 passed   (lifecycle, caps, claim window, exposure, roles, plot coords, TTL)
+cargo test --workspace                         ->  146/146 passed, 0 failed
+    microcrop-treasury          48 passed   (premium split, per-org solvency, FIFO pending queue, frozen wallet, receiver-switch guard, 7dp)
+    microcrop-policy-manager    38 passed   (lifecycle, caps, claim window, exposure, roles, plot coords, coverage, TTL)
     microcrop-payout-receiver   31 passed   (real secp256k1 sign→recover round-trip, pending claims, coverage + plot binding)
     microcrop-policy-nft        12 passed   (mint, soulbound transfer, PM-only status, paging)
-    microcrop-integration-tests 16 passed   (all four real contracts on one Env)
+    microcrop-integration-tests 17 passed   (all four real contracts on one Env)
     microcrop-shared             0 tests    (types/errors/TTL helpers only)
 ```
 
@@ -115,7 +115,8 @@ cargo test --workspace                         ->  142/142 passed, 0 failed
    The determination must also be about the insured plot (signed `latitude_e6` /
    `longitude_e6` within 1 micro-degree of the coordinates `create_policy` stored) and the
    policy must be `CoverageType::Comprehensive`, the only cover the cause-agnostic
-   CROP_DAMAGE index settles.
+   CROP_DAMAGE index settles. `create_policy` refuses any other coverage type
+   (`CoverageNotOffered`, 118), so cover that could never pay is never sold.
 3. **Triple replay guard.** temporary `ConsumedDetermination(digest)` + persistent
    `PolicyPaid(policy_id)` + Treasury `PayoutProcessed(policy_id)`.
 4. **Per-org solvency.** Payouts debit only the policy's org reserve. If it is short, the

@@ -199,9 +199,18 @@ stellar contract invoke --id "$TREASURY" --network testnet --source <any key> \
 Any other id reverts `NotPendingQueueHead` (224). A keeper should loop "head, settle"
 until the head's settle reverts `InsufficientOrgReserve`.
 
+**Never switch the PayoutReceiver while a claim is pending.** Each pending claim's marker
+lives in the current PayoutReceiver, so pointing Treasury at a new one would strand it and,
+because settlement is first-in-first-out, block every later claim of its org.
+`set_payout_receiver` therefore reverts `PayoutsStillPending` (226) while
+`total_pending_payout_count()` is above zero. Settle the queues first, or upgrade the
+PayoutReceiver in place (`upgrade`), which keeps its storage.
+
 **A frozen backend wallet queues claims; rotate it.** Circle's Stellar USDC issuer has
-`auth_revocable` set (checked on mainnet and testnet on 2026-10-13; `auth_clawback_enabled`
-is off, so clawback is not a risk). If the backend wallet's trustline is deauthorized, or
+`auth_revocable` set and `auth_clawback_enabled` off (checked on Horizon on 2026-10-13:
+mainnet issuer `GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN`, testnet issuer
+`GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`; the mainnet address is not the
+USDC issuer on testnet). Clawback is therefore not a risk. If the backend wallet's trustline is deauthorized, or
 the wallet has no USDC trustline, a payout's transfer fails: the determination is still
 accepted, Treasury emits `PayoutTransferFailed` and records the claim as pending even when
 the reserve covers it. Settling into the same wallet reverts `PayoutTransferFailed` (225).
@@ -232,10 +241,15 @@ stellar contract invoke --id "$PR" --network mainnet --source <any funded key> \
 It extends the policy's entries in all four contracts (PayoutReceiver `PolicyPaid` /
 `Report` / `ClaimPending`, Treasury `PremiumReceived` / `PayoutProcessed` / `PendingPayout`
 and its queue slot, PolicyManager `Policy` / `PendingCounted`, PolicyNft certificate) and
-each contract instance. An entry that archives anyway is not lost: it is restored
-(`stellar contract restore`, or automatically by a transaction whose footprint includes
-it), at a fee. Per-farmer and per-org counters are touched by every policy of that farmer
-or org; an org or farmer with no activity for ~180 days needs a restore on next use.
+each contract instance. It also extends the org and farmer entries the policy depends on:
+Treasury `OrgReserve`, the admin-set `OrgFeeSet` / `OrgFeeBps` / `OrgRatioSet` /
+`OrgReserveRatioBps`, and, while a claim is pending, `OrgQueueHead` / `OrgQueueTail` /
+`OrgPendingPayouts`; PolicyManager `OrgOutstanding` and the farmer's `FarmerClaimTimes` /
+`FarmerActiveCount` / `FarmerPendingCount` / `FarmerPolicyCount`. The fee and ratio entries
+are also extended whenever Treasury reads them. An entry that archives anyway is not lost:
+it is restored (`stellar contract restore`, or automatically by a transaction whose
+footprint includes it), at a fee. An org or farmer with no policy kept alive and no
+activity for ~180 days needs a restore on next use.
 
 ```bash
 # re-check the network limit (read-only; LedgerKey = CONFIG_SETTING / STATE_ARCHIVAL)
@@ -248,9 +262,16 @@ takes `lat_e6` and `lon_e6` (degrees x 1e6, i64) right after `plot_id`. Compute 
 the same plot record the Lit action reads and round the same way (`Math.round(deg * 1e6)`);
 a determination whose signed coordinates differ by more than 1 micro-degree on either axis
 reverts `PlotLocationMismatch` (321). The only determination kind, CROP_DAMAGE, settles only
-`CoverageType::Comprehensive` policies; any other coverage type reverts
-`CoverageNotSettledByMethodology` (320) at claim time, so create every Stellar policy as
-`Comprehensive` (the EVM backend already does).
+`CoverageType::Comprehensive` policies, so `create_policy` refuses any other coverage type
+with `CoverageNotOffered` (118) and no premium can be taken for cover that could never pay
+(the EVM backend already creates every policy as COMPREHENSIVE). PayoutReceiver keeps the
+claim-time check (`CoverageNotSettledByMethodology`, 320) as defence in depth.
+
+**Freeze the coordinates on the policy.** The coordinates are fixed at `create_policy`. The
+backend must store the `lat_e6` / `lon_e6` it passed on its own policy record, and the Lit
+action must sign those stored values, not the live plot record. If the plot is edited or
+re-geocoded after sale and the signer reads the new values, every determination for that
+policy reverts `PlotLocationMismatch`.
 
 **Premiums are paid exactly once, in full.** `receive_premium` takes exactly the policy's
 `premium`; any other amount reverts `PremiumAmountMismatch` (223).
