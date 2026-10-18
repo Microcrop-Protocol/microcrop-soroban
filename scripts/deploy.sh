@@ -42,7 +42,7 @@ mkdir -p "$STATE_DIR"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-say()  { printf '\033[1;36m[deploy]\033[0m %s\n' "$*"; }
+say()  { printf '\033[1;36m[deploy]\033[0m %s\n' "$*" >&2; }  # stderr: deploy() returns the address on stdout
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fatal]\033[0m %s\n' "$*" >&2; exit 1; }
 
