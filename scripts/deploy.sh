@@ -197,6 +197,18 @@ step role_pr_relayer    "$PR"       grant_role --role 4 --who "$RELAYER_ADDR"
 say "--- configuring the payout authority ---"
 step cfg_signer  "$PR" set_authorized_signer --pubkey "${AUTHORIZED_SIGNER_PUBKEY#0x}"
 step cfg_domain  "$PR" set_network_domain    --domain "$NETWORK_DOMAIN"
+# MethodologyKind is a #[repr(u32)] contracttype enum too: CropDualIndex10=0 (CROP_DAMAGE,
+# retired: leave disabled), CropDroughtRdi10=1 (CROP_DROUGHT). Absent means disabled, so
+# nothing settles until this step has run.
+step cfg_drought "$PR" set_methodology_enabled --kind 1 --enabled true
+
+# Rent cap: ordinary calls extend instance + code only below 3 days, to 10 days, and admin
+# calls extend nothing, so a fresh upload sits at the network minimum (7 days on testnet).
+# The permissionless keeper extends all four contracts to 30 days; the backend then runs it
+# daily (a no-op above 23 days). Not recorded as a step: it is meant to be repeated.
+say "--- keeper: extend all four contracts' instance + code to 30 days ---"
+run stellar contract invoke --id "$PR" --source "$ADMIN_KEY" --network "$NETWORK" \
+    -- extend_contract_ttl
 
 state_set network_domain "$NETWORK_DOMAIN"
 state_set network "$NETWORK"

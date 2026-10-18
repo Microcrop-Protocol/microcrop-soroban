@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Verify a MicroCrop Soroban deployment: every contract live, every cross-reference wired,
-# every role granted, the signer and network domain set.
+# every role granted, the signer and network domain set, CROP_DROUGHT enabled and the retired
+# CROP_DAMAGE methodology disabled.
 #
 # WHY THIS EXISTS. None of the wiring fails at deploy time. A missed role grant produces a
 # deployment that looks complete and is dead on the money path — the backend cannot create a
@@ -143,6 +144,23 @@ if [[ -n "${AUTHORIZED_SIGNER_PUBKEY:-}" ]]; then
 else
   echo "  (set AUTHORIZED_SIGNER_PUBKEY to also check the signer)"
 fi
+
+echo
+echo "5. Determination methodologies (MethodologyKind: 0 = CROP_DAMAGE, 1 = CROP_DROUGHT)"
+methodology() {                 # methodology <kind> -> true|false|<error>
+  stellar contract invoke --id "$PR" --network "$NETWORK" --source "${ADMIN_KEY:-default}" \
+      --send no -- is_methodology_enabled --kind "$1" 2>/dev/null | tr -d '"' | tail -1
+}
+case "$(methodology 1)" in
+  true)  ok "CROP_DROUGHT (crop-drought-rdi-1.0) enabled" ;;
+  false) bad "CROP_DROUGHT is DISABLED - no determination can settle. Run set_methodology_enabled --kind 1 --enabled true" ;;
+  *)     bad "could not query is_methodology_enabled (contract older than the drought upgrade?)" ;;
+esac
+case "$(methodology 0)" in
+  false) ok "CROP_DAMAGE (crop-dualindex-1.0, retired) disabled" ;;
+  true)  bad "CROP_DAMAGE is ENABLED - the retired methodology should stay off" ;;
+  *)     bad "could not query is_methodology_enabled for CROP_DAMAGE" ;;
+esac
 
 echo
 echo "=============================================="
