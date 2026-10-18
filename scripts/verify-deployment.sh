@@ -2,7 +2,8 @@
 #
 # Verify a MicroCrop Soroban deployment: every contract live, every cross-reference wired,
 # every role granted, the signer and network domain set, CROP_DROUGHT enabled and the retired
-# CROP_DAMAGE methodology disabled.
+# CROP_DAMAGE methodology disabled, and every instance and code entry kept alive by the keeper
+# (at least 23 days of TTL left).
 #
 # WHY THIS EXISTS. None of the wiring fails at deploy time. A missed role grant produces a
 # deployment that looks complete and is dead on the money path — the backend cannot create a
@@ -161,6 +162,42 @@ case "$(methodology 0)" in
   true)  bad "CROP_DAMAGE is ENABLED - the retired methodology should stay off" ;;
   *)     bad "could not query is_methodology_enabled for CROP_DAMAGE" ;;
 esac
+
+echo
+echo "6. Rent: every instance and code entry lives at least 23 days past now"
+# The keeper (extend_contract_ttl, sent with --send=yes) extends below 23 days to 30 days.
+# Ordinary calls only top up below 3 days to 10 days, so anything under 23 days here means
+# the keeper did not run or was never submitted, and the next user call pays code rent.
+MIN_TTL_LEDGERS=$((23 * 17280))
+ttl_left() {                    # ttl_left <ledger entry fetch args...> -> ledgers left | ''
+  stellar ledger entry fetch "$@" --network "$NETWORK" --output json 2>/dev/null \
+    | jq -r '(.entries[0].liveUntilLedgerSeq // empty) as $l | if $l == "" then empty else ($l - .latestLedger) end' 2>/dev/null
+}
+for pair in "PolicyNft:$NFT" "PolicyManager:$PM" "Treasury:$TREASURY" "PayoutReceiver:$PR"; do
+  name="${pair%%:*}"; addr="${pair#*:}"
+  [[ -n "$addr" ]] || continue
+  inst_json="$(stellar ledger entry fetch contract-data --contract "$addr" --instance --network "$NETWORK" --output json 2>/dev/null || true)"
+  hash="$(jq -r '.entries[0].val.contract_data.val.contract_instance.executable.wasm // empty' <<<"$inst_json" 2>/dev/null || true)"
+  left="$(jq -r '(.entries[0].liveUntilLedgerSeq // empty) as $l | if $l == "" then empty else ($l - .latestLedger) end' <<<"$inst_json" 2>/dev/null || true)"
+  if [[ -z "$left" ]]; then
+    bad "$name instance TTL could not be read"
+  elif (( left >= MIN_TTL_LEDGERS )); then
+    ok "$name instance lives $((left / 17280)) more days"
+  else
+    bad "$name instance has only $((left / 17280)) days left (< 23). Run the keeper: extend_contract_ttl with --send=yes"
+  fi
+  if [[ -z "$hash" ]]; then
+    bad "$name code hash could not be read from its instance"; continue
+  fi
+  left="$(ttl_left contract-code --wasm-hash "$hash")"
+  if [[ -z "$left" ]]; then
+    bad "$name code entry TTL could not be read ($hash)"
+  elif (( left >= MIN_TTL_LEDGERS )); then
+    ok "$name code lives $((left / 17280)) more days"
+  else
+    bad "$name code has only $((left / 17280)) days left (< 23). Run the keeper: extend_contract_ttl with --send=yes"
+  fi
+done
 
 echo
 echo "=============================================="

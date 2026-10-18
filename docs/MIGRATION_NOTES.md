@@ -253,11 +253,13 @@ preparation build into a real migration.
       cost is a restore (`an_archived_policy_paid_flag_never_pays_out`).
 - [ ] **Keeper job not built.** The backend must call `PayoutReceiver.extend_contract_ttl()`
       daily and `extend_policy_ttl(id)` for open or pending policies whose shortest TTL is
-      under 30 days (runbook). Without it, code and instances fall back to the 10-day
-      user-path safety net and the first call after a lapse pays up to ~7 days of code rent.
+      under 30 days (runbook), and must submit them even though simulation reports them
+      read-only (CLI: `--send=yes`). Without it, code and instances fall back to the 10-day
+      user-path safety net and the first call after a lapse pays up to ~10 days of code rent
+      for each contract it touches (§10). Alert on keeper failure.
 - [ ] **Code size grew** (optimized wasm, `stellar contract optimize`, 2026-10-18; code rent
       scales with it): PayoutReceiver 45,271 -> 59,816 B (the drought path), PolicyManager
-      47,369 -> 52,482, Treasury 60,283 -> 64,683, PolicyNft 29,246 -> 38,481. Roughly half of
+      47,369 -> 52,602, Treasury 60,283 -> 64,683, PolicyNft 29,246 -> 38,481. Roughly half of
       each file is the contract spec section (doc comments of every shared type and error are
       embedded in all four contracts); PolicyNft's code section grew ~4.4 KB from the need-based
       TTL helpers, not investigated further. Trimming spec docs and the helpers are rent levers.
@@ -299,7 +301,8 @@ preparation build into a real migration.
 - [ ] **Sale-side rule for drought cover.** A drought determination settles only if the
       planting day is on or after the UTC day cover started and the 110-day window ends by
       `end_date` (326). Sell at least ~140 days (110 + 7-day archive lag + margin) and
-      activate on or before planting day; cover bought after planting cannot settle that
+      activate on or before planting day (`create_policy` enforces only the hard floor:
+      Drought cover under 117 days reverts `InvalidDuration`); cover bought after planting cannot settle that
       season (intended: a grace period would leak W1 rainfall to the buyer).
 
 **Product parity not ported**
@@ -467,8 +470,9 @@ being extended from its 7-day deploy TTL to the network maximum (~173 more days)
 | PayoutReceiver.submit_determination | 662.56 XLM | PR code, 1,014,107 rent bytes |
 | create_policy / activate_policy | 2.63 / 2.65 XLM | data entries only |
 
-Ongoing rent of the four code entries, unchanged by any TTL policy: testnet 14.39 XLM/day
-(432/30 d), mainnet 1.77 XLM/day (53/30 d). Data entries are cheap (556 B for 180 days:
+Ongoing rent of the four code entries, unchanged by any TTL policy, at the pre-drought code
+sizes: testnet 14.39 XLM/day (432/30 d), mainnet 1.77 XLM/day (53/30 d); about 17 and 2.1
+after the growth in §5 (table below). Data entries are cheap (556 B for 180 days:
 1.13 XLM testnet, 0.14 mainnet).
 
 **Policy now** (`crates/shared/src/ttl.rs`, 1 day = 17,280 ledgers):
@@ -478,7 +482,7 @@ Ongoing rent of the four code entries, unchanged by any TTL policy: testnet 14.3
 | Instance + code, user path | below 3 d → 10 d (safety net only) | any call (`touch_contract`) |
 | Instance + code, keeper | below 23 d → 30 d | `extend_contract_ttl()`: PayoutReceiver's extends itself and Treasury and calls PolicyManager's, which extends PolicyManager and PolicyNft |
 | Role grants | below 30 d → 60 d | grant and every use |
-| Per-policy: PM `Policy`, `PendingCounted`, farmer index item; Treasury `PremiumReceived`, `PayoutProcessed`; PR `PolicyPaid`, `Report`; NFT `Certificate`, `Owner`, `PolicyToToken`, `DistributorPolicy` | `end_date + 30 d`, clamped; re-applied at activation; a closed policy keeps its TTL (`PayoutProcessed` at least 60 d) | the lifecycle calls; `extend_policy_ttl(id)` when the need is past the maximum |
+| Per-policy: PM `Policy`, `PendingCounted`, farmer index item; Treasury `PremiumReceived`, `PayoutProcessed`; PR `PolicyPaid`, `Report`; NFT `Certificate`, `Owner`, `PolicyToToken`, `DistributorPolicy` | `end_date + 30 d`, clamped; activation re-applies it to PM `Policy` and the shared per-farmer / per-org entries, but not to the farmer index item (`FarmerPolicyAt`, whose position the policy does not record) nor to a `PremiumReceived` set while PENDING: those keep the create-time need, short by the PENDING period, until `extend_policy_ttl` (Treasury's flag) or a restore (index item); a closed policy keeps its TTL (`PayoutProcessed` at least 60 d) | the lifecycle calls; `extend_policy_ttl(id)` when the need is past the maximum |
 | Pending claim: `ClaimPending`, `PendingPayout`, `OrgQueueAt/Head/Tail`, `OrgPendingPayouts`, PM `Policy` while CLAIM_PENDING | below 30 d → 60 d | settlement attempts and `extend_policy_ttl` |
 | Shared per-farmer / per-org: `Farmer*`, `OrgOutstanding`, `OrgReserve`, ratio and fee settings, `DistributorCount` | longest need of any policy touching it, at least 60 d; `FarmerClaimTimes` 365 d | every touch |
 | Temporary `ConsumedDetermination` | 7 d | `PolicyPaid` is the durable guard |
@@ -490,20 +494,34 @@ restored, so an archived `PolicyPaid`, `PayoutProcessed`, `PremiumReceived`, rol
 `FarmerClaimTimes`, `OrgOutstanding` or `OrgReserve` never reads as absent or false: it
 fails closed, or it is restored and reads its true value. Instance flags (`Paused`, signer,
 domain, `MethodologyEnabled`) archive with the whole instance. No security flag is in
-temporary storage except the redundant replay marker, and none is ever `remove()`d.
+temporary storage except the redundant replay marker, and no positive guard (`PolicyPaid`,
+`PayoutProcessed`, `PremiumReceived`) is ever `remove()`d. What is removed (revoked role
+grants, `ClaimPending`, `PendingPayout`, `OrgQueueAt`, `PendingCounted`) is removed only
+when its absence is the correct state.
 
-**Expected fees after the change** (the spec's rent model, not yet measured on testnet):
+**Expected fees after the change.** Data-entry rows: measured on the host (the four
+optimized wasm builds registered in one `Env` with the testnet ledger limits, rent read from
+the host's per-call metering). Code rows: the network's code rent size per contract (XDR
+size + `wasm_module_memory_cost`, from the 2026-10-13 testnet metas above) scaled by the
+optimized wasm growth in §5, because the local host (soroban-env-host 27) under-reports
+module memory cost against the network's protocol 29 cost model. Nothing here is measured
+on testnet yet.
 
 | Call | Testnet | Mainnet |
 |---|---|---|
-| Admin and config calls | ≈ 0.01 XLM | ≈ 0.01 XLM |
-| `create_policy` | ≈ 2–2.6 XLM | ≈ 0.35 XLM (mainnet's 120-day creation floor) |
-| `receive_premium` | 832.6 → ≈ 0.6 XLM | ≈ 0.07 XLM |
-| `activate_policy` | ≈ 2.6 XLM | ≈ 0.35 XLM |
-| `submit_drought_determination` (pending path) | 662.6 → ≈ 1.1–1.5 XLM | ≈ 0.25 XLM |
-| Worst-case user call if the keeper lapses (7 d of one contract's code) | ≤ 34 XLM (Treasury) | ≤ 4.1 XLM |
-| Keeper, all four contracts | ≈ 101 XLM/week | ≈ 12.4 XLM/week |
+| Admin and config calls | ≤ 0.09 XLM (`grant_role`), others ≈ 0.01 | ≤ 0.011 XLM |
+| `create_policy` | 2.54 XLM | ≈ 0.31 XLM (mainnet's 120-day creation floor applies) |
+| `receive_premium` | 832.6 → 0.60 XLM | ≈ 0.07 XLM |
+| `activate_policy` | 2.52 XLM | ≈ 0.31 XLM |
+| `submit_drought_determination` (pending path) | 662.6 → 1.05 XLM | ≈ 0.13 XLM |
+| Code rent per day: PayoutReceiver / Treasury / PolicyManager / PolicyNft | ≈ 5.0 / 5.2 / 4.1 / 2.8 XLM | ≈ 0.62 / 0.64 / 0.50 / 0.34 XLM |
+| Keeper, all four contracts | ≈ 17 XLM/day, ≈ 119 XLM/week | ≈ 2.1 XLM/day, ≈ 14.7 XLM/week |
+| Worst-case user call after a keeper lapse | up to ~10 days of code rent for **each** contract the call touches: a determination touches all four, ≈ 150–170 XLM | ≈ 19–21 XLM |
 
-These figures predate the code-size growth in §5 (code rent scales with it). Mainnet
-deploy budget: uploads pay the 120-day minimum, about 213 XLM for the four code entries;
-the keeper has nothing to do until about day 97.
+The lapse row: each contract a call touches tops up separately (below 3 days to 10 days),
+so one call can pay for all four. An `extend_policy_ttl` after a lapse was measured on the
+host extending all four contracts by 8 days in one call. Alert on keeper failure; lowering
+`USER_TARGET_LEDGERS` would cap this at the price of more frequent top-ups.
+
+Mainnet deploy budget: uploads pay the 120-day minimum, about 252 XLM for the four code
+entries (was 213 before the growth); the keeper has nothing to do until about day 97.

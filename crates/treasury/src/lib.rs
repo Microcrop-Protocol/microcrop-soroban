@@ -65,8 +65,12 @@ pub const USDC_DECIMALS: u32 = 7;
 // ============ TTL (rent cap, `microcrop_shared::ttl`) ============
 // - Instance + code: every call extends below 3 days to 10 days; the permissionless keeper
 //   `extend_contract_ttl()` extends below 23 days to 30 days.
-// - Per-policy flags: `PremiumReceived` lives until the policy's `end_date + 30 d`;
-//   `PayoutProcessed` until the same need and at least 60 days after it is set.
+// - Per-policy flags: `PremiumReceived` lives until the policy's `end_date + 30 d` as known
+//   when the premium arrives. A premium paid while the policy is PENDING uses the
+//   create-time end, and activation (in PolicyManager) moves the end later without touching
+//   Treasury, so the flag can run short by the PENDING period; `extend_policy_ttl` (the
+//   keeper) re-applies the real end. An archived flag fails closed: cost, not correctness.
+//   `PayoutProcessed` lives until the same need and at least 60 days after it is set.
 // - Pending-claim entries (`PendingPayout`, `OrgQueueAt/Head/Tail`, `OrgPendingPayouts`):
 //   below 30 days to 60 days on every write and settlement attempt.
 // - Per-org entries (`OrgReserve`, ratio and fee settings): the longest need of any policy

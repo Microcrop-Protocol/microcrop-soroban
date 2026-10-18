@@ -114,8 +114,9 @@ Note 11–13 grant roles to *contracts*, not people. That is the part most often
 
 18. `PayoutReceiver.extend_contract_ttl()` — extends all four contracts' instance and code
     to 30 days. A fresh upload sits at the network minimum (7 days on testnet) and admin calls
-    extend nothing, so run it right after the deploy; the backend keeper then runs it daily
-    (see *Storage rent: the keeper* below).
+    extend nothing, so run it right after the deploy (`--send=yes`: the CLI does not submit a
+    TTL-only call by default); the backend keeper then runs it daily (see *Storage rent: the
+    keeper* below).
 
 ---
 
@@ -249,23 +250,33 @@ So **the backend must run a keeper**, as a repeatable job:
 1. **Daily:** `extend_contract_ttl()` on PayoutReceiver. It extends PayoutReceiver and
    Treasury below 23 days to 30 days, then calls PolicyManager's, which does the same for
    PolicyManager and PolicyNft. Above 23 days it is a no-op, so running it daily costs one
-   transaction fee most days and about 7 days of code rent once a week (testnet ≈ 101 XLM a
-   week for all four, mainnet ≈ 12.4 XLM).
+   transaction fee most days and about 7 days of code rent once a week (estimated testnet
+   ≈ 119 XLM a week for all four, mainnet ≈ 14.7 XLM; MIGRATION_NOTES §10).
 2. **For each PENDING, ACTIVE or CLAIM_PENDING policy whose shortest TTL is under 30 days:**
    `extend_policy_ttl(policy_id)` on PayoutReceiver. It extends the policy's entries in all
    four contracts to their need, never to the maximum. Needed for policies whose need is past
    the ~180-day maximum and for pending claims (60-day target).
 
+**The keeper must always submit.** Both calls only extend TTLs: simulation shows no ledger
+write, no event and no auth, so a client that sends only "state-changing" simulations never
+sends them. The stellar CLI (28.x) does exactly that by default and prints "Simulation
+identified as read-only. Send by rerunning with `--send=yes`." Pass `--send=yes`; the
+backend keeper must likewise sign and submit the transaction regardless of how the
+simulation looks, and check `liveUntilLedgerSeq` afterwards (`verify-deployment.sh` step 6
+fails when any instance or code entry has under 23 days left).
+
 ```bash
-stellar contract invoke --id "$PR" --network testnet --source <any funded key> \
+stellar contract invoke --id "$PR" --network testnet --source <any funded key> --send=yes \
   -- extend_contract_ttl
-stellar contract invoke --id "$PR" --network testnet --source <any funded key> \
+stellar contract invoke --id "$PR" --network testnet --source <any funded key> --send=yes \
   -- extend_policy_ttl --policy_id <id>
 ```
 
-If the keeper lapses, nothing breaks: the next user call extends the contract it touches by
-up to ~7 days of code rent (testnet ≤ 34 XLM for Treasury, mainnet ≤ 4.1 XLM). CLI fallback
-(the same as the keeper, without the contracts):
+If the keeper lapses, nothing breaks, but it gets expensive: each contract a call touches
+tops itself up separately (below 3 days to 10 days), so a call pays up to ~10 days of code
+rent **for each contract it touches**. A determination touches all four: estimated
+≈ 150–170 XLM on testnet, ≈ 19–21 XLM on mainnet, charged to the relayer. Alert on keeper
+failure. CLI fallback (the same as the keeper, without the contracts):
 
 ```bash
 stellar contract extend --id C... --network testnet --source <key> \
@@ -276,8 +287,8 @@ stellar contract extend --wasm-hash <hash> --network testnet --source <key> \
 
 An entry that archives anyway is not lost and never reads as absent: it is restored
 (`stellar contract restore`, or automatically by a transaction whose footprint includes it),
-at a fee. Mainnet deploy budget: uploads pay the 120-day minimum (≈ 213 XLM for the four code
-entries) and the keeper has nothing to do until about day 97.
+at a fee. Mainnet deploy budget: uploads pay the 120-day minimum (≈ 252 XLM for the four code
+entries at the current sizes) and the keeper has nothing to do until about day 97.
 
 ```bash
 # re-check the network limit (read-only; LedgerKey = CONFIG_SETTING / STATE_ARCHIVAL)
@@ -302,7 +313,10 @@ UTC day the cover started — `activate_policy` resets `start_date` to now — a
 110-day measurement window ends by `end_date`; otherwise it reverts
 `EvidenceOutsideCoverWindow` (326). It is also refused before the window ends
 (`SeasonNotComplete`, 327). The oracle runs at least 7 days after the window (archive lag).
-So: sell at least ~140 days of cover and activate on or before planting day. Cover bought
+So: sell at least ~140 days of cover and activate on or before planting day.
+`create_policy` refuses Drought cover under 117 days (110 + 7; `InvalidDuration`, 106),
+because such a policy takes a premium and can never settle; 117 is that floor, not the
+recommended sale. Cover bought
 after planting cannot settle that season; this is the anti-adverse-selection rule, not a
 bug.
 
@@ -383,8 +397,8 @@ stellar contract invoke --id "$TREASURY" --source admin --network testnet -- upg
 stellar contract invoke --id "$PR" --source admin --network testnet -- upgrade --caller <ADMIN_G...> --new_wasm_hash "$PR_HASH"
 # enable CROP_DROUGHT; CROP_DAMAGE stays disabled (absent = disabled)
 stellar contract invoke --id "$PR" --source admin --network testnet -- set_methodology_enabled --caller <ADMIN_G...> --kind 1 --enabled true
-# keeper: all four to 30 days
-stellar contract invoke --id "$PR" --source admin --network testnet -- extend_contract_ttl
+# keeper: all four to 30 days (--send=yes, or the CLI only simulates it)
+stellar contract invoke --id "$PR" --source admin --network testnet --send=yes -- extend_contract_ttl
 ./scripts/verify-deployment.sh --network testnet
 ```
 
@@ -394,8 +408,16 @@ the upgrade, a claim already recorded as pending still settles (`settle_pending_
 not re-verify), but no new crop determination is accepted (322).
 
 **Rent checks after the upgrade.** Simulate every entrypoint: nothing above ≈ 1.5 XLM except
-the keeper; `extend_contract_ttl`'s cost should be about the days extended × 14.4 XLM on
-testnet; `liveUntilLedgerSeq` of the instances and code entries ≈ now + 30 days.
+the keeper, with one testnet exception below; `extend_contract_ttl`'s cost should be about
+the days extended × 17 XLM on testnet; `liveUntilLedgerSeq` of the instances and code
+entries ≈ now + 30 days (`verify-deployment.sh` step 6).
+
+**Testnet exception: the old PolicyNft.** PolicyNft has no `upgrade`, so the deployed
+testnet NFT keeps the old behaviour and extends its instance and code to the network
+maximum on every touch. Any call that touches it (`activate_policy` mints, claims update the
+certificate status) pays NFT code rent for every day since its last touch, so those calls
+will exceed 1.5 XLM on testnet. The rent cap reaches PolicyNft only on a fresh deploy (or a
+redeploy of the NFT with re-wiring and the Minter grant); mainnet is a fresh deploy.
 
 **Signer.** Until the drought Lit action signs the Soroban preimage (`chain = stellar`,
 `networkDomain`, the contract StrKey as `verifyingContract`) and its new CID is registered

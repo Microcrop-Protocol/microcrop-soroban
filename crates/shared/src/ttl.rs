@@ -28,7 +28,10 @@
 //! domain, enabled methodologies) archive with the whole instance, which makes the contract
 //! unusable rather than unpaused. Shortening a TTL therefore changes cost and availability,
 //! never correctness. Rules that keep it so: no security flag lives in temporary storage
-//! except the redundant replay marker, and no security flag is ever `remove()`d.
+//! except the redundant replay marker, and no positive guard (`PolicyPaid`,
+//! `PayoutProcessed`, `PremiumReceived`) is ever `remove()`d. Entries that are removed
+//! (revoked role grants, `ClaimPending`, Treasury's `PendingPayout` and `OrgQueueAt`,
+//! `PendingCounted`) are removed only when their absence is the correct state.
 //!
 //! ## Measured network limits (2026-10-13, `getLedgerEntries` on `ConfigSettingStateArchival`)
 //!

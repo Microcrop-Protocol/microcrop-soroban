@@ -206,8 +206,11 @@ step cfg_drought "$PR" set_methodology_enabled --kind 1 --enabled true
 # calls extend nothing, so a fresh upload sits at the network minimum (7 days on testnet).
 # The permissionless keeper extends all four contracts to 30 days; the backend then runs it
 # daily (a no-op above 23 days). Not recorded as a step: it is meant to be repeated.
+# --send=yes is required: a TTL extension writes no ledger entry, emits no event and needs no
+# auth, so the CLI's default classifies the simulation as read-only and never submits it
+# ("Simulation identified as read-only. Send by rerunning with `--send=yes`.").
 say "--- keeper: extend all four contracts' instance + code to 30 days ---"
-run stellar contract invoke --id "$PR" --source "$ADMIN_KEY" --network "$NETWORK" \
+run stellar contract invoke --id "$PR" --source "$ADMIN_KEY" --network "$NETWORK" --send=yes \
     -- extend_contract_ttl
 
 state_set network_domain "$NETWORK_DOMAIN"

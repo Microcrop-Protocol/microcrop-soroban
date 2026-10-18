@@ -97,15 +97,15 @@ Package names (for `-p`): `microcrop-shared`, `microcrop-policy-manager`,
 ```
 cargo build --target wasm32v1-none --release   ->  4/4 WASM contracts built
                                      release     after `stellar contract optimize`
-    microcrop_policy_manager.wasm    63,866 B    52,482 B
+    microcrop_policy_manager.wasm    64,003 B    52,602 B
     microcrop_treasury.wasm          79,856 B    64,683 B
     microcrop_payout_receiver.wasm   72,960 B    59,816 B
     microcrop_policy_nft.wasm        45,714 B    38,481 B
 
-cargo test --workspace                         ->  216/216 passed, 0 failed
-    microcrop-payout-receiver   75 passed   (crop + 41 drought: every check in order, real secp256k1 round-trip, cross-methodology replay, pending claims, archived-flag safety, rent cap)
+cargo test --workspace                         ->  220/220 passed, 0 failed
+    microcrop-payout-receiver   78 passed   (crop + 44 drought: every check in order, real secp256k1 round-trip, cross-methodology replay, pending claims, archived-flag safety, rent cap, signatures required without mock auths)
     microcrop-treasury          49 passed   (premium split, per-org solvency, FIFO pending queue, frozen wallet, receiver-switch guard, 7dp, TTL targets)
-    microcrop-policy-manager    44 passed   (lifecycle, caps, claim window, exposure, roles, plot coords, Drought-only sale, TTL targets)
+    microcrop-policy-manager    45 passed   (lifecycle, caps, claim window, exposure, roles, plot coords, Drought-only sale with a 117-day floor, TTL targets)
     microcrop-integration-tests 21 passed   (all four real contracts on one Env, drought path, real 2022 ERA5 season end to end, keepers)
     microcrop-policy-nft        14 passed   (mint, soulbound transfer, PM-only status, paging, TTL targets)
     microcrop-shared            13 passed   (drought golden vectors, EVM + JS cross-checks, rdi-1.0 grid, TTL helpers)
@@ -223,7 +223,7 @@ stellar contract invoke --id payout_receiver --source-account admin --network te
 stellar contract invoke --id payout_receiver --source-account admin --network testnet \
   -- set_methodology_enabled --caller <ADMIN_G...> --kind 1 --enabled true
 stellar contract invoke --id payout_receiver --source-account admin --network testnet \
-  -- extend_contract_ttl
+  --send=yes -- extend_contract_ttl   # --send=yes: the CLI never submits a TTL-only call otherwise
 ```
 
 For `upgrade`: publish the new WASM (`stellar contract upload --wasm <new>.wasm` returns a
