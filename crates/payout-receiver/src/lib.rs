@@ -89,10 +89,12 @@ pub const WEIGHT_DENOMINATOR: u32 = 100;
 /// farm.
 pub const PLOT_COORD_TOLERANCE_E6: i128 = 1;
 
-// ---- Storage TTL ----
-// Instance and persistent entries are extended to the network maximum on every touch
-// (`microcrop_shared::ttl`; ~180 days on mainnet/testnet). The replay marker is temporary
-// and only has to outlive the 1-hour freshness window.
+// ---- Storage TTL (rent cap, `microcrop_shared::ttl`) ----
+// Instance + code: every call extends below 3 days to 10 days; `extend_contract_ttl()` (the
+// keeper) extends all four contracts below 23 days to 30 days. `PolicyPaid` and `Report` live
+// until the policy's `end_date + 30 d`; `ClaimPending` below 30 days to 60 days. The replay
+// marker is temporary and only has to outlive the 1-hour freshness window; `PolicyPaid` is
+// the durable guard.
 const DAY_IN_LEDGERS: u32 = 17_280;
 const TEMP_BUMP: u32 = 7 * DAY_IN_LEDGERS;
 const TEMP_THRESHOLD: u32 = TEMP_BUMP - DAY_IN_LEDGERS;
@@ -307,7 +309,7 @@ impl PayoutReceiver {
         }
 
         let s = env.storage();
-        ttl::extend_instance(&env);
+        ttl::touch_contract(&env);
 
         // 1. authority root must be configured.
         let authorized_signer: BytesN<65> = match s.instance().get(&DataKey::AuthorizedSigner) {
@@ -454,7 +456,11 @@ impl PayoutReceiver {
 
         s.persistent()
             .set(&DataKey::PolicyPaid(d.on_chain_policy_id), &true);
-        ttl::extend_persistent(&env, &DataKey::PolicyPaid(d.on_chain_policy_id));
+        ttl::extend_for_policy(
+            &env,
+            &DataKey::PolicyPaid(d.on_chain_policy_id),
+            policy.end_date,
+        );
 
         let report = DamageReport {
             policy_id: d.on_chain_policy_id,
@@ -466,7 +472,11 @@ impl PayoutReceiver {
         };
         s.persistent()
             .set(&DataKey::Report(d.on_chain_policy_id), &report);
-        ttl::extend_persistent(&env, &DataKey::Report(d.on_chain_policy_id));
+        ttl::extend_for_policy(
+            &env,
+            &DataKey::Report(d.on_chain_policy_id),
+            policy.end_date,
+        );
 
         // Interactions. `this` is passed as the acting caller so Treasury/PolicyManager can
         // enforce `caller == payout_receiver` / role checks; a contract auto-authorizes calls
@@ -489,7 +499,7 @@ impl PayoutReceiver {
             pm.mark_claim_pending(&this, &d.on_chain_policy_id);
             s.persistent()
                 .set(&DataKey::ClaimPending(d.on_chain_policy_id), &true);
-            ttl::extend_persistent(&env, &DataKey::ClaimPending(d.on_chain_policy_id));
+            ttl::extend_pending(&env, &DataKey::ClaimPending(d.on_chain_policy_id));
         }
         // The claim counts against the farmer's window when it is approved, paid or not.
         pm.increment_claim_count(&this, &policy.farmer);
@@ -547,7 +557,7 @@ impl PayoutReceiver {
             panic_with_error!(&env, PausedError::ContractPaused);
         }
         let s = env.storage();
-        ttl::extend_instance(&env);
+        ttl::touch_contract(&env);
 
         let key = DataKey::ClaimPending(policy_id);
         if !s.persistent().get(&key).unwrap_or(false) {
@@ -574,28 +584,55 @@ impl PayoutReceiver {
     }
 
     /// PERMISSIONLESS keep-alive for one policy across all four contracts: extends this
-    /// contract's entries for `policy_id` (`PolicyPaid`, `Report`, `ClaimPending`) and its
-    /// instance to the network maximum TTL, then calls `Treasury::extend_policy_ttl` and
-    /// `PolicyManager::extend_policy_ttl` (which extends the PolicyNft certificate, best
-    /// effort). The network's `max_entry_ttl` (~180 days on mainnet and testnet) is shorter
-    /// than a 365-day policy, so the backend calls this for every open or pending policy at
-    /// least every ~150 days (see `docs/DEPLOYMENT_RUNBOOK.md`). Not paused-gated: keeping
-    /// state alive is always safe. Reverts `PolicyDoesNotExist` (PolicyManager) for an
-    /// unknown policy.
+    /// contract's entries for `policy_id` to their need (`PolicyPaid` / `Report` to the
+    /// policy's `end_date + 30 d`, `ClaimPending` below 30 days to 60 days), then calls
+    /// `Treasury::extend_policy_ttl` and `PolicyManager::extend_policy_ttl` (which extends the
+    /// PolicyNft certificate, best effort). Uses the keeper targets, never the network
+    /// maximum. The backend keeper calls it for every open or pending policy whose shortest
+    /// TTL is under 30 days (see `docs/DEPLOYMENT_RUNBOOK.md`). Not paused-gated: keeping state
+    /// alive is always safe. Reverts `PolicyDoesNotExist` (PolicyManager) for an unknown
+    /// policy.
     pub fn extend_policy_ttl(env: Env, policy_id: u64) {
-        ttl::extend_instance(&env);
-        ttl::extend_persistent_if_present(&env, &DataKey::PolicyPaid(policy_id));
-        ttl::extend_persistent_if_present(&env, &DataKey::Report(policy_id));
-        ttl::extend_persistent_if_present(&env, &DataKey::ClaimPending(policy_id));
+        ttl::touch_contract(&env);
+        let (treasury, policy_manager) = Self::siblings(&env);
+        let pm = PolicyManagerClient::new(&env, &policy_manager);
+        let policy = pm.get_policy(&policy_id);
+        let p = env.storage().persistent();
+        for key in [DataKey::PolicyPaid(policy_id), DataKey::Report(policy_id)] {
+            if p.has(&key) {
+                ttl::extend_for_policy(&env, &key, policy.end_date);
+            }
+        }
+        if p.has(&DataKey::ClaimPending(policy_id)) {
+            ttl::extend_pending(&env, &DataKey::ClaimPending(policy_id));
+        }
+        TreasuryClient::new(&env, &treasury).extend_policy_ttl(&policy_id);
+        pm.extend_policy_ttl(&policy_id);
+    }
+
+    /// PERMISSIONLESS keeper for all four contracts: extends the instance and code of this
+    /// contract and of Treasury below 23 days to 30 days, then calls
+    /// `PolicyManager::extend_contract_ttl`, which does the same for PolicyManager and
+    /// PolicyNft. A no-op above 23 days, so the backend calls it daily. Ordinary calls extend
+    /// only below 3 days to 10 days; this keeper, not user traffic, pays for keeping the code
+    /// alive. Not paused-gated.
+    pub fn extend_contract_ttl(env: Env) {
+        ttl::keep_contract_alive(&env);
+        let (treasury, policy_manager) = Self::siblings(&env);
+        ttl::keep_other_contract_alive(&env, &treasury);
+        PolicyManagerClient::new(&env, &policy_manager).extend_contract_ttl();
+    }
+
+    /// The Treasury and PolicyManager addresses (set in the constructor).
+    fn siblings(env: &Env) -> (Address, Address) {
         let s = env.storage().instance();
         let treasury: Address = s
             .get(&DataKey::Treasury)
-            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
+            .unwrap_or_else(|| panic_with_error!(env, CommonError::NotConfigured));
         let policy_manager: Address = s
             .get(&DataKey::PolicyManager)
-            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
-        TreasuryClient::new(&env, &treasury).extend_policy_ttl(&policy_id);
-        PolicyManagerClient::new(&env, &policy_manager).extend_policy_ttl(&policy_id);
+            .unwrap_or_else(|| panic_with_error!(env, CommonError::NotConfigured));
+        (treasury, policy_manager)
     }
 
     // ---- views ----

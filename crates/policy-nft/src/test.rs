@@ -327,3 +327,83 @@ fn distributor_index_is_per_entry_and_paginated_past_100() {
         0
     );
 }
+
+// ---------------- Rent cap (storage TTL) ----------------
+
+mod rent {
+    use super::*;
+    use crate::DataKey;
+    use microcrop_shared::ttl::{
+        DAY_LEDGERS, KEEPER_TARGET_LEDGERS, NETWORK_MAX_ENTRY_TTL_LEDGERS, USER_TARGET_LEDGERS,
+    };
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+    use soroban_sdk::testutils::Ledger as _;
+
+    const NOW: u64 = 1_700_000_000;
+
+    fn mint_ending(f: &Fixture, policy_id: u64, end: u64) -> Address {
+        let farmer = Address::generate(&f.env);
+        f.client.mint_policy(
+            &f.minter,
+            &farmer,
+            &policy_id,
+            &Address::generate(&f.env),
+            &String::from_str(&f.env, "Acre Africa"),
+            &10_000_000_000i128,
+            &50_000_000i128,
+            &NOW,
+            &end,
+            &CoverageType::Drought,
+            &String::from_str(&f.env, "Nakuru"),
+            &42u64,
+        );
+        farmer
+    }
+
+    #[test]
+    fn certificate_entries_live_until_end_date_plus_grace() {
+        let f = setup();
+        f.env.ledger().set_timestamp(NOW);
+        f.env
+            .ledger()
+            .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+        mint_ending(&f, 7, NOW + 100 * 86_400);
+        let ttl = |k: &DataKey| {
+            f.env.as_contract(&f.client.address, || {
+                f.env.storage().persistent().get_ttl(k)
+            })
+        };
+        for k in [
+            DataKey::Certificate(7),
+            DataKey::Owner(7),
+            DataKey::PolicyToToken(7),
+        ] {
+            assert_eq!(ttl(&k), 130 * DAY_LEDGERS);
+        }
+        // A 400-day need clamps to the network maximum, never more.
+        mint_ending(&f, 8, NOW + 400 * 86_400);
+        assert_eq!(ttl(&DataKey::Certificate(8)), NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    }
+
+    #[test]
+    fn calls_no_longer_extend_the_instance_above_the_threshold() {
+        let f = setup();
+        f.env.ledger().set_timestamp(NOW);
+        let inst = || {
+            f.env
+                .as_contract(&f.client.address, || f.env.storage().instance().get_ttl())
+        };
+        // Setup touched it: user target, not the network maximum.
+        assert_eq!(inst(), USER_TARGET_LEDGERS);
+        f.client.extend_contract_ttl();
+        assert_eq!(inst(), KEEPER_TARGET_LEDGERS);
+        // A mint is a user call: it leaves a 30-day TTL alone.
+        mint_ending(&f, 9, NOW + 100 * 86_400);
+        assert_eq!(inst(), KEEPER_TARGET_LEDGERS);
+        // Below 3 days a user call tops it up to 10 days, no more.
+        let seq = f.env.ledger().sequence();
+        f.env.ledger().set_sequence_number(seq + 28 * DAY_LEDGERS);
+        f.client.extend_policy_ttl(&9);
+        assert_eq!(inst(), USER_TARGET_LEDGERS);
+    }
+}

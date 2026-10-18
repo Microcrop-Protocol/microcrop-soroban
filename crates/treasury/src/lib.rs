@@ -62,10 +62,16 @@ pub const DEFAULT_PLATFORM_FEE_PERCENT: u32 = 10;
 /// The constructor refuses any other token precision.
 pub const USDC_DECIMALS: u32 = 7;
 
-// ============ TTL ============
-// Every touch extends the instance and the persistent entry it reads or writes to the network
-// maximum (`microcrop_shared::ttl`; ~180 days on mainnet/testnet). That is shorter than a
-// 365-day policy, so `extend_policy_ttl(policy_id)` keeps one policy's flags alive.
+// ============ TTL (rent cap, `microcrop_shared::ttl`) ============
+// - Instance + code: every call extends below 3 days to 10 days; the permissionless keeper
+//   `extend_contract_ttl()` extends below 23 days to 30 days.
+// - Per-policy flags: `PremiumReceived` lives until the policy's `end_date + 30 d`;
+//   `PayoutProcessed` until the same need and at least 60 days after it is set.
+// - Pending-claim entries (`PendingPayout`, `OrgQueueAt/Head/Tail`, `OrgPendingPayouts`):
+//   below 30 days to 60 days on every write and settlement attempt.
+// - Per-org entries (`OrgReserve`, ratio and fee settings): the longest need of any policy
+//   touching them, and at least 60 days past each touch.
+// - `extend_policy_ttl(policy_id)` keeps one policy's entries alive.
 
 /// Crate-local paused guard errors. The shared `TreasuryError` enum (range 200..=214) has no
 /// paused code; `Pausable`'s two reverts map here. Codes 215/216 stay inside the Treasury
@@ -497,11 +503,12 @@ impl Treasury {
 
         // The backing org comes from the same read; split the per-org platform fee.
         let org = policy.org;
-        let platform_fee = amount * fee_bps(&env, &org) / BPS_DENOMINATOR;
+        let end = Some(policy.end_date);
+        let platform_fee = amount * fee_bps(&env, &org, end) / BPS_DENOMINATOR;
         let net_premium = amount - platform_fee;
 
         // Mark received BEFORE the external transfer (CEI).
-        set_premium_received(&env, policy_id);
+        set_premium_received(&env, policy_id, policy.end_date);
         set_scalar(
             &env,
             &DataKey::AccumulatedFees,
@@ -512,7 +519,7 @@ impl Treasury {
             &DataKey::TotalPremiums,
             get_total_premiums(&env) + net_premium,
         );
-        set_org_reserve(&env, &org, org_reserve_of(&env, &org) + net_premium);
+        set_org_reserve(&env, &org, org_reserve_of(&env, &org) + net_premium, end);
         set_scalar(
             &env,
             &DataKey::TotalOrgReserves,
@@ -580,7 +587,9 @@ impl Treasury {
         // claim that fits would be paid from money `reserve_required` holds for an older
         // pending claim, and a large pending claim could wait behind new ones indefinitely.
         // New claims therefore queue behind unpaid ones.
-        let org = resolve_org(&env, policy_id);
+        let policy =
+            PolicyManagerClient::new(&env, &require_policy_manager(&env)).get_policy(&policy_id);
+        let org = policy.org;
         let reserve = org_reserve_of(&env, &org);
         let available = reserve - org_pending_payouts_of(&env, &org);
         if available < amount {
@@ -590,7 +599,14 @@ impl Treasury {
             return false;
         }
 
-        if !pay_out(&env, policy_id, &org, amount, reserve) {
+        if !pay_out(
+            &env,
+            policy_id,
+            &org,
+            amount,
+            reserve,
+            Some(policy.end_date),
+        ) {
             // The wallet cannot receive USDC. Nothing moved; keep the claim instead.
             record_pending(&env, policy_id, &org, amount, available);
             return false;
@@ -638,18 +654,25 @@ impl Treasury {
         env.storage()
             .persistent()
             .remove(&DataKey::OrgQueueAt(pending.org.clone(), head));
-        set_persistent(
+        set_pending_entry(
             &env,
             DataKey::OrgQueueHead(pending.org.clone()),
             &(head + 1),
         );
-        set_persistent(
+        set_pending_entry(
             &env,
             DataKey::OrgPendingPayouts(pending.org.clone()),
             &(org_pending_payouts_of(&env, &pending.org) - pending.amount),
         );
         set_pending_total_count(&env, pending_total_count(&env) - 1);
-        if !pay_out(&env, policy_id, &pending.org, pending.amount, available) {
+        if !pay_out(
+            &env,
+            policy_id,
+            &pending.org,
+            pending.amount,
+            available,
+            None,
+        ) {
             panic_with_error!(&env, TreasuryError::PayoutTransferFailed);
         }
         PendingPayoutSettled {
@@ -671,7 +694,7 @@ impl Treasury {
         if amount == 0 {
             panic_with_error!(&env, TreasuryError::ZeroAmount);
         }
-        set_org_reserve(&env, &org, org_reserve_of(&env, &org) + amount);
+        set_org_reserve(&env, &org, org_reserve_of(&env, &org) + amount, None);
         set_scalar(
             &env,
             &DataKey::TotalOrgReserves,
@@ -702,7 +725,7 @@ impl Treasury {
             panic_with_error!(&env, TreasuryError::WouldBreachReserve);
         }
 
-        set_org_reserve(&env, &org, remaining);
+        set_org_reserve(&env, &org, remaining, None);
         set_scalar(
             &env,
             &DataKey::TotalOrgReserves,
@@ -723,8 +746,8 @@ impl Treasury {
         if bps < MIN_RESERVE_RATIO_BPS {
             panic_with_error!(&env, TreasuryError::ReserveRatioTooLow);
         }
-        set_persistent_u32(&env, DataKey::OrgReserveRatioBps(org.clone()), bps);
-        set_persistent_bool(&env, DataKey::OrgRatioSet(org.clone()), true);
+        set_shared(&env, DataKey::OrgReserveRatioBps(org.clone()), &bps);
+        set_shared(&env, DataKey::OrgRatioSet(org.clone()), &true);
         OrgReserveRatioSet {
             org,
             ratio_bps: bps,
@@ -739,8 +762,8 @@ impl Treasury {
         if bps > MAX_FEE_BPS {
             panic_with_error!(&env, TreasuryError::BpsTooHigh);
         }
-        set_persistent_u32(&env, DataKey::OrgFeeBps(org.clone()), bps);
-        set_persistent_bool(&env, DataKey::OrgFeeSet(org.clone()), true);
+        set_shared(&env, DataKey::OrgFeeBps(org.clone()), &bps);
+        set_shared(&env, DataKey::OrgFeeSet(org.clone()), &true);
         OrgFeeBpsSet { org, fee_bps: bps }.publish(&env);
     }
 
@@ -816,7 +839,7 @@ impl Treasury {
     pub fn reserve_required(env: Env, org: Address) -> i128 {
         let outstanding = PolicyManagerClient::new(&env, &require_policy_manager(&env))
             .org_outstanding_sum_insured(&org);
-        outstanding * reserve_ratio_bps(&env, &org) / BPS_DENOMINATOR
+        outstanding * reserve_ratio_bps(&env, &org, None) / BPS_DENOMINATOR
             + org_pending_payouts_of(&env, &org)
     }
 
@@ -856,37 +879,53 @@ impl Treasury {
         pending_total_count(&env)
     }
 
-    /// PERMISSIONLESS keep-alive: extend every Treasury entry of `policy_id`
-    /// (`PremiumReceived`, `PayoutProcessed`, `PendingPayout` and its queue slot) and the
-    /// instance to the network maximum TTL. Absent entries are skipped. Called by
+    /// PERMISSIONLESS keeper: extend this contract's instance and code below 23 days to 30
+    /// days (a no-op above). `PayoutReceiver::extend_contract_ttl` also does this for the
+    /// Treasury, so the backend needs to call only that one.
+    pub fn extend_contract_ttl(env: Env) {
+        ttl::keep_contract_alive(&env);
+    }
+
+    /// PERMISSIONLESS keep-alive: extend every Treasury entry of `policy_id` to its need —
+    /// `PremiumReceived` / `PayoutProcessed` to the policy's `end_date + 30 d`, a pending
+    /// payout and its queue entries below 30 days to 60 days, and the org's reserve, fee and
+    /// ratio entries to at least the policy's need. Absent entries are skipped. Called by
     /// `PayoutReceiver::extend_policy_ttl`; anyone may call it directly.
     pub fn extend_policy_ttl(env: Env, policy_id: u64) {
         instance_bump(&env);
-        ttl::extend_persistent_if_present(&env, &DataKey::PremiumReceived(policy_id));
-        ttl::extend_persistent_if_present(&env, &DataKey::PayoutProcessed(policy_id));
-        let pending: Option<PendingPayout> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingPayout(policy_id));
-        if let Some(p) = pending {
-            ttl::extend_persistent(&env, &DataKey::PendingPayout(policy_id));
-            ttl::extend_persistent_if_present(
-                &env,
-                &DataKey::OrgQueueAt(p.org.clone(), p.queue_index),
-            );
+        let policy = try_get_policy(&env, policy_id);
+        let end = policy.as_ref().map(|p| p.end_date);
+        let p = env.storage().persistent();
+        if let Some(e) = end {
+            if p.has(&DataKey::PremiumReceived(policy_id)) {
+                ttl::extend_for_policy(&env, &DataKey::PremiumReceived(policy_id), e);
+            }
+        }
+        if p.has(&DataKey::PayoutProcessed(policy_id)) {
+            ttl::extend_shared(&env, &DataKey::PayoutProcessed(policy_id), end);
+        }
+        let pending: Option<PendingPayout> = p.get(&DataKey::PendingPayout(policy_id));
+        if let Some(pp) = pending {
+            ttl::extend_pending(&env, &DataKey::PendingPayout(policy_id));
+            let org = pp.org;
             // The org-level entries a pending claim needs in order to settle.
-            let org = p.org;
             for key in [
+                DataKey::OrgQueueAt(org.clone(), pp.queue_index),
                 DataKey::OrgQueueHead(org.clone()),
                 DataKey::OrgQueueTail(org.clone()),
                 DataKey::OrgPendingPayouts(org.clone()),
-                DataKey::OrgReserve(org.clone()),
             ] {
-                ttl::extend_persistent_if_present(&env, &key);
+                if p.has(&key) {
+                    ttl::extend_pending(&env, &key);
+                }
+            }
+            if p.has(&DataKey::OrgReserve(org.clone())) {
+                ttl::extend_shared(&env, &DataKey::OrgReserve(org), end);
             }
         }
         // The org's admin-set fee and reserve ratio, and its reserve, for any known policy.
-        if let Some(org) = try_policy_org(&env, policy_id) {
+        if let Some(policy) = policy {
+            let org = policy.org;
             for key in [
                 DataKey::OrgReserve(org.clone()),
                 DataKey::OrgRatioSet(org.clone()),
@@ -894,7 +933,9 @@ impl Treasury {
                 DataKey::OrgFeeSet(org.clone()),
                 DataKey::OrgFeeBps(org.clone()),
             ] {
-                ttl::extend_persistent_if_present(&env, &key);
+                if p.has(&key) {
+                    ttl::extend_shared(&env, &key, end);
+                }
             }
         }
     }
@@ -941,7 +982,7 @@ impl Treasury {
 
     /// Port of `calculatePlatformFee(premium, org)` = `premium * fee_bps(org) / 10000`.
     pub fn calculate_platform_fee(env: Env, premium: i128, org: Address) -> i128 {
-        premium * fee_bps(&env, &org) / BPS_DENOMINATOR
+        premium * fee_bps(&env, &org, None) / BPS_DENOMINATOR
     }
 
     /// Port of `getTotalPremiums`.
@@ -963,8 +1004,9 @@ fn usdc(env: &Env) -> TokenClient<'_> {
     TokenClient::new(env, &addr)
 }
 
+/// User-path instance + code extension: below 3 days to 10 days (see `ttl`).
 fn instance_bump(env: &Env) {
-    ttl::extend_instance(env);
+    ttl::touch_contract(env);
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -1018,18 +1060,13 @@ fn require_policy_manager(env: &Env) -> Address {
     }
 }
 
-/// Resolve a policy's backing org via PolicyManager (revert if PolicyManager unset). Soroban has
-/// no zero address, so `OrgNotResolved` is unreachable here — the callee raises on a missing org.
-fn resolve_org(env: &Env, policy_id: u64) -> Address {
-    PolicyManagerClient::new(env, &require_policy_manager(env)).policy_org(&policy_id)
-}
-
-/// Best-effort org lookup for the keep-alive: `None` when PolicyManager is unset or the policy
-/// is unknown, so `extend_policy_ttl` never reverts on a lookup.
-fn try_policy_org(env: &Env, policy_id: u64) -> Option<Address> {
+/// Best-effort policy lookup for the keep-alive: `None` when PolicyManager is unset or the
+/// policy is unknown, so `extend_policy_ttl` never reverts on a lookup. (Soroban has no zero
+/// address, so `OrgNotResolved` is unreachable: PolicyManager raises on an unknown policy.)
+fn try_get_policy(env: &Env, policy_id: u64) -> Option<microcrop_shared::types::Policy> {
     let pm: Address = env.storage().instance().get(&DataKey::PolicyManager)?;
-    match PolicyManagerClient::new(env, &pm).try_policy_org(&policy_id) {
-        Ok(Ok(org)) => Some(org),
+    match PolicyManagerClient::new(env, &pm).try_get_policy(&policy_id) {
+        Ok(Ok(p)) => Some(p),
         _ => None,
     }
 }
@@ -1060,7 +1097,17 @@ fn require_payout_receiver(env: &Env, caller: &Address) {
 ///
 /// The transfer runs before the bookkeeping. That is safe on Soroban: a contract cannot be
 /// re-entered, and the SAC is the only callee.
-fn pay_out(env: &Env, policy_id: u64, org: &Address, amount: i128, available: i128) -> bool {
+///
+/// `end_date` is the policy's, when the caller has it: `PayoutProcessed` and the org reserve
+/// then live at least until `end_date + 30 d`, and always at least 60 days.
+fn pay_out(
+    env: &Env,
+    policy_id: u64,
+    org: &Address,
+    amount: i128,
+    available: i128,
+    end_date: Option<u64>,
+) -> bool {
     let backend: Address = env
         .storage()
         .instance()
@@ -1080,10 +1127,10 @@ fn pay_out(env: &Env, policy_id: u64, org: &Address, amount: i128, available: i1
         return false;
     }
 
-    set_payout_processed(env, policy_id);
+    set_payout_processed(env, policy_id, end_date);
     set_scalar(env, &DataKey::TotalPayouts, get_total_payouts(env) + amount);
     let remaining = available - amount;
-    set_org_reserve(env, org, remaining);
+    set_org_reserve(env, org, remaining, end_date);
     set_scalar(
         env,
         &DataKey::TotalOrgReserves,
@@ -1126,10 +1173,10 @@ fn record_pending(env: &Env, policy_id: u64, org: &Address, amount: i128, availa
         recorded_at: env.ledger().timestamp(),
         queue_index: tail,
     };
-    set_persistent(env, DataKey::PendingPayout(policy_id), &pending);
-    set_persistent(env, DataKey::OrgQueueAt(org.clone(), tail), &policy_id);
-    set_persistent(env, DataKey::OrgQueueTail(org.clone()), &(tail + 1));
-    set_persistent(
+    set_pending_entry(env, DataKey::PendingPayout(policy_id), &pending);
+    set_pending_entry(env, DataKey::OrgQueueAt(org.clone(), tail), &policy_id);
+    set_pending_entry(env, DataKey::OrgQueueTail(org.clone()), &(tail + 1));
+    set_pending_entry(
         env,
         DataKey::OrgPendingPayouts(org.clone()),
         &(org_pending_payouts_of(env, org) + amount),
@@ -1169,73 +1216,85 @@ fn org_pending_payouts_of(env: &Env, org: &Address) -> i128 {
     get_persistent(env, &DataKey::OrgPendingPayouts(org.clone())).unwrap_or(0)
 }
 
-/// Read a persistent entry and, when present, extend it to the network maximum TTL: every
-/// money-path read of a per-policy / per-org entry is a touch (see `microcrop_shared::ttl`).
+/// Plain persistent read. Reading does not extend a TTL; writes and the keepers do. An
+/// archived entry is not read as absent: the host refuses the read until it is restored.
 fn get_persistent<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
     env: &Env,
     key: &DataKey,
 ) -> Option<V> {
+    env.storage().persistent().get(key)
+}
+
+/// Write a pending-claim entry and extend it below 30 days to 60 days.
+fn set_pending_entry<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: DataKey,
+    v: &V,
+) {
+    env.storage().persistent().set(&key, v);
+    ttl::extend_pending(env, &key);
+}
+
+/// Write a per-org entry with no policy context (admin settings): at least 60 days.
+fn set_shared<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: DataKey, v: &V) {
+    env.storage().persistent().set(&key, v);
+    ttl::extend_shared(env, &key, None);
+}
+
+/// Read a per-org entry and keep it alive for the need of the policy using it (when known),
+/// and at least 60 days. Used for the admin-set fee and ratio, which no other path rewrites.
+fn read_shared<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: &DataKey,
+    end_date: Option<u64>,
+) -> Option<V> {
     let v: Option<V> = env.storage().persistent().get(key);
     if v.is_some() {
-        ttl::extend_persistent(env, key);
+        ttl::extend_shared(env, key, end_date);
     }
     v
 }
 
-fn set_persistent<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: DataKey, v: &V) {
-    env.storage().persistent().set(&key, v);
-    ttl::extend_persistent(env, &key);
-}
-
-// ----- persistent per-org / per-policy accessors (with TTL bump on write) -----
+// ----- persistent per-org / per-policy accessors (with TTL extension on write) -----
 
 fn org_reserve_of(env: &Env, org: &Address) -> i128 {
     get_persistent(env, &DataKey::OrgReserve(org.clone())).unwrap_or(0)
 }
 
-fn set_org_reserve(env: &Env, org: &Address, v: i128) {
+fn set_org_reserve(env: &Env, org: &Address, v: i128, end_date: Option<u64>) {
     let key = DataKey::OrgReserve(org.clone());
     env.storage().persistent().set(&key, &v);
-    ttl::extend_persistent(env, &key);
+    ttl::extend_shared(env, &key, end_date);
 }
 
 fn is_premium_received(env: &Env, policy_id: u64) -> bool {
     get_persistent(env, &DataKey::PremiumReceived(policy_id)).unwrap_or(false)
 }
 
-fn set_premium_received(env: &Env, policy_id: u64) {
+fn set_premium_received(env: &Env, policy_id: u64, end_date: u64) {
     let key = DataKey::PremiumReceived(policy_id);
     env.storage().persistent().set(&key, &true);
-    ttl::extend_persistent(env, &key);
+    ttl::extend_for_policy(env, &key, end_date);
 }
 
 fn is_payout_processed(env: &Env, policy_id: u64) -> bool {
     get_persistent(env, &DataKey::PayoutProcessed(policy_id)).unwrap_or(false)
 }
 
-fn set_payout_processed(env: &Env, policy_id: u64) {
+fn set_payout_processed(env: &Env, policy_id: u64, end_date: Option<u64>) {
     let key = DataKey::PayoutProcessed(policy_id);
     env.storage().persistent().set(&key, &true);
-    ttl::extend_persistent(env, &key);
-}
-
-fn set_persistent_u32(env: &Env, key: DataKey, v: u32) {
-    env.storage().persistent().set(&key, &v);
-    ttl::extend_persistent(env, &key);
-}
-
-fn set_persistent_bool(env: &Env, key: DataKey, v: bool) {
-    env.storage().persistent().set(&key, &v);
-    ttl::extend_persistent(env, &key);
+    ttl::extend_shared(env, &key, end_date);
 }
 
 /// Effective reserve ratio for an org (explicit per-org value if set — including 0 — else the
 /// default). Returned as `i128` for the reserve math.
-fn reserve_ratio_bps(env: &Env, org: &Address) -> i128 {
-    // Read through `get_persistent` so the admin-set entries are extended on every touch.
-    let set: bool = get_persistent(env, &DataKey::OrgRatioSet(org.clone())).unwrap_or(false);
+fn reserve_ratio_bps(env: &Env, org: &Address, end_date: Option<u64>) -> i128 {
+    // Read through `read_shared` so the admin-set entries stay alive while they are used.
+    let set: bool = read_shared(env, &DataKey::OrgRatioSet(org.clone()), end_date).unwrap_or(false);
     if set {
-        let r: u32 = get_persistent(env, &DataKey::OrgReserveRatioBps(org.clone())).unwrap_or(0);
+        let r: u32 =
+            read_shared(env, &DataKey::OrgReserveRatioBps(org.clone()), end_date).unwrap_or(0);
         r as i128
     } else {
         DEFAULT_RESERVE_RATIO_BPS as i128
@@ -1244,10 +1303,10 @@ fn reserve_ratio_bps(env: &Env, org: &Address) -> i128 {
 
 /// Effective fee bps for an org (explicit per-org value if set — including 0 — else the global
 /// `platform_fee_percent * 100`). Returned as `i128` for the fee math.
-fn fee_bps(env: &Env, org: &Address) -> i128 {
-    let set: bool = get_persistent(env, &DataKey::OrgFeeSet(org.clone())).unwrap_or(false);
+fn fee_bps(env: &Env, org: &Address, end_date: Option<u64>) -> i128 {
+    let set: bool = read_shared(env, &DataKey::OrgFeeSet(org.clone()), end_date).unwrap_or(false);
     if set {
-        let f: u32 = get_persistent(env, &DataKey::OrgFeeBps(org.clone())).unwrap_or(0);
+        let f: u32 = read_shared(env, &DataKey::OrgFeeBps(org.clone()), end_date).unwrap_or(0);
         f as i128
     } else {
         let percent: u32 = env

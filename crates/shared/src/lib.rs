@@ -11,7 +11,7 @@
 //! - [`interfaces`] — `#[contractclient]` traits for cross-contract calls (no WASM build coupling).
 //! - [`encoding`]   — the FROZEN canonical byte layouts for the PKP determination signatures.
 //! - [`drought`]    — the `crop-drought-rdi-1.0` index recompute and evidence bounds.
-//! - [`ttl`]        — storage TTL policy: extend long-lived entries to the network maximum.
+//! - [`ttl`]        — storage TTL policy: the rent cap (bounded user-path and keeper targets).
 
 pub mod drought;
 pub mod encoding;

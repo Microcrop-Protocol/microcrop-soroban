@@ -158,7 +158,10 @@ fn vectors(env: &Env, d: &DroughtDetermination, contract: &str, domain: [u8; 32]
     let digest = drought_determination_digest(env, d, &contract, &domain);
     assert_eq!(inputs.len(), DROUGHT_INPUTS_LEN);
     assert_eq!(preimage.len(), DROUGHT_PREIMAGE_LEN);
-    assert_eq!(digest.to_array(), env.crypto().keccak256(&preimage).to_array());
+    assert_eq!(
+        digest.to_array(),
+        env.crypto().keccak256(&preimage).to_array()
+    );
     Vectors {
         inputs: bytes_hex(&inputs),
         inputs_hash: hex(&inputs_hash.to_array()),
@@ -243,7 +246,10 @@ fn drought_preimage_layout_and_offsets() {
     assert_eq!(&word(1)[30..], &[0x11, 0x94]); // 4500
     assert_eq!(word(2)[31], 45);
     assert_eq!(&word(3)[24..], &4_500_000_000u64.to_be_bytes());
-    assert_eq!(&word(4)[24..], &(1_743_465_600u64 + 117 * 86_400).to_be_bytes());
+    assert_eq!(
+        &word(4)[24..],
+        &(1_743_465_600u64 + 117 * 86_400).to_be_bytes()
+    );
     // Inputs: 13 words; the two hashes are copied raw at the end.
     assert_eq!(inputs.len(), 416);
     let iw: std::vec::Vec<u8> = inputs.slice(352..384).iter().collect();
@@ -328,7 +334,10 @@ fn crop_and_drought_digests_are_domain_separated() {
         weather_humidity: 0,
         weather_wind_e2: 0,
     };
-    let ci = env.crypto().keccak256(&encode_inputs(&env, &crop)).to_bytes();
+    let ci = env
+        .crypto()
+        .keccak256(&encode_inputs(&env, &crop))
+        .to_bytes();
     let cp = encode_preimage(&env, &ci, &crop, &contract, &domain);
     let d = v1(&env);
     let di = env
@@ -339,7 +348,11 @@ fn crop_and_drought_digests_are_domain_separated() {
     assert_eq!(cp.len(), 392);
     assert_eq!(dp.len(), 360);
     assert_ne!(cp.slice(32..64), dp.slice(32..64), "kind words must differ");
-    assert_ne!(cp.slice(64..96), dp.slice(64..96), "methodology words must differ");
+    assert_ne!(
+        cp.slice(64..96),
+        dp.slice(64..96),
+        "methodology words must differ"
+    );
     // keccak256("CROP_DAMAGE") = 0x5f9a…
     assert!(hex(&cp.slice(32..64).iter().collect::<std::vec::Vec<u8>>()).starts_with("0x5f9a"));
     assert_ne!(
@@ -363,11 +376,9 @@ fn js_signature_over_v1_recovers_to_the_test_key() {
     let mut sig = [0u8; 64];
     sig[..32].copy_from_slice(&hex32(JS_V1_SIG_R));
     sig[32..].copy_from_slice(&hex32(JS_V1_SIG_S));
-    let recovered = env.crypto().secp256k1_recover(
-        &digest,
-        &BytesN::from_array(&env, &sig),
-        JS_V1_RECOVERY_ID,
-    );
+    let recovered =
+        env.crypto()
+            .secp256k1_recover(&digest, &BytesN::from_array(&env, &sig), JS_V1_RECOVERY_ID);
     let pk = recovered.to_array();
     assert_eq!(pk[0], 0x04);
     assert_eq!(hex(&pk[1..33]), JS_TEST_PUBKEY_X);
@@ -379,7 +390,5 @@ const JS_V1_SIG_S: &str = "1ccd2fbe2f33550348c9e982083ccf627ccf0d374d06ee9434da5
 /// ethers `v = 28` -> recovery id 1.
 const JS_V1_RECOVERY_ID: u32 = 1;
 /// `new SigningKey(TEST_PRIVATE_KEY).publicKey` = `0x04 ‖ X ‖ Y`.
-const JS_TEST_PUBKEY_X: &str =
-    "0xba5734d8f7091719471e7f7ed6b9df170dc70cc661ca05e688601ad984f068b0";
-const JS_TEST_PUBKEY_Y: &str =
-    "0xd67351e5f06073092499336ab0839ef8a521afd334e53807205fa2f08eec74f4";
+const JS_TEST_PUBKEY_X: &str = "0xba5734d8f7091719471e7f7ed6b9df170dc70cc661ca05e688601ad984f068b0";
+const JS_TEST_PUBKEY_Y: &str = "0xd67351e5f06073092499336ab0839ef8a521afd334e53807205fa2f08eec74f4";

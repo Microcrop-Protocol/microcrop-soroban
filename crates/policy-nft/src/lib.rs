@@ -46,11 +46,13 @@ use microcrop_shared::{
     types::{CoverageType, PolicyCertificate, Role},
 };
 
-// ============ Storage TTL policy ============
-// Certificates and the instance (name/symbol/PolicyManager wiring) are long-lived, so every
-// touch extends them to the network maximum (`microcrop_shared::ttl`; ~180 days on mainnet
-// and testnet). The instance was bumped only ~7 days on mint; an archived PolicyNft instance
-// would make every claim, cancel and expiry pay a restore first.
+// ============ Storage TTL policy (rent cap, `microcrop_shared::ttl`) ============
+// - Instance + code: every call extends below 3 days to 10 days; the keeper
+//   (`extend_contract_ttl`, or PolicyManager's, which also extends this contract) extends
+//   below 23 days to 30 days.
+// - Certificate entries (`Certificate`, `Owner`, `PolicyToToken`, `DistributorPolicy`) live
+//   until the policy's `end_date + 30 d` (clamped to the network maximum); the distributor
+//   count takes the longest need of any certificate and at least 60 days.
 
 /// Hard maximum page size for the paginated index views. Each id is its own ledger entry,
 /// and a Soroban transaction (simulation included) may touch at most 100 footprint entries;
@@ -154,6 +156,12 @@ impl PolicyNft {
         .publish(&env);
     }
 
+    /// PERMISSIONLESS keeper: extend this contract's instance and code below 23 days to 30
+    /// days (a no-op above). `PolicyManager::extend_contract_ttl` does the same for it.
+    pub fn extend_contract_ttl(env: Env) {
+        ttl::keep_contract_alive(&env);
+    }
+
     /// Grant a role (ADMIN only). Mirrors AccessControl `grantRole`.
     pub fn grant_role(env: Env, caller: Address, role: Role, who: Address) {
         roles::require_role(&env, &caller, Role::Admin);
@@ -242,12 +250,12 @@ impl PolicyNft {
         p.set(&item_key, &token_id);
         p.set(&count_key, &(n + 1));
 
-        // TTL bumps.
-        Self::bump_persistent(&env, &DataKey::Certificate(token_id));
-        Self::bump_persistent(&env, &DataKey::PolicyToToken(policy_id));
-        Self::bump_persistent(&env, &DataKey::Owner(token_id));
-        Self::bump_persistent(&env, &item_key);
-        Self::bump_persistent(&env, &count_key);
+        // TTL: every certificate entry lives as long as the policy needs it.
+        ttl::extend_for_policy(&env, &DataKey::Certificate(token_id), end_date);
+        ttl::extend_for_policy(&env, &DataKey::PolicyToToken(policy_id), end_date);
+        ttl::extend_for_policy(&env, &DataKey::Owner(token_id), end_date);
+        ttl::extend_for_policy(&env, &item_key, end_date);
+        ttl::extend_shared(&env, &count_key, Some(end_date));
         Self::bump_instance(&env);
 
         PolicyNftMinted {
@@ -286,7 +294,7 @@ impl PolicyNft {
             .unwrap_or_else(|| panic_with_error!(&env, NftError::PolicyNotFound));
         cert.is_active = is_active;
         p.set(&DataKey::Certificate(token_id), &cert);
-        Self::bump_persistent(&env, &DataKey::Certificate(token_id));
+        ttl::extend_for_policy(&env, &DataKey::Certificate(token_id), cert.end_date);
         Self::bump_instance(&env);
 
         PolicyStatusUpdated {
@@ -321,25 +329,29 @@ impl PolicyNft {
         }
 
         p.set(&DataKey::Owner(token_id), &to);
-        Self::bump_persistent(&env, &DataKey::Owner(token_id));
+        ttl::extend_for_policy(&env, &DataKey::Owner(token_id), cert.end_date);
 
         Transfer { from, to, token_id }.publish(&env);
     }
 
     /// PERMISSIONLESS TTL helper: extend the certificate entries of `policy_id`
-    /// (`PolicyToToken`, `Certificate`, `Owner`) and the instance to the network maximum.
-    /// A no-op for a policy that was never minted. Called best effort by
-    /// `PolicyManager::extend_policy_ttl`.
+    /// (`PolicyToToken`, `Certificate`, `Owner`) to the policy's need (`end_date + 30 d`,
+    /// clamped to the network maximum). A no-op for a policy that was never minted. Called
+    /// best effort by `PolicyManager::extend_policy_ttl`.
     pub fn extend_policy_ttl(env: Env, policy_id: u64) {
         Self::bump_instance(&env);
-        let token: Option<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PolicyToToken(policy_id));
+        let p = env.storage().persistent();
+        let token: Option<u64> = p.get(&DataKey::PolicyToToken(policy_id));
         if let Some(token_id) = token {
-            Self::bump_persistent(&env, &DataKey::PolicyToToken(policy_id));
-            ttl::extend_persistent_if_present(&env, &DataKey::Certificate(token_id));
-            ttl::extend_persistent_if_present(&env, &DataKey::Owner(token_id));
+            let cert: Option<PolicyCertificate> = p.get(&DataKey::Certificate(token_id));
+            if let Some(cert) = cert {
+                let end = cert.end_date;
+                ttl::extend_for_policy(&env, &DataKey::PolicyToToken(policy_id), end);
+                ttl::extend_for_policy(&env, &DataKey::Certificate(token_id), end);
+                if p.has(&DataKey::Owner(token_id)) {
+                    ttl::extend_for_policy(&env, &DataKey::Owner(token_id), end);
+                }
+            }
         }
     }
 
@@ -390,8 +402,8 @@ impl PolicyNft {
             let id: u64 = p
                 .get(&key)
                 .unwrap_or_else(|| panic_with_error!(&env, NftError::TokenNotFound));
-            // Reads keep old index entries live, so paging never hits an archived entry.
-            Self::bump_persistent(&env, &key);
+            // Index items live as long as their certificate (`end_date + 30 d`); paging an
+            // older item needs it restored first (the RPC simulation adds the restore).
             out.push_back(id);
             i += 1;
         }
@@ -408,12 +420,9 @@ impl PolicyNft {
 
     // ---- internal helpers ----
 
+    /// User-path instance + code extension: below 3 days to 10 days (see `ttl`).
     fn bump_instance(env: &Env) {
-        ttl::extend_instance(env);
-    }
-
-    fn bump_persistent(env: &Env, key: &DataKey) {
-        ttl::extend_persistent(env, key);
+        ttl::touch_contract(env);
     }
 }
 

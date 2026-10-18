@@ -83,9 +83,15 @@ mod tests {
     #[test]
     fn canonical_vector_and_edges() {
         // V1: W1 at normal, W2 at 70% of normal -> d2 = 30, g2 = 45 -> 45%.
-        assert_eq!(rdi_v1_drought_damage(20_000, 20_000, 12_600, 18_000), Some(45));
+        assert_eq!(
+            rdi_v1_drought_damage(20_000, 20_000, 12_600, 18_000),
+            Some(45)
+        );
         // The EVM fixture's rains (W1 12500/20000, W2 3000/18000) give 100, not its 45.
-        assert_eq!(rdi_v1_drought_damage(12_500, 20_000, 3_000, 18_000), Some(100));
+        assert_eq!(
+            rdi_v1_drought_damage(12_500, 20_000, 3_000, 18_000),
+            Some(100)
+        );
         // Surplus never creates damage; total failure is 100.
         assert_eq!(rdi_v1_drought_damage(99_999, 1, 99_999, 1), Some(0));
         assert_eq!(rdi_v1_drought_damage(0, 1, 0, 1), Some(100));

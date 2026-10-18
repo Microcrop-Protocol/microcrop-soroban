@@ -870,12 +870,59 @@ fn evidence_from_another_plot_does_not_settle() {
     assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Active);
 }
 
-// ============ One call keeps a policy alive across all four contracts ============
+// ============ Rent cap: keepers reach every contract ============
+
+const DAY: u32 = 17_280;
+
+/// Advance ledger time and sequence together by `days`, running the contract keeper first
+/// (as the backend's daily job would) so no instance lapses.
+fn advance_with_keeper(w: &World, days: u32) {
+    w.pr.extend_contract_ttl();
+    let seq = w.env.ledger().sequence();
+    w.env.ledger().set_sequence_number(seq + days * DAY);
+    let ts = w.env.ledger().timestamp();
+    w.env.ledger().set_timestamp(ts + days as u64 * 86_400);
+}
+
+#[test]
+fn extend_contract_ttl_reaches_every_contract() {
+    use microcrop_shared::ttl::{KEEPER_TARGET_LEDGERS, USER_TARGET_LEDGERS};
+    use soroban_sdk::testutils::storage::Instance as _;
+
+    let w = deploy();
+    let premium: i128 = 10_000_000_000;
+    let policy_id = w.create_and_activate(premium);
+    w.pay_premium(policy_id, premium);
+    let inst = |a: &Address| {
+        w.env
+            .as_contract(a, || w.env.storage().instance().get_ttl())
+    };
+    let all = [
+        w.pm.address.clone(),
+        w.nft.address.clone(),
+        w.treasury_id.clone(),
+        w.pr_addr.clone(),
+    ];
+    // The whole money path so far extended code and instances to 10 days at most. (Admin
+    // and config calls extend nothing, so PayoutReceiver is still at its deploy TTL: run the
+    // keeper right after a deploy.)
+    for a in all[..3].iter() {
+        assert_eq!(inst(a), USER_TARGET_LEDGERS);
+    }
+    assert!(inst(&w.pr_addr) < USER_TARGET_LEDGERS);
+    // One permissionless call extends all four to 30 days.
+    w.env.set_auths(&[]);
+    w.pr.extend_contract_ttl();
+    for a in all.iter() {
+        assert_eq!(inst(a), KEEPER_TARGET_LEDGERS);
+    }
+}
 
 #[test]
 fn extend_policy_ttl_reaches_every_contract() {
-    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    use microcrop_shared::ttl::{NETWORK_MAX_ENTRY_TTL_LEDGERS, PENDING_TARGET_LEDGERS};
     use soroban_sdk::testutils::storage::Persistent as _;
+    use soroban_sdk::IntoVal;
 
     let w = deploy();
     w.env
@@ -883,43 +930,55 @@ fn extend_policy_ttl_reaches_every_contract() {
         .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
     let policy_id = record_short_claim(&w);
 
-    let ttl_in = |contract: &Address, k: &dyn Fn() -> soroban_sdk::Val| {
+    let ttl_in = |contract: &Address, k: soroban_sdk::Val| {
         w.env
-            .as_contract(contract, || w.env.storage().persistent().get_ttl(&k()))
+            .as_contract(contract, || w.env.storage().persistent().get_ttl(&k))
     };
-    use soroban_sdk::IntoVal;
     let pm_policy = || microcrop_policy_manager::DataKey::Policy(policy_id).into_val(&w.env);
     let tr_premium = || microcrop_treasury::DataKey::PremiumReceived(policy_id).into_val(&w.env);
+    let tr_pending = || microcrop_treasury::DataKey::PendingPayout(policy_id).into_val(&w.env);
     let pr_paid = || microcrop_payout_receiver::DataKey::PolicyPaid(policy_id).into_val(&w.env);
+    let pr_pending =
+        || microcrop_payout_receiver::DataKey::ClaimPending(policy_id).into_val(&w.env);
     let nft_cert = || microcrop_policy_nft::DataKey::Certificate(policy_id).into_val(&w.env);
 
-    // 150 days of silence: every entry has aged.
-    let seq = w.env.ledger().sequence();
-    w.env.ledger().set_sequence_number(seq + 150 * 17_280);
-    let aged = NETWORK_MAX_ENTRY_TTL_LEDGERS - 150 * 17_280;
-    assert!(ttl_in(&w.pm.address, &pm_policy) <= aged);
+    // Per-policy entries: the 90-day cover + 30 days. Pending-claim entries: 60 days.
+    let need = (DURATION_DAYS + 30) * DAY;
+    assert_eq!(ttl_in(&w.pr_addr, pr_paid()), need);
+    assert_eq!(ttl_in(&w.treasury_id, tr_premium()), need);
+    assert_eq!(ttl_in(&w.nft.address, nft_cert()), need);
+    // The policy entry already lived until end + 30 days; going CLAIM_PENDING never
+    // shortens it.
+    assert_eq!(ttl_in(&w.pm.address, pm_policy()), need);
+    assert_eq!(ttl_in(&w.treasury_id, tr_pending()), PENDING_TARGET_LEDGERS);
+    assert_eq!(ttl_in(&w.pr_addr, pr_pending()), PENDING_TARGET_LEDGERS);
+
+    // 40 days with only the contract keeper running: the pending entries are under 30 days.
+    advance_with_keeper(&w, 40);
+    assert_eq!(ttl_in(&w.pr_addr, pr_pending()), 20 * DAY);
 
     // One permissionless call.
     w.env.set_auths(&[]);
     w.pr.extend_policy_ttl(&policy_id);
-    assert_eq!(
-        ttl_in(&w.pm.address, &pm_policy),
-        NETWORK_MAX_ENTRY_TTL_LEDGERS
-    );
-    assert_eq!(
-        ttl_in(&w.treasury_id, &tr_premium),
-        NETWORK_MAX_ENTRY_TTL_LEDGERS
-    );
-    assert_eq!(ttl_in(&w.pr_addr, &pr_paid), NETWORK_MAX_ENTRY_TTL_LEDGERS);
-    assert_eq!(
-        ttl_in(&w.nft.address, &nft_cert),
-        NETWORK_MAX_ENTRY_TTL_LEDGERS
-    );
+    for (c, k) in [(&w.treasury_id, tr_pending()), (&w.pr_addr, pr_pending())] {
+        assert_eq!(ttl_in(c, k), PENDING_TARGET_LEDGERS);
+    }
+    // The per-policy entries already live until end + 30 days: left as they are.
+    for (c, k) in [
+        (&w.pm.address, pm_policy()),
+        (&w.pr_addr, pr_paid()),
+        (&w.treasury_id, tr_premium()),
+        (&w.nft.address, nft_cert()),
+    ] {
+        assert_eq!(ttl_in(c, k), need - 40 * DAY);
+    }
 }
 
 #[test]
 fn extend_policy_ttl_keeps_org_and_farmer_entries_alive() {
-    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    use microcrop_shared::ttl::{
+        NETWORK_MAX_ENTRY_TTL_LEDGERS, PENDING_TARGET_LEDGERS, SHARED_FLOOR_LEDGERS,
+    };
     use soroban_sdk::testutils::storage::Persistent as _;
     use soroban_sdk::IntoVal;
 
@@ -939,40 +998,55 @@ fn extend_policy_ttl_keeps_org_and_farmer_entries_alive() {
     };
     use microcrop_policy_manager::DataKey as Pm;
     use microcrop_treasury::DataKey as Tr;
-    // (`OrgQueueHead` is first written when the head advances, so it is absent here.)
-    let treasury_keys = [
-        Tr::OrgQueueTail(w.org.clone()),
-        Tr::OrgPendingPayouts(w.org.clone()),
+    let need = (DURATION_DAYS + 30) * DAY;
+    // Per-org terms and reserve: the policy's need (they were read or written for it).
+    let org_keys = [
         Tr::OrgReserve(w.org.clone()),
         Tr::OrgFeeSet(w.org.clone()),
         Tr::OrgFeeBps(w.org.clone()),
         Tr::OrgRatioSet(w.org.clone()),
         Tr::OrgReserveRatioBps(w.org.clone()),
     ];
+    // (`OrgQueueHead` is first written when the head advances, so it is absent here.)
+    let pending_keys = [
+        Tr::OrgQueueTail(w.org.clone()),
+        Tr::OrgPendingPayouts(w.org.clone()),
+    ];
     let pm_keys = [
         Pm::OrgOutstanding(w.org.clone()),
         Pm::FarmerPolicyCount(w.farmer.clone()),
     ];
-
-    // 150 days of silence: every entry has aged.
-    let seq = w.env.ledger().sequence();
-    w.env.ledger().set_sequence_number(seq + 150 * 17_280);
-    for k in treasury_keys.iter() {
-        assert!(ttl_in(&w.treasury_id, k.clone().into_val(&w.env)) < NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    // The fee terms and the reserve were used for this policy: its need. The ratio terms were
+    // only read by `reserve_required`, which has no policy at hand: the 60-day floor.
+    for k in org_keys[..3].iter() {
+        assert_eq!(ttl_in(&w.treasury_id, k.clone().into_val(&w.env)), need);
     }
-
-    w.env.set_auths(&[]);
-    w.pr.extend_policy_ttl(&policy_id);
-    for k in treasury_keys.iter() {
+    for k in org_keys[3..].iter() {
         assert_eq!(
             ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
-            NETWORK_MAX_ENTRY_TTL_LEDGERS
+            SHARED_FLOOR_LEDGERS
+        );
+    }
+
+    advance_with_keeper(&w, 40);
+    w.env.set_auths(&[]);
+    w.pr.extend_policy_ttl(&policy_id);
+    for k in pending_keys.iter() {
+        assert_eq!(
+            ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
+            PENDING_TARGET_LEDGERS
+        );
+    }
+    for k in org_keys.iter() {
+        assert_eq!(
+            ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
+            need - 40 * DAY
         );
     }
     for k in pm_keys.iter() {
         assert_eq!(
             ttl_in(&w.pm.address, k.clone().into_val(&w.env)),
-            NETWORK_MAX_ENTRY_TTL_LEDGERS
+            need - 40 * DAY
         );
     }
 }

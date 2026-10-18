@@ -14,9 +14,10 @@ use soroban_sdk::{contracttype, panic_with_error, Address, Env};
 use crate::errors::CommonError;
 use crate::types::Role;
 
-// Role grants are persistent entries; without a bump they archive after the network minimum
-// TTL and every role-gated call has to restore them first. Extend to the network maximum on
-// grant and whenever a grant is found (see [`crate::ttl`]).
+// Role grants are persistent entries. They are extended below 30 days to 60 days on grant and
+// whenever a held grant is found (see [`crate::ttl`]). An archived grant does not read as
+// "not held": the host refuses the read until the entry is restored, which the next
+// transaction that needs it does automatically, at a fee.
 
 /// Storage key for a role grant. Lives in each contract's own storage namespace, so the
 /// same key type is reused across contracts without collision.
@@ -31,7 +32,7 @@ pub fn has_role(env: &Env, role: Role, who: &Address) -> bool {
     let key = RoleKey::Role(role, who.clone());
     let held: bool = env.storage().persistent().get(&key).unwrap_or(false);
     if held {
-        crate::ttl::extend_persistent(env, &key);
+        crate::ttl::extend_role(env, &key);
     }
     held
 }
@@ -41,7 +42,7 @@ pub fn has_role(env: &Env, role: Role, who: &Address) -> bool {
 pub fn grant_role(env: &Env, role: Role, who: &Address) {
     let key = RoleKey::Role(role, who.clone());
     env.storage().persistent().set(&key, &true);
-    crate::ttl::extend_persistent(env, &key);
+    crate::ttl::extend_role(env, &key);
 }
 
 /// Revoke `role` from `who`.

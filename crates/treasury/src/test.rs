@@ -723,8 +723,8 @@ fn settle_pending_payout_blocked_while_paused() {
 // ---------------- Per-policy flags outlive a 365-day policy ----------------
 
 #[test]
-fn premium_flag_ttl_is_the_network_maximum() {
-    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+fn premium_flag_lives_until_end_date_plus_grace() {
+    use microcrop_shared::ttl::{DAY_LEDGERS, NETWORK_MAX_ENTRY_TTL_LEDGERS};
     use soroban_sdk::testutils::storage::Persistent as _;
 
     let c = setup();
@@ -732,19 +732,78 @@ fn premium_flag_ttl_is_the_network_maximum() {
     c.env
         .ledger()
         .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    let ttl = |k: &crate::DataKey| {
+        c.env
+            .as_contract(&c.treasury_id, || c.env.storage().persistent().get_ttl(k))
+    };
+    // A policy ending in 140 days: the flag lives 140 + 30 days, the org reserve as long.
+    c.pm().set_org(&1u64, &c.org);
+    c.pm().set_end_date(&1u64, &(140 * 86_400));
+    c.token_admin.mint(&c.backend, &2_000_000);
+    c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
+    assert_eq!(ttl(&crate::DataKey::PremiumReceived(1)), 170 * DAY_LEDGERS);
+    assert_eq!(
+        ttl(&crate::DataKey::OrgReserve(c.org.clone())),
+        170 * DAY_LEDGERS
+    );
+    // A need past the network maximum clamps to it, never more.
+    c.pm().set_org(&2u64, &c.org);
+    c.treasury.receive_premium(&c.backend, &2u64, &1_000_000);
+    assert_eq!(
+        ttl(&crate::DataKey::PremiumReceived(2)),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS
+    );
+}
+
+#[test]
+fn pending_entries_get_the_pending_target_and_instance_stays_capped() {
+    use microcrop_shared::ttl::{
+        DAY_LEDGERS, KEEPER_TARGET_LEDGERS, NETWORK_MAX_ENTRY_TTL_LEDGERS, PENDING_TARGET_LEDGERS,
+        USER_TARGET_LEDGERS,
+    };
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+
+    let c = setup();
+    c.env
+        .ledger()
+        .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    let ttl = |k: &crate::DataKey| {
+        c.env
+            .as_contract(&c.treasury_id, || c.env.storage().persistent().get_ttl(k))
+    };
+    let inst = || {
+        c.env
+            .as_contract(&c.treasury_id, || c.env.storage().instance().get_ttl())
+    };
+    // The money path (premium in, pending payout) no longer extends code to the maximum.
     c.pm().set_org(&1u64, &c.org);
     c.token_admin.mint(&c.backend, &1_000_000);
     c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
-    let ttl = c.env.as_contract(&c.treasury_id, || {
-        c.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::PremiumReceived(1))
-    });
-    assert_eq!(ttl, NETWORK_MAX_ENTRY_TTL_LEDGERS);
-    // ...which is shorter than MAX_DURATION_DAYS (365): a long policy needs
-    // `extend_policy_ttl` (see the deployment runbook).
-    assert!(ttl < 365 * 17_280);
+    assert_eq!(inst(), USER_TARGET_LEDGERS);
+    assert!(!c
+        .treasury
+        .request_payout(&c.payout_receiver, &1u64, &2_000_000));
+    for k in [
+        crate::DataKey::PendingPayout(1),
+        crate::DataKey::OrgQueueAt(c.org.clone(), 0),
+        crate::DataKey::OrgQueueTail(c.org.clone()),
+        crate::DataKey::OrgPendingPayouts(c.org.clone()),
+    ] {
+        assert_eq!(ttl(&k), PENDING_TARGET_LEDGERS);
+    }
+    // The keeper takes it to 30 days; the money path then leaves it there.
+    c.env.set_auths(&[]);
+    c.treasury.extend_contract_ttl();
+    assert_eq!(inst(), KEEPER_TARGET_LEDGERS);
+    c.env.mock_all_auths();
+    c.token_admin.mint(&c.org, &5_000_000);
+    c.treasury.deposit_reserve(&c.org, &c.org, &5_000_000);
+    assert_eq!(inst(), KEEPER_TARGET_LEDGERS);
+    // The keeper is a no-op above 23 days.
+    let seq = c.env.ledger().sequence();
+    c.env.ledger().set_sequence_number(seq + 5 * DAY_LEDGERS);
+    c.treasury.extend_contract_ttl();
+    assert_eq!(inst(), 25 * DAY_LEDGERS);
 }
 
 // ---------------- New claims queue behind pending ones ----------------
@@ -1000,13 +1059,16 @@ fn deauthorized_backend_wallet_records_the_claim_as_pending() {
 #[test]
 fn extend_policy_ttl_bumps_the_policy_flags_and_pending_record() {
     use crate::DataKey;
-    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    use microcrop_shared::ttl::{
+        DAY_LEDGERS, NETWORK_MAX_ENTRY_TTL_LEDGERS, PENDING_TARGET_LEDGERS,
+    };
     use soroban_sdk::testutils::storage::Persistent as _;
 
     let c = setup();
     c.env
         .ledger()
         .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    // The mock policy never ends: its need is the network maximum.
     c.pm().set_org(&1u64, &c.org);
     c.token_admin.mint(&c.backend, &1_000_000);
     c.treasury.receive_premium(&c.backend, &1u64, &1_000_000);
@@ -1018,20 +1080,28 @@ fn extend_policy_ttl_bumps_the_policy_flags_and_pending_record() {
         c.env
             .as_contract(&c.treasury_id, || c.env.storage().persistent().get_ttl(k))
     };
+    // 40 days with no touch: the pending record is under the 30-day threshold.
     let seq = c.env.ledger().sequence();
-    c.env.ledger().set_sequence_number(seq + 150 * 17_280);
-    let aged = NETWORK_MAX_ENTRY_TTL_LEDGERS - 150 * 17_280;
-    assert_eq!(ttl(&DataKey::PremiumReceived(1)), aged);
-    assert_eq!(ttl(&DataKey::PendingPayout(1)), aged);
+    c.env.ledger().set_sequence_number(seq + 40 * DAY_LEDGERS);
+    assert_eq!(
+        ttl(&DataKey::PremiumReceived(1)),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS - 40 * DAY_LEDGERS
+    );
+    assert_eq!(ttl(&DataKey::PendingPayout(1)), 20 * DAY_LEDGERS);
 
     c.env.set_auths(&[]);
     c.treasury.extend_policy_ttl(&1u64);
+    assert_eq!(
+        ttl(&DataKey::PremiumReceived(1)),
+        NETWORK_MAX_ENTRY_TTL_LEDGERS
+    );
     for k in [
-        DataKey::PremiumReceived(1),
         DataKey::PendingPayout(1),
         DataKey::OrgQueueAt(c.org.clone(), 0),
+        DataKey::OrgQueueTail(c.org.clone()),
+        DataKey::OrgPendingPayouts(c.org.clone()),
     ] {
-        assert_eq!(ttl(&k), NETWORK_MAX_ENTRY_TTL_LEDGERS);
+        assert_eq!(ttl(&k), PENDING_TARGET_LEDGERS);
     }
     // A policy with no Treasury entries is a no-op, not a revert.
     c.treasury.extend_policy_ttl(&42u64);
