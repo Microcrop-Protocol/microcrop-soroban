@@ -65,7 +65,11 @@ echo
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 dump() {
   local addr="$1" out="$2"
-  { stellar contract read --id "$addr" --network "$NETWORK" --durability persistent 2>/dev/null || true; } >  "$out"
+  # Config refs, the signer and the domain live in INSTANCE storage, which a plain persistent
+  # read does not return, and only --output json shows the instance storage map.
+  # AAAAFA== is ScVal::LedgerKeyContractInstance.
+  { stellar contract read --id "$addr" --network "$NETWORK" --durability persistent --key-xdr AAAAFA== --output json 2>/dev/null || true; } >  "$out"
+  { stellar contract read --id "$addr" --network "$NETWORK" --durability persistent 2>/dev/null || true; } >> "$out"
   { stellar contract read --id "$addr" --network "$NETWORK" --durability temporary  2>/dev/null || true; } >> "$out"
 }
 [[ -n "$NFT"      ]] && dump "$NFT"      "$TMP/nft"
@@ -89,6 +93,11 @@ echo "3. Roles (the ones whose absence kills the money path)"
 # not people - the set most often missed, and none of them fails at deploy time.
 role_is() {                     # role_is <label> <contract> <Role> <who> <consequence>
   local label="$1" contract="$2" role="$3" who="$4" why="$5" out
+  # Role is a #[repr(u32)] enum: the CLI takes its number (crates/shared/src/types.rs).
+  case "$role" in
+    Admin) role=0 ;; Backend) role=1 ;; Oracle) role=2 ;; Payout) role=3 ;;
+    Relayer) role=4 ;; Upgrader) role=5 ;; Minter) role=6 ;;
+  esac
   out="$(stellar contract invoke --id "$contract" --network "$NETWORK" --source "${ADMIN_KEY:-default}" \
           -- has_role --role "$role" --who "$who" 2>/dev/null | tr -d '"' | tail -1)"
   case "$out" in
