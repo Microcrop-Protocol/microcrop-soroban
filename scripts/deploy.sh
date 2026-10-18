@@ -103,6 +103,12 @@ fi
 WASM_DIR="target/wasm32v1-none/release"
 for w in microcrop_policy_nft microcrop_policy_manager microcrop_treasury microcrop_payout_receiver; do
   [[ -f "$WASM_DIR/$w.wasm" ]] || die "missing $WASM_DIR/$w.wasm — run: cargo build --release --target wasm32v1-none"
+  # Deploy the OPTIMIZED wasm: it is ~16-22% smaller, and code rent is paid per byte for the
+  # contract's whole life. The rent figures in the docs assume these files.
+  if [[ ! -f "$WASM_DIR/$w.optimized.wasm" || "$WASM_DIR/$w.wasm" -nt "$WASM_DIR/$w.optimized.wasm" ]]; then
+    say "optimizing $w.wasm"
+    run stellar contract optimize --wasm "$WASM_DIR/$w.wasm" >&2
+  fi
 done
 
 if [[ "$NETWORK" == "mainnet" && "$DRY_RUN" == "0" ]]; then
@@ -128,7 +134,7 @@ deploy() {                      # deploy <state-key> <wasm-name> [--ctor-args...
 
   local addr
   addr="$(stellar contract deploy \
-      --wasm "$WASM_DIR/$wasm.wasm" \
+      --wasm "$WASM_DIR/$wasm.optimized.wasm" \
       --source "$ADMIN_KEY" --network "$NETWORK" \
       -- "$@" | tail -1)"
   [[ "$addr" =~ ^C[A-Z0-9]{55}$ ]] || die "$key deploy returned an unexpected address: $addr"
