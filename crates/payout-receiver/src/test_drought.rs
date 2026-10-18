@@ -868,3 +868,46 @@ fn the_drought_path_never_extends_the_instance_above_three_days() {
     f.client.settle_pending_claim(&1);
     assert_eq!(inst(), USER_TARGET_LEDGERS);
 }
+
+// ============ Signatures, not just roles ============
+// The rest of this suite runs under `mock_all_auths`, which proves the role checks but not
+// that the caller's signature is demanded. These run with no auths at all.
+
+/// `set_methodology_enabled` needs the admin's own signature, not just the Admin role.
+#[test]
+fn set_methodology_enabled_requires_admin_signature() {
+    let f = deploy(false, true);
+    f.env.set_auths(&[]);
+    let r =
+        f.client
+            .try_set_methodology_enabled(&f.admin, &MethodologyKind::CropDroughtRdi10, &true);
+    assert!(r.is_err(), "admin call without admin auth must fail: {r:?}");
+    assert!(!f
+        .client
+        .is_methodology_enabled(&MethodologyKind::CropDroughtRdi10));
+}
+
+/// `submit_drought_determination` needs the relayer's signature even when the determination
+/// itself is validly signed by the oracle key.
+#[test]
+fn submit_drought_determination_requires_relayer_signature() {
+    let f = setup();
+    let d = on(&f.env, &det());
+    let (sig, recid) = sign_with(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.env.set_auths(&[]);
+    let r = f
+        .client
+        .try_submit_drought_determination(&f.relayer, &d, &sig, &recid);
+    assert!(r.is_err(), "relayer without auth must fail: {r:?}");
+    assert_eq!(f.treasury.calls(), 0);
+}
+
+/// The keeper and the digest view are permissionless by design.
+#[test]
+fn keeper_and_digest_view_need_no_auth() {
+    let f = setup();
+    f.env.set_auths(&[]);
+    f.client.extend_contract_ttl();
+    let d = on(&f.env, &det());
+    let _ = f.client.drought_determination_digest(&d);
+}
