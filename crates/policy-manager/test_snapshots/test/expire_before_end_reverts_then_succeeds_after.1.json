@@ -113,7 +113,7 @@
                   "u32": 30
                 },
                 {
-                  "u32": 4
+                  "u32": 0
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
@@ -397,7 +397,7 @@
                       "symbol": "coverage_type"
                     },
                     "val": {
-                      "u32": 4
+                      "u32": 0
                     }
                   },
                   {

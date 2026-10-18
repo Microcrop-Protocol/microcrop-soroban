@@ -24,7 +24,7 @@ use k256::ecdsa::SigningKey;
 use microcrop_shared::{
     encoding::determination_digest,
     errors::{CommonError, PayoutError},
-    types::{CoverageType, CropDetermination, Policy, PolicyStatus, Role},
+    types::{CoverageType, CropDetermination, MethodologyKind, Policy, PolicyStatus, Role},
 };
 
 use crate::{PausedError, PayoutReceiver, PayoutReceiverClient};
@@ -346,6 +346,8 @@ fn setup() -> Fixture {
 
     let domain = BytesN::from_array(&env, &[0xABu8; 32]);
     client.set_network_domain(&admin, &domain);
+    // The crop methodology is retired and disabled by default; these tests exercise it.
+    client.set_methodology_enabled(&admin, &MethodologyKind::CropDualIndex10, &true);
 
     let treasury = MockTreasuryClient::new(&env, &treasury_id);
 
@@ -678,6 +680,7 @@ fn farmer_over_claim_limit_rejected() {
     client.set_authorized_signer(&admin, &pubkey65(&env, &sk));
     let domain = BytesN::from_array(&env, &[0xABu8; 32]);
     client.set_network_domain(&admin, &domain);
+    client.set_methodology_enabled(&admin, &MethodologyKind::CropDualIndex10, &true);
 
     let d = base_det();
     let (sig, recid) = sign(&env, &sk, &pr_addr, &domain, &d);
@@ -1026,4 +1029,38 @@ fn extend_contract_ttl_keeps_all_four_contracts_alive() {
     // keeper.
     assert_eq!(inst(&f.treasury.address), KEEPER_TARGET_LEDGERS);
     assert!(f.pm.keep_called());
+}
+
+// ============ Methodology allow-list ============
+
+#[test]
+fn crop_methodology_disabled_is_rejected() {
+    let f = setup();
+    f.client
+        .set_methodology_enabled(&f.admin, &MethodologyKind::CropDualIndex10, &false);
+    assert!(!f
+        .client
+        .is_methodology_enabled(&MethodologyKind::CropDualIndex10));
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    assert_eq!(
+        f.client
+            .try_submit_determination(&f.relayer, &d, &sig, &recid),
+        Err(Ok(PayoutError::MethodologyDisabled.into()))
+    );
+    assert_eq!(f.treasury.calls(), 0);
+}
+
+#[test]
+fn only_the_admin_sets_a_methodology() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    assert_eq!(
+        f.client
+            .try_set_methodology_enabled(&stranger, &MethodologyKind::CropDroughtRdi10, &true),
+        Err(Ok(CommonError::Unauthorized.into()))
+    );
+    assert!(!f
+        .client
+        .is_methodology_enabled(&MethodologyKind::CropDroughtRdi10));
 }

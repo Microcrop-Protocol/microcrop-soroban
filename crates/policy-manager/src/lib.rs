@@ -313,10 +313,17 @@ impl PolicyManager {
             panic_with_error!(&env, PolicyError::InvalidCoordinates);
         }
 
-        // Only all-cause cover is sold: the crop-damage methodology cannot attribute a loss to
-        // one peril, so any other coverage type could take a premium and never pay
-        // (PayoutReceiver step 6c keeps the same check as defence in depth).
-        if coverage_type != CoverageType::Comprehensive {
+        // Only drought cover is sold: the one methodology the signer can sign
+        // (`crop-drought-rdi-1.0`) indemnifies drought and nothing else, so any other coverage
+        // type could take a premium and never pay (PayoutReceiver keeps the same check as
+        // defence in depth). Re-opening `Comprehensive` needs an audited upgrade once a
+        // cause-agnostic methodology is live again.
+        //
+        // Sale-side rule (not enforced here): the drought path settles only if the season's
+        // 110-day window lies inside the cover and the policy is activated on or before the
+        // planting day, so sell at least ~140 days of cover (110 + 7-day archive lag +
+        // operations margin) and activate by planting.
+        if coverage_type != CoverageType::Drought {
             panic_with_error!(&env, PolicyError::CoverageNotOffered);
         }
 

@@ -1,15 +1,23 @@
 #![no_std]
 //! # PayoutReceiver
 //!
-//! Soroban port of `microcrop-contracts/microcrop/src/PayoutReceiver.sol` (v2.1.0). This is
-//! the crux contract: it verifies a PKP-signed CROP_DAMAGE determination and, iff valid,
-//! triggers the payout. The **signature is the sole payout authority**; `Role::Relayer` is an
-//! anti-spam gate on WHO may relay and does NOT authorize a payout.
+//! Soroban port of `microcrop-contracts/microcrop/src/PayoutReceiver.sol` (v2.1.0, plus the
+//! v2.2.0 drought path). This is the crux contract: it verifies a PKP-signed determination
+//! and, iff valid, triggers the payout. The **signature is the sole payout authority**;
+//! `Role::Relayer` is an anti-spam gate on WHO may relay and does NOT authorize a payout.
+//!
+//! Two methodologies, each behind an admin switch (`set_methodology_enabled`; absent means
+//! disabled):
+//! - CROP_DROUGHT, `crop-drought-rdi-1.0` — [`PayoutReceiver::submit_drought_determination`].
+//!   The live methodology; settles `Drought` cover only. Its 17 checks are listed on the
+//!   function.
+//! - CROP_DAMAGE, `crop-dualindex-1.0` — [`PayoutReceiver::submit_determination`]. Retired
+//!   (the oracle no longer signs it); settles `Comprehensive` cover only. Leave it disabled.
 //!
 //! ## EVM -> Soroban mapping
 //! - `ECDSA.recover` (secp256k1) -> `env.crypto().secp256k1_recover(&digest, &sig64, recovery_id)`.
 //! - `keccak256` -> `env.crypto().keccak256(&Bytes)`.
-//! - `abi.encode`/`abi.encodePacked` -> [`microcrop_shared::encoding`] FROZEN canonical layout.
+//! - `abi.encode`/`abi.encodePacked` -> [`microcrop_shared::encoding`] FROZEN canonical layouts.
 //! - `authorizedSigner` (20-byte EVM addr) -> stored 65-byte SEC-1 pubkey (`BytesN<65>`),
 //!   byte-compared to the recovered key.
 //! - `block.chainid` -> configured `DataKey::NetworkDomain` (`BytesN<32>`), see `set_network_domain`.
@@ -18,8 +26,8 @@
 //!   `PolicyManagerClient::mark_as_claimed` + `increment_claim_count`.
 //! - `nonReentrant` dropped (Soroban is single-frame re-entrancy safe); CEI ordering preserved.
 //!
-//! ## submit_determination — validation order (ALL must pass; preserve verbatim)
-//!  1. signer configured
+//! ## submit_determination (CROP_DAMAGE) — validation order (ALL must pass)
+//!  1. signer configured; methodology `CropDualIndex10` enabled (322)
 //!  2. bounds: `damage_bp <= 10000`, sub-scores `<= 100`, `weather_present in {0,1}`
 //!  3. evidence consistency: `weather_present == 0 => weather_damage == 0`
 //!  4. weighted invariant (NO division): present -> `60*w + 40*s == bp`; satellite-only -> `100*s == bp`
@@ -36,6 +44,8 @@
 //!     + Treasury `payout_processed` = triple guard)
 //! 12. signature: `secp256k1_recover(digest, sig, recovery_id) == authorized_signer`
 //!
+//! Both paths share their effects (`settle_verified`) and their replay guards: `PolicyPaid`
+//! is one flag per policy, so a policy settles at most once across both methodologies.
 //! Effects before interactions (CEI): mark consumed + paid + store report, THEN
 //! `treasury.request_payout`, then `pm.mark_as_claimed` (paid now) or `pm.mark_claim_pending`
 //! (org reserve short: Treasury recorded a pending payout), then `pm.increment_claim_count`.
@@ -58,16 +68,20 @@
 //! unexpired or the policy is paid). See `docs/MIGRATION_NOTES.md`.
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
-    BytesN, Env,
+    contract, contracterror, contractevent, contractimpl, contracttype, crypto::Hash,
+    panic_with_error, Address, BytesN, Env,
 };
 
 use microcrop_shared::{
-    encoding::determination_digest,
+    drought,
+    encoding::{determination_digest, drought_determination_digest, DROUGHT_PARAMS_HASH_RDI_1_0},
     errors::{CommonError, PayoutError},
     interfaces::{PolicyManagerClient, TreasuryClient},
     roles, ttl,
-    types::{CoverageType, CropDetermination, DamageReport, PolicyStatus, Role},
+    types::{
+        CoverageType, CropDetermination, DamageReport, DroughtDetermination, MethodologyKind,
+        Policy, PolicyStatus, Role,
+    },
 };
 
 // ============ Constants (ported 1:1) ============
@@ -160,6 +174,26 @@ pub struct ClaimAwaitingFunding {
     pub amount: i128,
 }
 
+/// The rainfall evidence behind a verified CROP_DROUGHT determination.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DroughtEvidenceRecorded {
+    #[topic]
+    pub policy_id: u64,
+    pub drought_damage: u32,
+    pub season_start_epoch: u64,
+    pub source_hash: BytesN<32>,
+}
+
+/// A methodology was enabled or disabled.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MethodologyEnabledSet {
+    #[topic]
+    pub kind: MethodologyKind,
+    pub enabled: bool,
+}
+
 /// A pending claim was paid in full.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +229,8 @@ pub enum DataKey {
     /// reconstructed preimage hash -> consumed? (temporary storage; guards distinct-preimage
     /// replay within the unpaid freshness window).
     ConsumedDetermination(BytesN<32>),
+    /// methodology -> accepted? Instance storage; absent means disabled.
+    MethodologyEnabled(MethodologyKind),
 }
 
 #[contract]
@@ -277,15 +313,41 @@ impl PayoutReceiver {
         env.storage().instance().set(&DataKey::Paused, &false);
     }
 
+    // ---- methodology allow-list ----
+
+    /// Enable or disable a determination methodology (ADMIN). Absent means disabled, so a
+    /// fresh deployment or an upgrade accepts nothing until the admin enables a methodology.
+    /// CROP_DAMAGE (`CropDualIndex10`) is retired: leave it disabled. A claim already recorded
+    /// as pending still settles, because `settle_pending_claim` does not re-verify.
+    pub fn set_methodology_enabled(
+        env: Env,
+        caller: Address,
+        kind: MethodologyKind,
+        enabled: bool,
+    ) {
+        roles::require_role(&env, &caller, Role::Admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::MethodologyEnabled(kind), &enabled);
+        MethodologyEnabledSet { kind, enabled }.publish(&env);
+    }
+
+    /// Whether `kind` is enabled.
+    pub fn is_methodology_enabled(env: Env, kind: MethodologyKind) -> bool {
+        Self::methodology_enabled(&env, kind)
+    }
+
     // ---- crux ----
 
-    /// Port of `submitDetermination` (RELAYER, when-not-paused). Runs the 12-step validation,
-    /// reconstructs the digest via [`microcrop_shared::encoding::determination_digest`] using
+    /// Port of `submitDetermination` (RELAYER, when-not-paused) for the retired CROP_DAMAGE
+    /// methodology (`crop-dualindex-1.0`). Runs the validation in the module docs, rebuilds
+    /// the digest via [`microcrop_shared::encoding::determination_digest`] using
     /// `env.current_contract_address()` + the stored `NetworkDomain`, recovers the signer with
-    /// `env.crypto().secp256k1_recover(&digest, &signature, recovery_id)`, byte-compares to the
-    /// stored `AuthorizedSigner`, then (CEI) marks consumed/paid, stores the report, and calls
-    /// `TreasuryClient::request_payout` + `PolicyManagerClient::mark_as_claimed` +
-    /// `increment_claim_count`.
+    /// `env.crypto().secp256k1_recover(&digest, &signature, recovery_id)`, byte-compares it to
+    /// the stored `AuthorizedSigner`, then settles exactly as the drought path does.
+    ///
+    /// Requires `MethodologyEnabled(CropDualIndex10)` (`MethodologyDisabled`, 322, otherwise).
+    /// It is disabled after the drought upgrade, and no new `Comprehensive` policy can be sold.
     ///
     /// `signature` is the 64-byte `r‖s`; `recovery_id` is `v - 27` (0 or 1).
     pub fn submit_determination(
@@ -295,27 +357,8 @@ impl PayoutReceiver {
         signature: BytesN<64>,
         recovery_id: u32,
     ) {
-        // RELAYER gate (anti-spam only; not the payout authority) + caller.require_auth().
-        roles::require_role(&env, &caller, Role::Relayer);
-
-        // whenNotPaused.
-        if env
-            .storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-        {
-            panic_with_error!(&env, PausedError::ContractPaused);
-        }
-
-        let s = env.storage();
-        ttl::touch_contract(&env);
-
-        // 1. authority root must be configured.
-        let authorized_signer: BytesN<65> = match s.instance().get(&DataKey::AuthorizedSigner) {
-            Some(pk) => pk,
-            None => panic_with_error!(&env, PayoutError::SignerNotConfigured),
-        };
+        let authorized_signer =
+            Self::begin_submission(&env, &caller, MethodologyKind::CropDualIndex10);
 
         // 2. bounds.
         if d.damage_percent_bp > MAX_DAMAGE_PERCENTAGE {
@@ -350,35 +393,9 @@ impl PayoutReceiver {
             panic_with_error!(&env, PayoutError::DamageBelowThreshold);
         }
 
-        // Cross-contract references (configured in the constructor).
-        let policy_manager: Address = s
-            .instance()
-            .get(&DataKey::PolicyManager)
-            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
-        let treasury: Address = s
-            .instance()
-            .get(&DataKey::Treasury)
-            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
-        let pm = PolicyManagerClient::new(&env, &policy_manager);
-
         // 6. policy state: exists, ACTIVE, not expired, not already paid.
-        if !pm.policy_exists(&d.on_chain_policy_id) {
-            panic_with_error!(&env, PayoutError::PolicyDoesNotExist);
-        }
-        let policy = pm.get_policy(&d.on_chain_policy_id);
-        if policy.status != PolicyStatus::Active {
-            panic_with_error!(&env, PayoutError::PolicyNotActive);
-        }
-        let now = env.ledger().timestamp();
-        if now > policy.end_date {
-            panic_with_error!(&env, PayoutError::PolicyExpired);
-        }
-        if s.persistent()
-            .get(&DataKey::PolicyPaid(d.on_chain_policy_id))
-            .unwrap_or(false)
-        {
-            panic_with_error!(&env, PayoutError::PolicyAlreadyPaid);
-        }
+        let (pm, treasury) = Self::clients(&env);
+        let policy = Self::open_policy(&env, &pm, d.on_chain_policy_id);
 
         // 6b. evidence must bind the real policy's sum insured.
         if d.sum_insured != policy.sum_insured {
@@ -392,57 +409,355 @@ impl PayoutReceiver {
         }
 
         // 6d. the evidence must be about the insured plot.
-        if (d.latitude_e6 - policy.lat_e6 as i128).abs() > PLOT_COORD_TOLERANCE_E6
-            || (d.longitude_e6 - policy.lon_e6 as i128).abs() > PLOT_COORD_TOLERANCE_E6
-        {
-            panic_with_error!(&env, PayoutError::PlotLocationMismatch);
-        }
+        Self::require_plot(&env, &policy, d.latitude_e6, d.longitude_e6);
 
         // 7. payout re-derived on-chain (basis points; single unit on the money path).
-        let expected_payout = policy.sum_insured * (d.damage_percent_bp as i128) / BASIS_POINTS;
-        if d.payout_amount != expected_payout {
-            panic_with_error!(&env, PayoutError::InvalidPayoutCalculation);
-        }
+        Self::require_payout(&env, &policy, d.damage_percent_bp, d.payout_amount);
 
-        // 8. freshness: future-dated and stale are distinct failure modes.
-        if d.assessed_at > now {
-            panic_with_error!(&env, PayoutError::ReportInFuture);
-        }
-        if now > d.assessed_at.saturating_add(MAX_REPORT_AGE) {
-            panic_with_error!(&env, PayoutError::ReportTooOld);
-        }
-
-        // 9. farmer claim limit.
-        if !pm.can_farmer_claim(&policy.farmer) {
-            panic_with_error!(&env, PayoutError::FarmerClaimLimitExceeded);
-        }
+        // 8. freshness + 9. farmer claim limit.
+        Self::require_fresh_and_claimable(&env, &pm, &policy, d.assessed_at);
 
         // 10. reconstruct the settlement digest ON-CHAIN from raw fields (never trust a
         //     passed-in hash). NetworkDomain + this contract's address are bound in, so a
         //     determination signed for another network/contract cannot verify here.
-        let network_domain: BytesN<32> = s
+        let digest = determination_digest(
+            &env,
+            &d,
+            &env.current_contract_address(),
+            &Self::network_domain(&env),
+        );
+
+        // 11. replay guard + 12. signature (the sole authority).
+        Self::require_unconsumed_and_signed(
+            &env,
+            &digest,
+            &signature,
+            recovery_id,
+            &authorized_signer,
+        );
+
+        let report = DamageReport {
+            policy_id: d.on_chain_policy_id,
+            damage_percentage: d.damage_percent_bp,
+            weather_damage: d.weather_damage,
+            satellite_damage: d.satellite_damage,
+            payout_amount: d.payout_amount,
+            assessed_at: d.assessed_at,
+        };
+        Self::settle_verified(&env, &pm, &treasury, &policy, report, digest.to_bytes());
+    }
+
+    /// Verify a PKP-signed CROP_DROUGHT determination (`crop-drought-rdi-1.0`) and, iff
+    /// valid, pay it (RELAYER, when-not-paused). The signature is the sole payout authority;
+    /// it is over [`microcrop_shared::encoding::drought_determination_digest`], which binds
+    /// the on-chain policy id, the USDC amounts, this contract and the network domain.
+    ///
+    /// Checks, in order (all must pass):
+    ///  1. signer configured (300); 2. `CropDroughtRdi10` enabled (322);
+    ///  3. bounds: `bp <= 10000` (301), `drought_damage <= 100` (323), evidence within the
+    ///     methodology (325: `lgp_days == 180`, `cdd_w2_days <= 40`, non-zero reference rain,
+    ///     every rain value <= 1e9, season start at 00:00 UTC, the rdi-1.0 params hash);
+    ///  4. `bp == drought_damage * 100` (324); 5. the index recomputed from the signed rain
+    ///     equals `drought_damage` (324); 6. `bp >= 3000` (306);
+    ///  7. policy exists (307), ACTIVE (308), `now <= end_date` (309), not paid (310);
+    ///  8. `coverage_type == Drought` (320); 9. `sum_insured` matches (311);
+    ///  10. coordinates within 1e-6 degree (321);
+    ///  11. evidence window: planting on or after the UTC day cover started and the 110-day
+    ///      window inside cover (326); `assessed_at` after the window (327);
+    ///  12. `payout == sum_insured * bp / 10000` (312); 13. `assessed_at <= now` (313) and
+    ///      `now <= assessed_at + 3600` (314); 14. farmer claim limit (315);
+    ///  15. digest rebuilt on-chain; 16. not consumed (316); 17. signer recovered (317).
+    ///
+    /// Effects and interactions are those of `submit_determination`; `PolicyPaid` is shared,
+    /// so a policy settles at most once across both methodologies. The stored report has
+    /// `weather_damage = satellite_damage = 0`.
+    pub fn submit_drought_determination(
+        env: Env,
+        caller: Address,
+        d: DroughtDetermination,
+        signature: BytesN<64>,
+        recovery_id: u32,
+    ) {
+        let authorized_signer =
+            Self::begin_submission(&env, &caller, MethodologyKind::CropDroughtRdi10);
+
+        // 3. bounds.
+        if d.damage_percent_bp > MAX_DAMAGE_PERCENTAGE {
+            panic_with_error!(&env, PayoutError::DamageExceedsMaximum);
+        }
+        if d.drought_damage > 100 {
+            panic_with_error!(&env, PayoutError::DroughtScoreOutOfRange);
+        }
+        if d.lgp_days != drought::LGP_DAYS
+            || d.cdd_w2_days > drought::MAX_CDD_W2_DAYS
+            || d.rain_ref_w1_e2 == 0
+            || d.rain_ref_w2_e2 == 0
+            || d.rain_w1_e2 > drought::MAX_RAIN_E2
+            || d.rain_ref_w1_e2 > drought::MAX_RAIN_E2
+            || d.rain_w2_e2 > drought::MAX_RAIN_E2
+            || d.rain_ref_w2_e2 > drought::MAX_RAIN_E2
+            || !d
+                .season_start_epoch
+                .is_multiple_of(drought::SECONDS_PER_DAY)
+            || d.methodology_params_hash.to_array() != DROUGHT_PARAMS_HASH_RDI_1_0
+        {
+            panic_with_error!(&env, PayoutError::DroughtEvidenceInvalid);
+        }
+
+        // 4. unit invariant: rdi-1.0 emits whole percent; the money path is basis points.
+        if d.damage_percent_bp != d.drought_damage * 100 {
+            panic_with_error!(&env, PayoutError::InvalidDroughtDamage);
+        }
+
+        // 5. the result follows from the signed evidence.
+        match drought::rdi_v1_drought_damage(
+            d.rain_w1_e2,
+            d.rain_ref_w1_e2,
+            d.rain_w2_e2,
+            d.rain_ref_w2_e2,
+        ) {
+            Some(dd) if dd == d.drought_damage => {}
+            _ => panic_with_error!(&env, PayoutError::InvalidDroughtDamage),
+        }
+
+        // 6. threshold.
+        if d.damage_percent_bp < MIN_DAMAGE_THRESHOLD {
+            panic_with_error!(&env, PayoutError::DamageBelowThreshold);
+        }
+
+        // 7. policy: exists, ACTIVE, not expired, not already paid.
+        let (pm, treasury) = Self::clients(&env);
+        let policy = Self::open_policy(&env, &pm, d.on_chain_policy_id);
+
+        // 8. drought cover only (the index indemnifies drought and nothing else).
+        if policy.coverage_type != CoverageType::Drought {
+            panic_with_error!(&env, PayoutError::CoverageNotSettledByMethodology);
+        }
+
+        // 9. the evidence binds the sold sum insured (USDC, 7dp).
+        if d.sum_insured != policy.sum_insured {
+            panic_with_error!(&env, PayoutError::SumInsuredMismatch);
+        }
+
+        // 10. the evidence is about the insured plot.
+        Self::require_plot(&env, &policy, d.latitude_e6, d.longitude_e6);
+
+        // 11. the measured season lies inside the cover. Planting must not precede the UTC day
+        //     cover started (`activate_policy` resets `start_date` to now), so rainfall already
+        //     observed at purchase cannot be insured; and the whole W1..W2 window (110 days)
+        //     must end by `end_date`. Then the season must be over when it was assessed.
+        let start_day = policy.start_date - policy.start_date % drought::SECONDS_PER_DAY;
+        let window_end = d
+            .season_start_epoch
+            .checked_add(drought::SEASON_WINDOW_SECS)
+            .unwrap_or_else(|| panic_with_error!(&env, PayoutError::EvidenceOutsideCoverWindow));
+        if d.season_start_epoch < start_day || window_end > policy.end_date {
+            panic_with_error!(&env, PayoutError::EvidenceOutsideCoverWindow);
+        }
+        if d.assessed_at < window_end {
+            panic_with_error!(&env, PayoutError::SeasonNotComplete);
+        }
+
+        // 12. payout re-derived on-chain (floor; never overpays a base unit).
+        Self::require_payout(&env, &policy, d.damage_percent_bp, d.payout_amount);
+
+        // 13. freshness + 14. farmer claim limit.
+        Self::require_fresh_and_claimable(&env, &pm, &policy, d.assessed_at);
+
+        // 15. rebuild the digest on-chain from the stored domain and this contract's address.
+        let digest = drought_determination_digest(
+            &env,
+            &d,
+            &env.current_contract_address(),
+            &Self::network_domain(&env),
+        );
+
+        // 16. replay guard + 17. signature (the sole authority).
+        Self::require_unconsumed_and_signed(
+            &env,
+            &digest,
+            &signature,
+            recovery_id,
+            &authorized_signer,
+        );
+
+        let report = DamageReport {
+            policy_id: d.on_chain_policy_id,
+            damage_percentage: d.damage_percent_bp,
+            weather_damage: 0,
+            satellite_damage: 0,
+            payout_amount: d.payout_amount,
+            assessed_at: d.assessed_at,
+        };
+        DroughtEvidenceRecorded {
+            policy_id: d.on_chain_policy_id,
+            drought_damage: d.drought_damage,
+            season_start_epoch: d.season_start_epoch,
+            source_hash: d.source_hash.clone(),
+        }
+        .publish(&env);
+        Self::settle_verified(&env, &pm, &treasury, &policy, report, digest.to_bytes());
+    }
+
+    /// The digest `submit_drought_determination` would verify for `d` on this contract and
+    /// network. Read-only: the oracle and the backend simulate it against the live contract
+    /// to confirm their encoder. Reverts `NotConfigured` until the network domain is set.
+    pub fn drought_determination_digest(env: Env, d: DroughtDetermination) -> BytesN<32> {
+        drought_determination_digest(
+            &env,
+            &d,
+            &env.current_contract_address(),
+            &Self::network_domain(&env),
+        )
+        .to_bytes()
+    }
+
+    // ---- shared verification steps (private) ----
+
+    /// Steps 0-2 of both paths: relayer role + auth, not paused, user-path TTL, signer
+    /// configured, methodology enabled. Returns the authorized signer.
+    fn begin_submission(env: &Env, caller: &Address, kind: MethodologyKind) -> BytesN<65> {
+        // RELAYER gate (anti-spam only; not the payout authority) + caller.require_auth().
+        roles::require_role(env, caller, Role::Relayer);
+        // whenNotPaused.
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(env, PausedError::ContractPaused);
+        }
+        ttl::touch_contract(env);
+        // 1. authority root must be configured.
+        let signer: BytesN<65> = match env.storage().instance().get(&DataKey::AuthorizedSigner) {
+            Some(pk) => pk,
+            None => panic_with_error!(env, PayoutError::SignerNotConfigured),
+        };
+        // 2. the methodology must be enabled.
+        if !Self::methodology_enabled(env, kind) {
+            panic_with_error!(env, PayoutError::MethodologyDisabled);
+        }
+        signer
+    }
+
+    fn methodology_enabled(env: &Env, kind: MethodologyKind) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::MethodologyEnabled(kind))
+            .unwrap_or(false)
+    }
+
+    fn clients(env: &Env) -> (PolicyManagerClient<'_>, TreasuryClient<'_>) {
+        let (treasury, policy_manager) = Self::siblings(env);
+        (
+            PolicyManagerClient::new(env, &policy_manager),
+            TreasuryClient::new(env, &treasury),
+        )
+    }
+
+    fn network_domain(env: &Env) -> BytesN<32> {
+        env.storage()
             .instance()
             .get(&DataKey::NetworkDomain)
-            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
-        let this = env.current_contract_address();
-        let digest = determination_digest(&env, &d, &this, &network_domain);
-        let preimage_hash = digest.to_bytes();
+            .unwrap_or_else(|| panic_with_error!(env, CommonError::NotConfigured))
+    }
 
-        // 11. replay guard (temporary layer of the triple guard).
-        if s.temporary()
-            .has(&DataKey::ConsumedDetermination(preimage_hash.clone()))
-        {
-            panic_with_error!(&env, PayoutError::DeterminationAlreadyConsumed);
+    /// The policy exists (307), is ACTIVE (308), within its cover (309) and unpaid (310).
+    fn open_policy(env: &Env, pm: &PolicyManagerClient, policy_id: u64) -> Policy {
+        if !pm.policy_exists(&policy_id) {
+            panic_with_error!(env, PayoutError::PolicyDoesNotExist);
         }
+        let policy = pm.get_policy(&policy_id);
+        if policy.status != PolicyStatus::Active {
+            panic_with_error!(env, PayoutError::PolicyNotActive);
+        }
+        if env.ledger().timestamp() > policy.end_date {
+            panic_with_error!(env, PayoutError::PolicyExpired);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::PolicyPaid(policy_id))
+            .unwrap_or(false)
+        {
+            panic_with_error!(env, PayoutError::PolicyAlreadyPaid);
+        }
+        policy
+    }
 
-        // 12. signature is the sole authority: recover the SEC-1 pubkey and byte-compare.
+    /// The signed coordinates are the insured plot's, within one micro-degree per axis (321).
+    fn require_plot(env: &Env, policy: &Policy, lat_e6: i128, lon_e6: i128) {
+        if (lat_e6 - policy.lat_e6 as i128).abs() > PLOT_COORD_TOLERANCE_E6
+            || (lon_e6 - policy.lon_e6 as i128).abs() > PLOT_COORD_TOLERANCE_E6
+        {
+            panic_with_error!(env, PayoutError::PlotLocationMismatch);
+        }
+    }
+
+    /// `payout == sum_insured * bp / 10000`, floor division (312).
+    fn require_payout(env: &Env, policy: &Policy, bp: u32, payout: i128) {
+        if payout != policy.sum_insured * (bp as i128) / BASIS_POINTS {
+            panic_with_error!(env, PayoutError::InvalidPayoutCalculation);
+        }
+    }
+
+    /// Freshness (313 future, 314 stale) and the farmer's claim limit (315).
+    fn require_fresh_and_claimable(
+        env: &Env,
+        pm: &PolicyManagerClient,
+        policy: &Policy,
+        assessed_at: u64,
+    ) {
+        let now = env.ledger().timestamp();
+        if assessed_at > now {
+            panic_with_error!(env, PayoutError::ReportInFuture);
+        }
+        if now > assessed_at.saturating_add(MAX_REPORT_AGE) {
+            panic_with_error!(env, PayoutError::ReportTooOld);
+        }
+        if !pm.can_farmer_claim(&policy.farmer) {
+            panic_with_error!(env, PayoutError::FarmerClaimLimitExceeded);
+        }
+    }
+
+    /// The digest was not consumed (316) and recovers to the authorized signer (317).
+    fn require_unconsumed_and_signed(
+        env: &Env,
+        digest: &Hash<32>,
+        signature: &BytesN<64>,
+        recovery_id: u32,
+        authorized_signer: &BytesN<65>,
+    ) {
+        if env
+            .storage()
+            .temporary()
+            .has(&DataKey::ConsumedDetermination(digest.to_bytes()))
+        {
+            panic_with_error!(env, PayoutError::DeterminationAlreadyConsumed);
+        }
         let recovered = env
             .crypto()
-            .secp256k1_recover(&digest, &signature, recovery_id);
-        if recovered != authorized_signer {
-            panic_with_error!(&env, PayoutError::InvalidSignature);
+            .secp256k1_recover(digest, signature, recovery_id);
+        if recovered != *authorized_signer {
+            panic_with_error!(env, PayoutError::InvalidSignature);
         }
+    }
 
+    /// Effects then interactions for a verified determination, identical for both
+    /// methodologies: consumed marker, `PolicyPaid`, `Report`; `Treasury::request_payout`;
+    /// `mark_as_claimed`, or on a short reserve `mark_claim_pending` + `ClaimPending`;
+    /// `increment_claim_count`; events.
+    fn settle_verified(
+        env: &Env,
+        pm: &PolicyManagerClient,
+        treasury: &TreasuryClient,
+        policy: &Policy,
+        report: DamageReport,
+        preimage_hash: BytesN<32>,
+    ) {
+        let s = env.storage();
+        let policy_id = report.policy_id;
         // ============ All checks passed — effects before interactions (CEI) ============
         s.temporary().set(
             &DataKey::ConsumedDetermination(preimage_hash.clone()),
@@ -454,81 +769,59 @@ impl PayoutReceiver {
             TEMP_BUMP,
         );
 
-        s.persistent()
-            .set(&DataKey::PolicyPaid(d.on_chain_policy_id), &true);
-        ttl::extend_for_policy(
-            &env,
-            &DataKey::PolicyPaid(d.on_chain_policy_id),
-            policy.end_date,
-        );
+        s.persistent().set(&DataKey::PolicyPaid(policy_id), &true);
+        ttl::extend_for_policy(env, &DataKey::PolicyPaid(policy_id), policy.end_date);
 
-        let report = DamageReport {
-            policy_id: d.on_chain_policy_id,
-            damage_percentage: d.damage_percent_bp,
-            weather_damage: d.weather_damage,
-            satellite_damage: d.satellite_damage,
-            payout_amount: d.payout_amount,
-            assessed_at: d.assessed_at,
-        };
-        s.persistent()
-            .set(&DataKey::Report(d.on_chain_policy_id), &report);
-        ttl::extend_for_policy(
-            &env,
-            &DataKey::Report(d.on_chain_policy_id),
-            policy.end_date,
-        );
+        s.persistent().set(&DataKey::Report(policy_id), &report);
+        ttl::extend_for_policy(env, &DataKey::Report(policy_id), policy.end_date);
 
         // Interactions. `this` is passed as the acting caller so Treasury/PolicyManager can
         // enforce `caller == payout_receiver` / role checks; a contract auto-authorizes calls
         // it makes under its own address. Treasury.request_payout is the third replay layer
         // (its `PayoutProcessed(policy_id)` guard).
         //
-        // A short org reserve no longer reverts the determination (audit findings 9/11):
+        // A short org reserve does not revert the determination (audit findings 9/11):
         // Treasury records a pending payout for the full amount and returns false, the policy
         // moves to CLAIM_PENDING (so it cannot expire, be cancelled, or be settled by another
         // determination), and `settle_pending_claim` pays it once the reserve covers it. The
         // replay guards above are already set, so the determination is consumed either way.
-        let paid_now = TreasuryClient::new(&env, &treasury).request_payout(
-            &this,
-            &d.on_chain_policy_id,
-            &d.payout_amount,
-        );
+        let this = env.current_contract_address();
+        let paid_now = treasury.request_payout(&this, &policy_id, &report.payout_amount);
         if paid_now {
-            pm.mark_as_claimed(&this, &d.on_chain_policy_id);
+            pm.mark_as_claimed(&this, &policy_id);
         } else {
-            pm.mark_claim_pending(&this, &d.on_chain_policy_id);
-            s.persistent()
-                .set(&DataKey::ClaimPending(d.on_chain_policy_id), &true);
-            ttl::extend_pending(&env, &DataKey::ClaimPending(d.on_chain_policy_id));
+            pm.mark_claim_pending(&this, &policy_id);
+            s.persistent().set(&DataKey::ClaimPending(policy_id), &true);
+            ttl::extend_pending(env, &DataKey::ClaimPending(policy_id));
         }
         // The claim counts against the farmer's window when it is approved, paid or not.
         pm.increment_claim_count(&this, &policy.farmer);
 
         // Events (mirror Solidity DeterminationVerified / DamageReportReceived / PayoutInitiated).
         DeterminationVerified {
-            policy_id: d.on_chain_policy_id,
+            policy_id,
             preimage_hash,
         }
-        .publish(&env);
+        .publish(env);
         DamageReportReceived {
-            policy_id: d.on_chain_policy_id,
-            farmer: policy.farmer,
-            damage_percentage: d.damage_percent_bp,
-            payout_amount: d.payout_amount,
+            policy_id,
+            farmer: policy.farmer.clone(),
+            damage_percentage: report.damage_percentage,
+            payout_amount: report.payout_amount,
         }
-        .publish(&env);
+        .publish(env);
         if paid_now {
             PayoutInitiated {
-                policy_id: d.on_chain_policy_id,
-                amount: d.payout_amount,
+                policy_id,
+                amount: report.payout_amount,
             }
-            .publish(&env);
+            .publish(env);
         } else {
             ClaimAwaitingFunding {
-                policy_id: d.on_chain_policy_id,
-                amount: d.payout_amount,
+                policy_id,
+                amount: report.payout_amount,
             }
-            .publish(&env);
+            .publish(env);
         }
     }
 
@@ -672,3 +965,5 @@ impl PayoutReceiver {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_drought;

@@ -10,8 +10,8 @@
 //! ```text
 //!   create_policy ─▶ activate_policy (mints the real NFT)
 //!                 ─▶ mint USDC + receive_premium (real SAC token transfer, fee split)
-//!                 ─▶ sign a CropDetermination with a real k256 key
-//!                 ─▶ submit_determination (real secp256k1_recover)
+//!                 ─▶ sign a DroughtDetermination with a real k256 key
+//!                 ─▶ submit_drought_determination (real secp256k1_recover)
 //!                 ─▶ Treasury.request_payout (real USDC leaves the Treasury)
 //! ```
 //!
@@ -33,9 +33,10 @@
 //! | `set_payout_receiver(payout_receiver_addr)`      | Treasury        | `request_payout` restricts caller == PR           |
 //! | `grant_role(Backend, backend)`                   | Treasury        | backend may `receive_premium`                     |
 //! | `grant_role(Payout,  payout_receiver_addr)`      | Treasury        | PR (as itself) may `request_payout`               |
-//! | `grant_role(Relayer, relayer)`                   | PayoutReceiver  | relayer may `submit_determination` (anti-spam)    |
+//! | `grant_role(Relayer, relayer)`                   | PayoutReceiver  | relayer may submit determinations (anti-spam)     |
 //! | `set_authorized_signer(pubkey65)`                | PayoutReceiver  | the sole payout authority (the signature)         |
 //! | `set_network_domain(domain)`                     | PayoutReceiver  | binds the signed digest to this network           |
+//! | `set_methodology_enabled(CropDroughtRdi10)`       | PayoutReceiver  | drought determinations are accepted at all        |
 //!
 //! ### Payout recipient note
 //! In this v3 port `Treasury::request_payout` transfers USDC to the **backend offramp wallet**
@@ -55,9 +56,11 @@ use soroban_sdk::{
 use k256::ecdsa::SigningKey;
 
 use microcrop_shared::{
-    encoding::determination_digest,
+    encoding::{determination_digest, drought_determination_digest, DROUGHT_PARAMS_HASH_RDI_1_0},
     errors::{PayoutError, PolicyError, TreasuryError},
-    types::{CoverageType, CropDetermination, PolicyStatus, Role},
+    types::{
+        CoverageType, CropDetermination, DroughtDetermination, MethodologyKind, PolicyStatus, Role,
+    },
 };
 
 use microcrop_payout_receiver::{
@@ -69,19 +72,25 @@ use microcrop_treasury::{PausedError as TreasuryPausedError, Treasury, TreasuryC
 
 // ============ Fixed test parameters ============
 
-const NOW: u64 = 1_700_000_000;
+/// Planting day, 2025-04-01 00:00 UTC (the drought evidence's `season_start_epoch`).
+const PLANT: u64 = 1_743_465_600;
+/// Sale and activation: 06:00 UTC on planting day (the cover must start by planting).
+const NOW: u64 = PLANT + 6 * 3_600;
 /// 1,000 USDC (7dp, Stellar SAC) — within PolicyManager's [MIN_SUM_INSURED, MAX_SUM_INSURED].
 const SUM_INSURED: i128 = 10_000_000_000;
-/// weather 50% + satellite 50% => 60*50 + 40*50 = 5000 bp (the weighted invariant).
+/// 50% drought damage => 5000 bp (W1 at half its normal, W2 at 75% of its normal).
 const DAMAGE_BP: u32 = 5_000;
 /// SUM_INSURED * 5000 / 10000.
 const PAYOUT: i128 = 5_000_000_000;
-const DURATION_DAYS: u32 = 90;
+/// 150 days of cover: the 110-day measurement window, the 7-day archive lag and a margin.
+const DURATION_DAYS: u32 = 150;
+/// The oracle assesses 117 days after planting; the relayer submits a minute later.
+const ASSESSED: u64 = PLANT + 117 * 86_400;
 /// The insured plot (Nairobi), degrees x 1e6 — what create_policy stores and the signer signs.
 const PLOT_LAT_E6: i64 = -1_286_389;
 const PLOT_LON_E6: i64 = 36_817_223;
 
-// ============ secp256k1 signing helpers (copied verbatim from payout-receiver/src/test.rs) ============
+// ============ secp256k1 signing helpers (as in payout-receiver/src/test.rs) ============
 
 fn sk_from(byte: u8) -> SigningKey {
     SigningKey::from_slice(&[byte; 32]).unwrap()
@@ -95,41 +104,53 @@ fn pubkey65(env: &Env, sk: &SigningKey) -> BytesN<65> {
     BytesN::from_array(env, &arr)
 }
 
-/// Sign the digest the contract will reconstruct for `d`, bound to `pr_addr` + `domain`.
-/// Reuses the exact on-chain preimage/digest so `secp256k1_recover` round-trips.
-fn sign(
-    env: &Env,
-    sk: &SigningKey,
-    pr_addr: &Address,
-    domain: &BytesN<32>,
-    d: &CropDetermination,
-) -> (BytesN<64>, u32) {
-    let digest = determination_digest(env, d, pr_addr, domain);
-    let (sig, recid) = sk.sign_prehash_recoverable(&digest.to_array()).unwrap();
+fn sign_digest(env: &Env, sk: &SigningKey, digest: [u8; 32]) -> (BytesN<64>, u32) {
+    let (sig, recid) = sk.sign_prehash_recoverable(&digest).unwrap();
     let mut arr = [0u8; 64];
     arr.copy_from_slice(&sig.to_bytes());
     (BytesN::from_array(env, &arr), recid.to_byte() as u32)
 }
 
-/// A fully-consistent determination for `policy_id`, sum insured `sum_insured`, 50/50 sub-scores
-/// (=> 5000 bp) assessed at `NOW`. `payout` must equal `sum_insured * DAMAGE_BP / 10000`.
-fn determination(policy_id: u64, sum_insured: i128, payout: i128) -> CropDetermination {
-    CropDetermination {
+/// Sign the drought digest the contract will reconstruct for `d`, bound to `pr_addr` +
+/// `domain`.
+fn sign(
+    env: &Env,
+    sk: &SigningKey,
+    pr_addr: &Address,
+    domain: &BytesN<32>,
+    d: &DroughtDetermination,
+) -> (BytesN<64>, u32) {
+    let digest = drought_determination_digest(env, d, pr_addr, domain);
+    sign_digest(env, sk, digest.to_array())
+}
+
+/// A fully consistent drought determination for `policy_id`: W1 10000/20000 (d1 50, g1 20),
+/// W2 13500/18000 (d2 25, g2 37) -> 100 - (80 * 63) / 100 = 50% => 5000 bp, assessed at
+/// `ASSESSED`. `payout` must equal `sum_insured * DAMAGE_BP / 10000`.
+fn determination(
+    env: &Env,
+    policy_id: u64,
+    sum_insured: i128,
+    payout: i128,
+) -> DroughtDetermination {
+    DroughtDetermination {
         on_chain_policy_id: policy_id,
         damage_percent_bp: DAMAGE_BP,
-        weather_damage: 50,
-        satellite_damage: 50,
+        drought_damage: DAMAGE_BP / 100,
         payout_amount: payout,
-        assessed_at: NOW,
+        assessed_at: ASSESSED,
         latitude_e6: PLOT_LAT_E6 as i128,
         longitude_e6: PLOT_LON_E6 as i128,
         sum_insured,
-        ndvi_scaled: 4_200,
-        weather_present: 1,
-        weather_temp_c_e2: 2_750,
-        weather_precip_e2: 15,
-        weather_humidity: 80,
-        weather_wind_e2: 350,
+        season_start_epoch: PLANT,
+        lgp_days: 180,
+        rain_w1_e2: 10_000,
+        rain_ref_w1_e2: 20_000,
+        rain_w2_e2: 13_500,
+        rain_ref_w2_e2: 18_000,
+        cdd_w2_days: 12,
+        source_hash: BytesN::from_array(env, &[0x5c; 32]),
+        methodology_params_hash: BytesN::from_array(env, &DROUGHT_PARAMS_HASH_RDI_1_0),
     }
 }
 
@@ -231,6 +252,8 @@ fn deploy<'a>() -> World<'a> {
     pr.set_authorized_signer(&admin, &pubkey65(&env, &sk));
     let domain = BytesN::from_array(&env, &[0xABu8; 32]);
     pr.set_network_domain(&admin, &domain);
+    // Accept CROP_DROUGHT; CROP_DAMAGE stays disabled (retired).
+    pr.set_methodology_enabled(&admin, &MethodologyKind::CropDroughtRdi10, &true);
 
     World {
         env,
@@ -267,7 +290,7 @@ impl<'a> World<'a> {
             &SUM_INSURED,
             &premium,
             &DURATION_DAYS,
-            &CoverageType::Comprehensive,
+            &CoverageType::Drought,
             &self.org,
         );
         self.pm.activate_policy(
@@ -285,6 +308,37 @@ impl<'a> World<'a> {
         self.token_admin.mint(&self.backend, &premium);
         self.treasury
             .receive_premium(&self.backend, &policy_id, &premium);
+    }
+
+    /// Move the ledger to the relayer's submission time (a minute after the assessment) if it
+    /// is earlier: a drought determination can only be assessed once the season is over.
+    fn at_assessment(&self) {
+        if self.env.ledger().timestamp() < ASSESSED + 60 {
+            self.env.ledger().set_timestamp(ASSESSED + 60);
+        }
+    }
+
+    /// Sign `d` with the authorized key and submit it at assessment time.
+    fn submit(&self, d: &DroughtDetermination) {
+        self.at_assessment();
+        let (sig, recid) = sign(&self.env, &self.sk, &self.pr_addr, &self.domain, d);
+        self.pr
+            .submit_drought_determination(&self.relayer, d, &sig, &recid);
+    }
+
+    /// `try_` form of [`Self::submit`] with an explicit signature.
+    fn try_submit(
+        &self,
+        d: &DroughtDetermination,
+        sig: &BytesN<64>,
+        recid: u32,
+    ) -> Result<
+        Result<(), soroban_sdk::ConversionError>,
+        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+    > {
+        self.at_assessment();
+        self.pr
+            .try_submit_drought_determination(&self.relayer, d, sig, &recid)
     }
 
     /// Solvency invariant that must hold after every Treasury state change.
@@ -326,12 +380,10 @@ fn full_lifecycle_premium_to_payout() {
     assert_eq!(w.token.balance(&w.treasury_id), premium);
     w.assert_solvent();
 
-    // --- sign the determination with the real k256 key and submit it ---
-    let d = determination(policy_id, SUM_INSURED, PAYOUT);
-    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
-
+    // --- after the season: sign the determination with the real k256 key and submit it ---
+    let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     let backend_wallet_before = w.token.balance(&w.backend_wallet);
-    w.pr.submit_determination(&w.relayer, &d, &sig, &recid);
+    w.submit(&d);
 
     // --- REAL USDC moved: Treasury -> backend offramp wallet, exactly the derived payout ---
     assert_eq!(
@@ -349,6 +401,8 @@ fn full_lifecycle_premium_to_payout() {
     let report = w.pr.get_report(&policy_id);
     assert_eq!(report.payout_amount, PAYOUT);
     assert_eq!(report.damage_percentage, DAMAGE_BP);
+    assert_eq!(report.weather_damage, 0);
+    assert_eq!(report.satellite_damage, 0);
     // Farmer is still the on-chain certificate owner.
     assert_eq!(w.nft.owner_of(&policy_id), w.farmer);
     w.assert_solvent();
@@ -363,11 +417,11 @@ fn determination_replay_rejected() {
     let policy_id = w.create_and_activate(premium);
     w.pay_premium(policy_id, premium);
 
-    let d = determination(policy_id, SUM_INSURED, PAYOUT);
+    let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
 
     // First submission pays out.
-    w.pr.submit_determination(&w.relayer, &d, &sig, &recid);
+    w.try_submit(&d, &sig, recid).unwrap().unwrap();
     let backend_wallet_after_first = w.token.balance(&w.backend_wallet);
     let reserve_after_first = w.treasury.org_reserve(&w.org);
     assert_eq!(backend_wallet_after_first, PAYOUT);
@@ -378,7 +432,7 @@ fn determination_replay_rejected() {
     // persistent `PolicyAlreadyPaid` guard (#310) would. (The isolated unit test — whose mock keeps
     // the policy Active — sees #310 instead.) Either way the replay is blocked and no second payout
     // occurs; that difference is exactly what an integration test exists to surface.
-    let res = w.pr.try_submit_determination(&w.relayer, &d, &sig, &recid);
+    let res = w.try_submit(&d, &sig, recid);
     assert_eq!(res, Err(Ok(PayoutError::PolicyNotActive.into())));
 
     // No second payout: balances + reserve unchanged, Treasury still solvent.
@@ -395,18 +449,21 @@ fn determination_replay_rejected() {
 // (audit findings 9 and 11 — previously the determination reverted with no record, and the
 // claim was lost once the signed report aged out or the policy reached end_date.)
 
-/// Create + activate + pay a 100 USDC premium (90 USDC net reserve), then submit a valid
-/// determination for a 500 USDC payout the reserve cannot cover. Returns the policy id.
-fn record_short_claim(w: &World) -> u64 {
+/// Sell (create + activate) a policy on planting day and pay a 100 USDC premium (90 USDC
+/// net reserve). Returns the policy id.
+fn sell_short(w: &World) -> u64 {
     let premium: i128 = 1_000_000_000; // 100 USDC; net after 10% fee = 90 USDC.
     let policy_id = w.create_and_activate(premium);
     w.pay_premium(policy_id, premium);
-    let net = premium - premium / 10;
-    assert!(net < PAYOUT);
+    assert!(premium - premium / 10 < PAYOUT);
+    policy_id
+}
 
-    let d = determination(policy_id, SUM_INSURED, PAYOUT);
-    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
-    w.pr.submit_determination(&w.relayer, &d, &sig, &recid);
+/// [`sell_short`], then after the season submit a valid determination for a 500 USDC payout
+/// the reserve cannot cover. Returns the policy id.
+fn record_short_claim(w: &World) -> u64 {
+    let policy_id = sell_short(w);
+    w.submit(&determination(&w.env, policy_id, SUM_INSURED, PAYOUT));
     policy_id
 }
 
@@ -503,23 +560,21 @@ fn pending_claim_blocks_replay_and_other_determinations() {
     let policy_id = record_short_claim(&w);
 
     // The same determination again: rejected, and no second pending record.
-    let d = determination(policy_id, SUM_INSURED, PAYOUT);
+    let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
-    assert!(w
-        .pr
-        .try_submit_determination(&w.relayer, &d, &sig, &recid)
-        .is_err());
+    assert!(w.try_submit(&d, &sig, recid).is_err());
 
     // A different, smaller determination (signed later) cannot settle the policy either.
-    w.env.ledger().set_timestamp(NOW + 60);
-    let mut d2 = determination(policy_id, SUM_INSURED, SUM_INSURED * 3_000 / 10_000);
-    d2.weather_damage = 30;
-    d2.satellite_damage = 30;
+    // W1 at normal, W2 at 80% of normal: d2 = 20, g2 = 30 -> 30%.
+    w.env.ledger().set_timestamp(ASSESSED + 120);
+    let mut d2 = determination(&w.env, policy_id, SUM_INSURED, SUM_INSURED * 3_000 / 10_000);
+    d2.rain_w1_e2 = 20_000;
+    d2.rain_w2_e2 = 14_400;
+    d2.drought_damage = 30;
     d2.damage_percent_bp = 3_000;
-    d2.assessed_at = NOW + 60;
+    d2.assessed_at = ASSESSED + 100;
     let (sig2, recid2) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d2);
-    let res =
-        w.pr.try_submit_determination(&w.relayer, &d2, &sig2, &recid2);
+    let res = w.try_submit(&d2, &sig2, recid2);
     assert_eq!(res, Err(Ok(PayoutError::PolicyNotActive.into())));
 
     // The recorded amount is still the original, full one.
@@ -533,12 +588,13 @@ fn pending_claim_blocks_replay_and_other_determinations() {
 #[test]
 fn new_claim_queues_behind_an_older_pending_claim() {
     let w = deploy();
-    let first = record_short_claim(&w); // reserve 90 USDC, 500 USDC pending.
-
-    // Same farmer (one claim in the window + one open policy is under the cap of 3).
+    // Two policies of the same farmer, both sold on planting day.
+    let first = sell_short(&w);
     let premium: i128 = 1_000_000_000;
     let second = w.create_and_activate(premium);
     w.pay_premium(second, premium);
+    // After the season the first claim finds 180 USDC of reserve: 500 USDC pending.
+    w.submit(&determination(&w.env, first, SUM_INSURED, PAYOUT));
     // Reserve 600 USDC: the second 500 USDC claim fits the reserve, but only 100 USDC of it
     // is not already owed to the first claim.
     let top_up: i128 = 4_200_000_000;
@@ -546,9 +602,7 @@ fn new_claim_queues_behind_an_older_pending_claim() {
     w.treasury.deposit_reserve(&w.org, &w.org, &top_up);
     assert_eq!(w.treasury.org_reserve(&w.org), 6_000_000_000);
 
-    let d = determination(second, SUM_INSURED, PAYOUT);
-    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
-    w.pr.submit_determination(&w.relayer, &d, &sig, &recid);
+    w.submit(&determination(&w.env, second, SUM_INSURED, PAYOUT));
 
     // Queued, not paid ahead of the first claim.
     assert_eq!(w.token.balance(&w.backend_wallet), 0);
@@ -609,10 +663,10 @@ fn wrong_signer_determination_rejected() {
 
     // Correct payload, but signed by a key that is NOT the configured authorized signer.
     let attacker = sk_from(0x22);
-    let d = determination(policy_id, SUM_INSURED, PAYOUT);
+    let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     let (sig, recid) = sign(&w.env, &attacker, &w.pr_addr, &w.domain, &d);
 
-    let res = w.pr.try_submit_determination(&w.relayer, &d, &sig, &recid);
+    let res = w.try_submit(&d, &sig, recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidSignature.into())));
 
     // Nothing moved.
@@ -705,7 +759,7 @@ fn pending_policy_premium_is_reserve_not_surplus() {
         &SUM_INSURED,
         &premium,
         &DURATION_DAYS,
-        &CoverageType::Comprehensive,
+        &CoverageType::Drought,
         &w.org,
     );
     assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Pending);
@@ -739,8 +793,11 @@ fn pending_policy_premium_is_reserve_not_surplus() {
 #[test]
 fn pending_claims_of_one_org_settle_in_arrival_order() {
     let w = deploy();
-    let first = record_short_claim(&w); // 500 USDC pending, reserve 90 USDC
-    let second = record_short_claim(&w); // 500 USDC pending, reserve 180 USDC
+    // Both sold on planting day; both claims recorded after the season.
+    let first = sell_short(&w);
+    let second = sell_short(&w);
+    w.submit(&determination(&w.env, first, SUM_INSURED, PAYOUT)); // 500 pending, reserve 180
+    w.submit(&determination(&w.env, second, SUM_INSURED, PAYOUT)); // 500 pending
     assert_eq!(w.treasury.pending_payout_head(&w.org), Some(first));
     assert_eq!(w.treasury.pending_payout_count(&w.org), 2);
 
@@ -787,9 +844,7 @@ fn frozen_backend_wallet_queues_the_claim_until_the_wallet_is_rotated() {
     w.token_admin.set_authorized(&w.backend_wallet, &false);
 
     // The determination is accepted, not reverted: consumed, counted, and queued.
-    let d = determination(policy_id, SUM_INSURED, PAYOUT);
-    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
-    w.pr.submit_determination(&w.relayer, &d, &sig, &recid);
+    w.submit(&determination(&w.env, policy_id, SUM_INSURED, PAYOUT));
     assert!(w.pr.is_policy_paid(&policy_id));
     assert!(w.pr.is_claim_pending(&policy_id));
     assert_eq!(
@@ -810,7 +865,7 @@ fn frozen_backend_wallet_queues_the_claim_until_the_wallet_is_rotated() {
     // long after MAX_REPORT_AGE.
     let new_wallet = Address::generate(&w.env);
     w.treasury.set_backend_wallet(&w.admin, &new_wallet);
-    w.env.ledger().set_timestamp(NOW + 7 * 86_400);
+    w.env.ledger().set_timestamp(ASSESSED + 7 * 86_400);
     w.env.set_auths(&[]);
     w.pr.settle_pending_claim(&policy_id);
     assert_eq!(w.token.balance(&new_wallet), PAYOUT);
@@ -821,13 +876,14 @@ fn frozen_backend_wallet_queues_the_claim_until_the_wallet_is_rotated() {
 // ============ Coverage type and plot binding, end to end ============
 
 #[test]
-fn single_peril_cover_cannot_be_sold() {
-    // Crop damage settles only all-cause cover, so single-peril cover is refused at sale:
-    // no policy, no exposure, no farmer slot, no premium.
+fn only_drought_cover_can_be_sold() {
+    // The one signable methodology (crop-drought-rdi-1.0) settles drought cover only, so
+    // every other cover is refused at sale: no policy, no exposure, no farmer slot, no
+    // premium.
     let w = deploy();
     let premium: i128 = 10_000_000_000;
     for coverage in [
-        CoverageType::Drought,
+        CoverageType::Comprehensive,
         CoverageType::Flood,
         CoverageType::Both,
         CoverageType::ExcessRain,
@@ -860,11 +916,11 @@ fn evidence_from_another_plot_does_not_settle() {
     let policy_id = w.create_and_activate(premium);
     w.pay_premium(policy_id, premium);
 
-    let mut d = determination(policy_id, SUM_INSURED, PAYOUT);
+    let mut d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     d.latitude_e6 = -1_300_000; // ~1.5 km south
     let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
     assert_eq!(
-        w.pr.try_submit_determination(&w.relayer, &d, &sig, &recid),
+        w.try_submit(&d, &sig, recid),
         Err(Ok(PayoutError::PlotLocationMismatch.into()))
     );
     assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Active);
@@ -942,14 +998,22 @@ fn extend_policy_ttl_reaches_every_contract() {
         || microcrop_payout_receiver::DataKey::ClaimPending(policy_id).into_val(&w.env);
     let nft_cert = || microcrop_policy_nft::DataKey::Certificate(policy_id).into_val(&w.env);
 
-    // Per-policy entries: the 90-day cover + 30 days. Pending-claim entries: 60 days.
-    let need = (DURATION_DAYS + 30) * DAY;
-    assert_eq!(ttl_in(&w.pr_addr, pr_paid()), need);
-    assert_eq!(ttl_in(&w.treasury_id, tr_premium()), need);
-    assert_eq!(ttl_in(&w.nft.address, nft_cert()), need);
+    // Per-policy entries live until end + 30 days, counted from when they were written:
+    // the premium flag, certificate and policy at sale (NOW), PolicyPaid at the claim.
+    let until = w.pm.get_policy(&policy_id).end_date + 30 * 86_400;
+    let need_at = |t: u64| ((until - t).div_ceil(5)) as u32;
+    assert_eq!(ttl_in(&w.pr_addr, pr_paid()), need_at(ASSESSED + 60));
+    assert_eq!(ttl_in(&w.treasury_id, tr_premium()), need_at(NOW));
+    assert_eq!(ttl_in(&w.nft.address, nft_cert()), need_at(NOW));
     // The policy entry already lived until end + 30 days; going CLAIM_PENDING never
-    // shortens it.
-    assert_eq!(ttl_in(&w.pm.address, pm_policy()), need);
+    // shortens it. Pending-claim entries: 60 days.
+    assert_eq!(ttl_in(&w.pm.address, pm_policy()), need_at(NOW));
+    let before = [
+        ttl_in(&w.pm.address, pm_policy()),
+        ttl_in(&w.pr_addr, pr_paid()),
+        ttl_in(&w.treasury_id, tr_premium()),
+        ttl_in(&w.nft.address, nft_cert()),
+    ];
     assert_eq!(ttl_in(&w.treasury_id, tr_pending()), PENDING_TARGET_LEDGERS);
     assert_eq!(ttl_in(&w.pr_addr, pr_pending()), PENDING_TARGET_LEDGERS);
 
@@ -964,13 +1028,16 @@ fn extend_policy_ttl_reaches_every_contract() {
         assert_eq!(ttl_in(c, k), PENDING_TARGET_LEDGERS);
     }
     // The per-policy entries already live until end + 30 days: left as they are.
-    for (c, k) in [
+    for (i, (c, k)) in [
         (&w.pm.address, pm_policy()),
         (&w.pr_addr, pr_paid()),
         (&w.treasury_id, tr_premium()),
         (&w.nft.address, nft_cert()),
-    ] {
-        assert_eq!(ttl_in(c, k), need - 40 * DAY);
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(ttl_in(c, k), before[i] - 40 * DAY);
     }
 }
 
@@ -998,7 +1065,9 @@ fn extend_policy_ttl_keeps_org_and_farmer_entries_alive() {
     };
     use microcrop_policy_manager::DataKey as Pm;
     use microcrop_treasury::DataKey as Tr;
-    let need = (DURATION_DAYS + 30) * DAY;
+    let until = w.pm.get_policy(&policy_id).end_date + 30 * 86_400;
+    // Written for the policy at sale (NOW): its need then.
+    let need = ((until - NOW).div_ceil(5)) as u32;
     // Per-org terms and reserve: the policy's need (they were read or written for it).
     let org_keys = [
         Tr::OrgReserve(w.org.clone()),
@@ -1016,8 +1085,9 @@ fn extend_policy_ttl_keeps_org_and_farmer_entries_alive() {
         Pm::OrgOutstanding(w.org.clone()),
         Pm::FarmerPolicyCount(w.farmer.clone()),
     ];
-    // The fee terms and the reserve were used for this policy: its need. The ratio terms were
-    // only read by `reserve_required`, which has no policy at hand: the 60-day floor.
+    // The fee terms and the reserve were used for this policy: its need (from the premium
+    // at sale). The ratio terms were only read by `reserve_required`, which has no policy at
+    // hand: the 60-day floor, from when the admin set them.
     for k in org_keys[..3].iter() {
         assert_eq!(ttl_in(&w.treasury_id, k.clone().into_val(&w.env)), need);
     }
@@ -1037,10 +1107,18 @@ fn extend_policy_ttl_keeps_org_and_farmer_entries_alive() {
             PENDING_TARGET_LEDGERS
         );
     }
-    for k in org_keys.iter() {
+    // Fee terms and reserve: left as they are (they already outlive the policy). Ratio
+    // terms: under the floor, so topped up to at least 60 days.
+    for k in org_keys[..3].iter() {
         assert_eq!(
             ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
             need - 40 * DAY
+        );
+    }
+    for k in org_keys[3..].iter() {
+        assert_eq!(
+            ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
+            SHARED_FLOOR_LEDGERS
         );
     }
     for k in pm_keys.iter() {
@@ -1049,4 +1127,144 @@ fn extend_policy_ttl_keeps_org_and_farmer_entries_alive() {
             need - 40 * DAY
         );
     }
+}
+
+// ============ CROP_DROUGHT end to end ============
+
+#[test]
+fn crop_determination_is_rejected_after_the_upgrade() {
+    // CROP_DAMAGE is retired: disabled, so even a validly signed one is refused.
+    let w = deploy();
+    let premium: i128 = 10_000_000_000;
+    let policy_id = w.create_and_activate(premium);
+    w.pay_premium(policy_id, premium);
+    let c = CropDetermination {
+        on_chain_policy_id: policy_id,
+        damage_percent_bp: 5_000,
+        weather_damage: 50,
+        satellite_damage: 50,
+        payout_amount: PAYOUT,
+        assessed_at: NOW,
+        latitude_e6: PLOT_LAT_E6 as i128,
+        longitude_e6: PLOT_LON_E6 as i128,
+        sum_insured: SUM_INSURED,
+        ndvi_scaled: 4_200,
+        weather_present: 1,
+        weather_temp_c_e2: 2_750,
+        weather_precip_e2: 15,
+        weather_humidity: 80,
+        weather_wind_e2: 350,
+    };
+    let digest = determination_digest(&w.env, &c, &w.pr_addr, &w.domain);
+    let (sig, recid) = sign_digest(&w.env, &w.sk, digest.to_array());
+    assert!(!w
+        .pr
+        .is_methodology_enabled(&MethodologyKind::CropDualIndex10));
+    assert_eq!(
+        w.pr.try_submit_determination(&w.relayer, &c, &sig, &recid),
+        Err(Ok(PayoutError::MethodologyDisabled.into()))
+    );
+    assert_eq!(w.token.balance(&w.backend_wallet), 0);
+}
+
+#[test]
+fn cover_bought_after_planting_does_not_settle_that_season() {
+    // Activated the day after planting: the buyer has seen the start of W1. The season's
+    // evidence cannot settle the policy (anti-adverse-selection rule), however dry it was.
+    let w = deploy();
+    w.env.ledger().set_timestamp(PLANT + 86_400 + 60);
+    let premium: i128 = 10_000_000_000;
+    let policy_id = w.create_and_activate(premium);
+    w.pay_premium(policy_id, premium);
+    let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
+    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
+    assert_eq!(
+        w.try_submit(&d, &sig, recid),
+        Err(Ok(PayoutError::EvidenceOutsideCoverWindow.into()))
+    );
+    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Active);
+}
+
+/// Positive end-to-end with REAL evidence: the 2022 long-rains season at the oracle's pilot
+/// pixel (ERA5 cell 1.0 N / 35.0 E, Trans Nzoia), planted 2022-04-01. The values below are
+/// what the oracle's own index (`calculateDroughtDamage`, microcrop-lit-oracle 1bc2d9d
+/// `src/scoring/drought.shared.js`) returns for the live Open-Meteo archive response of
+///   https://archive-api.open-meteo.com/v1/archive?latitude=1.016700&longitude=35.006200&start_date=1991-01-01&end_date=2022-07-19&daily=precipitation_sum&timezone=Africa%2FNairobi&models=era5
+/// fetched 2026-10-18 (209,608 bytes, sha256 213bdcc7…b7c117); `source_hash` is keccak256 of
+/// that run's canonical projection. Signed here with the test key; the ledger clock is set
+/// inside the window.
+#[test]
+fn real_era5_season_settles_end_to_end() {
+    const PLANT_2022: u64 = 1_648_771_200; // 2022-04-01
+    const LAT: i64 = 1_016_700;
+    const LON: i64 = 35_006_200;
+    let w = deploy();
+    w.env.ledger().set_timestamp(PLANT_2022 + 6 * 3_600);
+    let premium: i128 = 1_000_000_000;
+    let policy_id = w.pm.create_policy(
+        &w.backend,
+        &w.farmer,
+        &7u64,
+        &LAT,
+        &LON,
+        &SUM_INSURED,
+        &premium,
+        &DURATION_DAYS,
+        &CoverageType::Drought,
+        &w.org,
+    );
+    w.pm.activate_policy(
+        &w.backend,
+        &policy_id,
+        &w.distributor,
+        &String::from_str(&w.env, "Acme Distributor"),
+        &String::from_str(&w.env, "Trans Nzoia"),
+    );
+    w.token_admin.mint(&w.org, &SUM_INSURED);
+    w.treasury.deposit_reserve(&w.org, &w.org, &SUM_INSURED);
+    w.pay_premium(policy_id, premium);
+
+    // W1 31130 vs normal 27260 (satisfied); W2 16280 vs 22305: s2 = 729, d2 = 28, g2 = 42.
+    let source_hash: [u8; 32] = [
+        0x20, 0x7c, 0xa2, 0x6b, 0x24, 0x54, 0xf0, 0xd0, 0x8e, 0x04, 0x96, 0x2f, 0x42, 0x00, 0x8b,
+        0x73, 0xba, 0x0a, 0x51, 0x74, 0x4f, 0x26, 0x73, 0xe9, 0x9a, 0x0e, 0xe9, 0xf5, 0xf5, 0x6a,
+        0xf8, 0x42,
+    ];
+    let assessed = PLANT_2022 + 117 * 86_400;
+    let d = DroughtDetermination {
+        on_chain_policy_id: policy_id,
+        damage_percent_bp: 4_200,
+        drought_damage: 42,
+        payout_amount: SUM_INSURED * 4_200 / 10_000,
+        assessed_at: assessed,
+        latitude_e6: LAT as i128,
+        longitude_e6: LON as i128,
+        sum_insured: SUM_INSURED,
+        season_start_epoch: PLANT_2022,
+        lgp_days: 180,
+        rain_w1_e2: 31_130,
+        rain_ref_w1_e2: 27_260,
+        rain_w2_e2: 16_280,
+        rain_ref_w2_e2: 22_305,
+        cdd_w2_days: 7,
+        source_hash: BytesN::from_array(&w.env, &source_hash),
+        methodology_params_hash: BytesN::from_array(&w.env, &DROUGHT_PARAMS_HASH_RDI_1_0),
+    };
+    w.env.ledger().set_timestamp(assessed + 600);
+    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
+    // The view returns the digest that was signed.
+    assert_eq!(
+        w.pr.drought_determination_digest(&d),
+        drought_determination_digest(&w.env, &d, &w.pr_addr, &w.domain).to_bytes()
+    );
+    w.pr.submit_drought_determination(&w.relayer, &d, &sig, &recid);
+
+    assert_eq!(
+        w.token.balance(&w.backend_wallet),
+        SUM_INSURED * 4_200 / 10_000
+    );
+    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
+    assert!(w.treasury.is_payout_processed(&policy_id));
+    assert_eq!(w.pr.get_report(&policy_id).damage_percentage, 4_200);
+    w.assert_solvent();
 }
