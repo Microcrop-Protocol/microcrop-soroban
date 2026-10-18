@@ -9,9 +9,11 @@
 //! - [`errors`]     — `#[contracterror]` codes (one enum per contract domain + a common one).
 //! - [`roles`]      — `AccessControl`-equivalent role registry + `require_role` guard.
 //! - [`interfaces`] — `#[contractclient]` traits for cross-contract calls (no WASM build coupling).
-//! - [`encoding`]   — the FROZEN canonical byte layout for the PKP determination signature.
+//! - [`encoding`]   — the FROZEN canonical byte layouts for the PKP determination signatures.
+//! - [`drought`]    — the `crop-drought-rdi-1.0` index recompute and evidence bounds.
 //! - [`ttl`]        — storage TTL policy: extend long-lived entries to the network maximum.
 
+pub mod drought;
 pub mod encoding;
 pub mod errors;
 pub mod interfaces;
