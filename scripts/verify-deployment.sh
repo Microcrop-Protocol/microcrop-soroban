@@ -89,6 +89,11 @@ echo "3. Roles (the ones whose absence kills the money path)"
 # not people - the set most often missed, and none of them fails at deploy time.
 role_is() {                     # role_is <label> <contract> <Role> <who> <consequence>
   local label="$1" contract="$2" role="$3" who="$4" why="$5" out
+  # Role is a #[repr(u32)] enum: the CLI takes its number (crates/shared/src/types.rs).
+  case "$role" in
+    Admin) role=0 ;; Backend) role=1 ;; Oracle) role=2 ;; Payout) role=3 ;;
+    Relayer) role=4 ;; Upgrader) role=5 ;; Minter) role=6 ;;
+  esac
   out="$(stellar contract invoke --id "$contract" --network "$NETWORK" --source "${ADMIN_KEY:-default}" \
           -- has_role --role "$role" --who "$who" 2>/dev/null | tr -d '"' | tail -1)"
   case "$out" in

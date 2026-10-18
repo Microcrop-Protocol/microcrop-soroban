@@ -185,12 +185,14 @@ step wire_treasury_pr   "$TREASURY" set_payout_receiver --payout_receiver "$PR"
 say "--- granting cross-contract roles ---"
 # Without these the deploy LOOKS fine and the money path is dead: the backend cannot create a
 # policy, PolicyManager cannot mint a certificate, and PayoutReceiver cannot draw a payout.
-step role_pm_backend    "$PM"       grant_role --role Backend --who "$BACKEND_ADDR"
-step role_tr_backend    "$TREASURY" grant_role --role Backend --who "$BACKEND_ADDR"
-step role_nft_minter    "$NFT"      grant_role --role Minter  --who "$PM"
-step role_pm_oracle     "$PM"       grant_role --role Oracle  --who "$PR"
-step role_tr_payout     "$TREASURY" grant_role --role Payout  --who "$PR"
-step role_pr_relayer    "$PR"       grant_role --role Relayer --who "$RELAYER_ADDR"
+# Role is a #[repr(u32)] contracttype enum, so the CLI takes its NUMBER, not its name:
+# Admin=0 Backend=1 Oracle=2 Payout=3 Relayer=4 Upgrader=5 Minter=6 (crates/shared/src/types.rs).
+step role_pm_backend    "$PM"       grant_role --role 1 --who "$BACKEND_ADDR"
+step role_tr_backend    "$TREASURY" grant_role --role 1 --who "$BACKEND_ADDR"
+step role_nft_minter    "$NFT"      grant_role --role 6  --who "$PM"
+step role_pm_oracle     "$PM"       grant_role --role 2  --who "$PR"
+step role_tr_payout     "$TREASURY" grant_role --role 3  --who "$PR"
+step role_pr_relayer    "$PR"       grant_role --role 4 --who "$RELAYER_ADDR"
 
 say "--- configuring the payout authority ---"
 step cfg_signer  "$PR" set_authorized_signer --pubkey "${AUTHORIZED_SIGNER_PUBKEY#0x}"
