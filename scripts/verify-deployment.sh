@@ -65,7 +65,11 @@ echo
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 dump() {
   local addr="$1" out="$2"
-  { stellar contract read --id "$addr" --network "$NETWORK" --durability persistent 2>/dev/null || true; } >  "$out"
+  # Config refs, the signer and the domain live in INSTANCE storage, which a plain persistent
+  # read does not return, and only --output json shows the instance storage map.
+  # AAAAFA== is ScVal::LedgerKeyContractInstance.
+  { stellar contract read --id "$addr" --network "$NETWORK" --durability persistent --key-xdr AAAAFA== --output json 2>/dev/null || true; } >  "$out"
+  { stellar contract read --id "$addr" --network "$NETWORK" --durability persistent 2>/dev/null || true; } >> "$out"
   { stellar contract read --id "$addr" --network "$NETWORK" --durability temporary  2>/dev/null || true; } >> "$out"
 }
 [[ -n "$NFT"      ]] && dump "$NFT"      "$TMP/nft"
