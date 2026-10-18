@@ -22,9 +22,13 @@
 //! - Instance + code: every call extends below 3 days to 10 days; the permissionless keeper
 //!   `extend_contract_ttl()` extends below 23 days to 30 days (and PolicyNft's too).
 //! - Per-policy entries (`Policy`, `PendingCounted`, the farmer index item) live until
-//!   `end_date + 30 d` (clamped to the network maximum), re-applied at activation when the
-//!   end moves; a closed policy keeps the TTL it has. `Policy` lives 60 days past every
-//!   touch while CLAIM_PENDING.
+//!   `end_date + 30 d` (clamped to the network maximum). Activation moves the end and
+//!   re-applies it to `Policy` and the shared per-farmer / per-org entries (counts included);
+//!   the farmer index item (`FarmerPolicyAt`) keeps its create-time need, because the policy
+//!   does not record its index position. The new end is later by the time the policy spent
+//!   PENDING, so the item can archive up to that long before the policy's new need; paging
+//!   it then needs a restore (it fails closed, never reads as absent). A closed policy keeps the TTL
+//!   it has. `Policy` lives 60 days past every touch while CLAIM_PENDING.
 //! - Shared per-farmer / per-org entries take the longest need of any policy that touches
 //!   them, and at least 60 days; `FarmerClaimTimes` lives 365 days past the last claim.
 //! - `extend_policy_ttl(policy_id)` is the permissionless keep-alive for one policy.
@@ -48,6 +52,14 @@ pub const MIN_SUM_INSURED: i128 = 1_000_000_000;
 /// 1,000,000 USDC in base units (7dp).
 pub const MAX_SUM_INSURED: i128 = 10_000_000_000_000;
 pub const MIN_DURATION_DAYS: u32 = 30;
+/// Shortest Drought cover that can ever pay. A drought determination settles only if the
+/// season's 110-day window (`drought::SEASON_WINDOW_SECS`) ends by `end_date`, the season
+/// starts no earlier than the UTC day cover started, and the assessment (which needs the
+/// rainfall archive, about 7 days behind real time) lands by `end_date`. So 110 + 7 = 117
+/// days is the floor below which a Drought policy takes a premium and can never pay. It is
+/// a floor, not the recommended sale: sell ~140 days (operations margin) and activate by
+/// planting.
+pub const MIN_DROUGHT_DURATION_DAYS: u32 = 117;
 pub const MAX_DURATION_DAYS: u32 = 365;
 /// Cap on a farmer's open policies (PENDING + ACTIVE) PLUS claims paid in the rolling claim
 /// window. Equal to the claim cap, so every policy a farmer pays a premium on can still pay
@@ -319,12 +331,16 @@ impl PolicyManager {
         // defence in depth). Re-opening `Comprehensive` needs an audited upgrade once a
         // cause-agnostic methodology is live again.
         //
-        // Sale-side rule (not enforced here): the drought path settles only if the season's
-        // 110-day window lies inside the cover and the policy is activated on or before the
-        // planting day, so sell at least ~140 days of cover (110 + 7-day archive lag +
-        // operations margin) and activate by planting.
+        // The drought path settles only if the season's 110-day window lies inside the cover
+        // and is assessed by `end_date` (rainfall archive ~7 days behind), so Drought cover
+        // shorter than MIN_DROUGHT_DURATION_DAYS (117) could take a premium and never pay:
+        // refused here. Sale-side rule (not enforced): sell ~140 days of cover (operations
+        // margin) and activate on or before the planting day.
         if coverage_type != CoverageType::Drought {
             panic_with_error!(&env, PolicyError::CoverageNotOffered);
+        }
+        if duration_days < MIN_DROUGHT_DURATION_DAYS {
+            panic_with_error!(&env, PolicyError::InvalidDuration);
         }
 
         // Cap open policies (ACTIVE + PENDING) PLUS claims already paid in the rolling window.
@@ -463,17 +479,15 @@ impl PolicyManager {
         // Move the farmer's slot PENDING -> ACTIVE.
         Self::set_farmer_active_count(&env, &policy.farmer, current_active + 1, policy.end_date);
         Self::release_pending_slot(&env, policy_id, &policy.farmer, policy.end_date);
-        // The end moved: the org's exposure entry must outlive the new end too.
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::OrgOutstanding(policy.org.clone()))
-        {
-            ttl::extend_shared(
-                &env,
-                &DataKey::OrgOutstanding(policy.org.clone()),
-                Some(policy.end_date),
-            );
+        // The end moved: the org's exposure entry and the farmer's index count must outlive
+        // the new end too.
+        for key in [
+            DataKey::OrgOutstanding(policy.org.clone()),
+            DataKey::FarmerPolicyCount(policy.farmer.clone()),
+        ] {
+            if env.storage().persistent().has(&key) {
+                ttl::extend_shared(&env, &key, Some(policy.end_date));
+            }
         }
 
         // (The org's outstanding exposure was already counted at create_policy.)

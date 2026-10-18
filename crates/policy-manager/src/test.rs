@@ -17,7 +17,8 @@ use microcrop_shared::{
 
 use crate::{
     PolicyManager, PolicyManagerClient, CLAIM_WINDOW_SECS, MAX_ACTIVE_POLICIES_PER_FARMER,
-    MAX_PAGE_SIZE, MAX_SUM_INSURED, MIN_SUM_INSURED, SECONDS_PER_DAY,
+    MAX_PAGE_SIZE, MAX_SUM_INSURED, MIN_DROUGHT_DURATION_DAYS, MIN_DURATION_DAYS, MIN_SUM_INSURED,
+    SECONDS_PER_DAY,
 };
 
 /// Insured plot near Nairobi, degrees x 1e6.
@@ -132,9 +133,9 @@ fn create_default(c: &Ctx) -> u64 {
         &1u64, // plot_id
         &PLOT_LAT_E6,
         &PLOT_LON_E6,
-        &MIN_SUM_INSURED, // sum_insured (100 USDC)
-        &100_000_000i128, // premium (10 USDC)
-        &30u32,           // duration_days
+        &MIN_SUM_INSURED,           // sum_insured (100 USDC)
+        &100_000_000i128,           // premium (10 USDC)
+        &MIN_DROUGHT_DURATION_DAYS, // duration_days
         &CoverageType::Drought,
         &c.org,
     )
@@ -184,7 +185,10 @@ fn create_activate_claim_happy_path() {
     assert_eq!(p.sum_insured, MIN_SUM_INSURED);
     assert_eq!(p.org, c.org);
     // Coverage window: end == start + 30 days.
-    assert_eq!(p.end_date, p.start_date + 30 * SECONDS_PER_DAY);
+    assert_eq!(
+        p.end_date,
+        p.start_date + MIN_DROUGHT_DURATION_DAYS as u64 * SECONDS_PER_DAY
+    );
     // PENDING policy is not yet active, but its org exposure is counted from creation.
     assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
     assert_eq!(
@@ -229,7 +233,7 @@ fn create_rejects_sum_too_low() {
         &PLOT_LON_E6,
         &(MIN_SUM_INSURED - 1),
         &100_000_000i128,
-        &30u32,
+        &MIN_DROUGHT_DURATION_DAYS,
         &CoverageType::Drought,
         &c.org,
     );
@@ -247,7 +251,7 @@ fn create_rejects_sum_too_high() {
         &PLOT_LON_E6,
         &(MAX_SUM_INSURED + 1),
         &100_000_000i128,
-        &30u32,
+        &MIN_DROUGHT_DURATION_DAYS,
         &CoverageType::Drought,
         &c.org,
     );
@@ -265,7 +269,7 @@ fn create_rejects_zero_premium() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &0i128,
-        &30u32,
+        &MIN_DROUGHT_DURATION_DAYS,
         &CoverageType::Drought,
         &c.org,
     );
@@ -305,6 +309,47 @@ fn create_rejects_bad_duration() {
     assert_err(res, PolicyError::InvalidDuration as u32);
 }
 
+/// Audit (drought-path review, finding 3): Drought cover shorter than the 110-day season
+/// window plus the 7-day rainfall-archive lag takes a premium and can never settle, so it is
+/// refused at sale even though it is inside the generic 30..=365 day range.
+#[test]
+fn create_rejects_drought_cover_too_short_to_pay() {
+    let c = setup();
+    for days in [MIN_DURATION_DAYS, 110u32, MIN_DROUGHT_DURATION_DAYS - 1] {
+        let res = c.client.try_create_policy(
+            &c.backend,
+            &c.farmer,
+            &1u64,
+            &PLOT_LAT_E6,
+            &PLOT_LON_E6,
+            &MIN_SUM_INSURED,
+            &100_000_000i128,
+            &days,
+            &CoverageType::Drought,
+            &c.org,
+        );
+        assert_err(res, PolicyError::InvalidDuration as u32);
+    }
+    // The floor itself is accepted.
+    let id = c.client.create_policy(
+        &c.backend,
+        &c.farmer,
+        &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
+        &MIN_SUM_INSURED,
+        &100_000_000i128,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
+        &c.org,
+    );
+    let p = c.client.get_policy(&id);
+    assert_eq!(
+        p.end_date - p.start_date,
+        MIN_DROUGHT_DURATION_DAYS as u64 * SECONDS_PER_DAY
+    );
+}
+
 #[test]
 fn create_enforces_open_policy_cap() {
     let c = setup();
@@ -322,7 +367,7 @@ fn create_enforces_open_policy_cap() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
+        &MIN_DROUGHT_DURATION_DAYS,
         &CoverageType::Drought,
         &c.org,
     );
@@ -341,7 +386,7 @@ fn create_requires_backend_role() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
+        &MIN_DROUGHT_DURATION_DAYS,
         &CoverageType::Drought,
         &c.org,
     );
@@ -401,7 +446,7 @@ fn cancel_pending_releases_slot() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
+        &MIN_DROUGHT_DURATION_DAYS,
         &CoverageType::Drought,
         &c.org,
     );
@@ -536,7 +581,7 @@ fn create_counts_recent_claims_against_the_open_cap() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
+        &MIN_DROUGHT_DURATION_DAYS,
         &CoverageType::Drought,
         &c.org,
     );
@@ -569,7 +614,7 @@ fn activate_without_nft_set_reverts() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
+        &MIN_DROUGHT_DURATION_DAYS,
         &CoverageType::Drought,
         &org,
     );
@@ -601,7 +646,7 @@ fn sum_insured_bounds_are_seven_decimal_usdc() {
             &PLOT_LON_E6,
             &sum,
             &100_000_000i128,
-            &30u32,
+            &MIN_DROUGHT_DURATION_DAYS,
             &CoverageType::Drought,
             &c.org,
         )
@@ -878,7 +923,7 @@ fn stale_pending_policy_expires_and_releases_exposure_once() {
             &PLOT_LON_E6,
             &MIN_SUM_INSURED,
             &100_000_000i128,
-            &30u32,
+            &MIN_DROUGHT_DURATION_DAYS,
             &CoverageType::Drought,
             &c.org,
         ),
@@ -1027,7 +1072,7 @@ fn role_grant_ttl_is_set_on_grant_and_extended_on_use() {
             &PLOT_LON_E6,
             &MIN_SUM_INSURED,
             &100_000_000i128,
-            &30u32,
+            &MIN_DROUGHT_DURATION_DAYS,
             &CoverageType::Drought,
             &Address::generate(&env),
         )
@@ -1071,7 +1116,7 @@ fn create_rejects_out_of_range_coordinates() {
             &lon,
             &MIN_SUM_INSURED,
             &100_000_000i128,
-            &30u32,
+            &MIN_DROUGHT_DURATION_DAYS,
             &CoverageType::Drought,
             &c.org,
         )
@@ -1154,14 +1199,14 @@ mod rent {
     #[test]
     fn policy_entries_live_until_end_date_plus_grace() {
         let c = ctx();
-        let id = create(&c, &c.farmer, 90);
-        // Per-policy: 90 days of cover + 30 days of grace.
+        let id = create(&c, &c.farmer, 120);
+        // Per-policy: 120 days of cover + 30 days of grace.
         for k in [
             DataKey::Policy(id),
             DataKey::PendingCounted(id),
             DataKey::FarmerPolicyAt(c.farmer.clone(), 0),
         ] {
-            assert_eq!(ttl(&c, &k), 120 * DAY_LEDGERS);
+            assert_eq!(ttl(&c, &k), 150 * DAY_LEDGERS);
         }
         // Shared per-farmer / per-org: the same need here.
         for k in [
@@ -1169,7 +1214,7 @@ mod rent {
             DataKey::FarmerPendingCount(c.farmer.clone()),
             DataKey::OrgOutstanding(c.org.clone()),
         ] {
-            assert_eq!(ttl(&c, &k), 120 * DAY_LEDGERS);
+            assert_eq!(ttl(&c, &k), 150 * DAY_LEDGERS);
         }
         // A 365-day policy's need (395 days) clamps to the network maximum.
         let long = create(&c, &Address::generate(&c.env), 365);
@@ -1182,50 +1227,65 @@ mod rent {
     #[test]
     fn activation_re_extends_to_the_new_end_date() {
         let c = ctx();
-        let id = create(&c, &c.farmer, 30);
-        assert_eq!(ttl(&c, &DataKey::Policy(id)), 60 * DAY_LEDGERS);
+        let id = create(&c, &c.farmer, 120);
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), 150 * DAY_LEDGERS);
         advance(&c, 20);
-        assert_eq!(ttl(&c, &DataKey::Policy(id)), 40 * DAY_LEDGERS);
-        // Activation moves end_date to now + 30 d: the entry needs 60 days again.
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), 130 * DAY_LEDGERS);
+        // Activation moves end_date to now + 120 d: the entry needs 150 days again.
         activate_default(&c, id);
-        assert_eq!(ttl(&c, &DataKey::Policy(id)), 60 * DAY_LEDGERS);
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), 150 * DAY_LEDGERS);
+        // The shared per-farmer / per-org entries follow the new end, the index count too.
+        for k in [
+            DataKey::FarmerActiveCount(c.farmer.clone()),
+            DataKey::FarmerPolicyCount(c.farmer.clone()),
+            DataKey::OrgOutstanding(c.org.clone()),
+        ] {
+            assert_eq!(ttl(&c, &k), 150 * DAY_LEDGERS);
+        }
+        // The index item keeps its create-time need (the policy does not record its index
+        // position): short by the 20 days the policy spent PENDING.
         assert_eq!(
-            ttl(&c, &DataKey::FarmerActiveCount(c.farmer.clone())),
-            60 * DAY_LEDGERS
-        );
-        assert_eq!(
-            ttl(&c, &DataKey::OrgOutstanding(c.org.clone())),
-            60 * DAY_LEDGERS
+            ttl(&c, &DataKey::FarmerPolicyAt(c.farmer.clone(), 0)),
+            130 * DAY_LEDGERS
         );
     }
 
     #[test]
     fn shared_entries_keep_the_longest_need() {
         let c = ctx();
-        create(&c, &c.farmer, 120);
+        create(&c, &c.farmer, 140);
         let k = DataKey::OrgOutstanding(c.org.clone());
-        assert_eq!(ttl(&c, &k), 150 * DAY_LEDGERS);
+        assert_eq!(ttl(&c, &k), 170 * DAY_LEDGERS);
         // A shorter policy of the same org and farmer never shortens it.
-        create(&c, &c.farmer, 30);
-        assert_eq!(ttl(&c, &k), 150 * DAY_LEDGERS);
+        create(&c, &c.farmer, MIN_DROUGHT_DURATION_DAYS);
+        assert_eq!(ttl(&c, &k), 170 * DAY_LEDGERS);
         assert_eq!(
             ttl(&c, &DataKey::FarmerPolicyCount(c.farmer.clone())),
-            150 * DAY_LEDGERS
+            170 * DAY_LEDGERS
         );
     }
 
     #[test]
     fn a_closed_policy_keeps_its_ttl_and_a_pending_claim_gets_sixty_days() {
         let c = ctx();
-        let id = create(&c, &c.farmer, 120);
+        let id = create(&c, &c.farmer, 140);
         activate_default(&c, id);
         advance(&c, 10);
         c.client.mark_claim_pending(&c.oracle, &id);
-        // CLAIM_PENDING: the pending target (it may outlive end_date while it waits).
-        assert_eq!(ttl(&c, &DataKey::Policy(id)), 140 * DAY_LEDGERS);
-        let short = create(&c, &Address::generate(&c.env), 30);
+        // CLAIM_PENDING with more than 30 days left: left as it is.
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), 160 * DAY_LEDGERS);
+        let short = create(&c, &Address::generate(&c.env), MIN_DROUGHT_DURATION_DAYS);
         activate_default(&c, short);
+        for _ in 0..5 {
+            advance(&c, 20);
+        }
+        advance(&c, 16);
+        // One day before the end: end + 30 d is 31 days away.
         c.client.mark_claim_pending(&c.oracle, &short);
+        assert_eq!(ttl(&c, &DataKey::Policy(short)), 31 * DAY_LEDGERS);
+        // While it waits past the end, the keeper gives it the pending target.
+        advance(&c, 2);
+        c.client.extend_policy_ttl(&short);
         assert_eq!(ttl(&c, &DataKey::Policy(short)), PENDING_TARGET_LEDGERS);
         // Claimed: left as it is.
         let before = ttl(&c, &DataKey::Policy(short));
@@ -1256,12 +1316,12 @@ mod rent {
             NETWORK_MAX_ENTRY_TTL_LEDGERS
         );
 
-        // A 30-day policy: extend_policy_ttl gives it end + 30 d, not the maximum.
+        // A 117-day policy: extend_policy_ttl gives it end + 30 d, not the maximum.
         c.env.mock_all_auths();
-        let short = create(&c, &Address::generate(&c.env), 30);
+        let short = create(&c, &Address::generate(&c.env), MIN_DROUGHT_DURATION_DAYS);
         advance(&c, 20);
         c.client.extend_policy_ttl(&short);
-        assert_eq!(ttl(&c, &DataKey::Policy(short)), 40 * DAY_LEDGERS);
+        assert_eq!(ttl(&c, &DataKey::Policy(short)), 127 * DAY_LEDGERS);
 
         assert_err(
             c.client.try_extend_policy_ttl(&999),
@@ -1287,7 +1347,7 @@ mod rent {
         assert_eq!(inst(&nft), KEEPER_TARGET_LEDGERS);
         c.env.mock_all_auths();
         // User calls leave a 30-day TTL alone.
-        let id = create(&c, &c.farmer, 30);
+        let id = create(&c, &c.farmer, MIN_DROUGHT_DURATION_DAYS);
         activate_default(&c, id);
         assert_eq!(inst(&c.client.address), KEEPER_TARGET_LEDGERS);
         // The keeper is a no-op above 23 days.
@@ -1321,7 +1381,7 @@ fn create_rejects_cover_the_methodology_cannot_settle() {
             &PLOT_LON_E6,
             &MIN_SUM_INSURED,
             &100_000_000i128,
-            &30u32,
+            &MIN_DROUGHT_DURATION_DAYS,
             &coverage,
             &c.org,
         );
