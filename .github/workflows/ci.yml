@@ -81,16 +81,22 @@ jobs:
         with:
           version: ${{ env.STELLAR_CLI_VERSION }}
 
+      # stellar-cli 25.1.0 has no --locked. Fail here instead if Cargo.lock is stale, so the
+      # build below resolves exactly the committed lockfile, as the release build will.
+      - name: Cargo.lock is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # --optimize as release.yml passes it: stellar-cli 25.1.0 does not optimize by default.
       - name: Build the four release contracts (default-members)
         run: |
-          stellar contract build --locked --out-dir dist \
+          stellar contract build --optimize --out-dir dist \
             --meta "source_repo=github:${GITHUB_REPOSITORY}"
 
       # Built so CI proves it compiles. It is testnet evidence only and is never released:
       # release.yml has no job for it.
       - name: Build the testnet fixture (not released)
         run: |
-          stellar contract build --locked --package microcrop-testnet-policy-fixture \
+          stellar contract build --optimize --package microcrop-testnet-policy-fixture \
             --out-dir dist-testnet-only
 
       - name: Check the SEP-55 source_repo metadata
