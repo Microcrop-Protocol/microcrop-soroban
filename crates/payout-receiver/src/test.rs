@@ -427,6 +427,15 @@ fn satellite_only_renormalizes_to_full_weight() {
 
 // ============ Access + lifecycle guards ============
 
+/// A rejected submission leaves no trace: no paid marker, no claim, no obligation. (The
+/// adapter mock's counter would roll back with the reverted call anyway; the paid marker and
+/// the PolicyManager's claim count are the checks that matter.)
+fn assert_nothing_recorded(f: &Fixture) {
+    assert!(!f.client.is_policy_paid(&1));
+    assert_eq!(f.pm.claimed_calls(), 0);
+    assert_eq!(f.adapter.calls(), 0);
+}
+
 #[test]
 fn unauthorized_relayer_rejected() {
     let f = setup();
@@ -438,6 +447,7 @@ fn unauthorized_relayer_rejected() {
         .client
         .try_submit_determination(&stranger, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(CommonError::Unauthorized.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -480,6 +490,7 @@ fn paused_blocks_submit() {
     let (sig, recid) = sign(&env, &sk, &pr_addr, &domain, &d);
     let res = client.try_submit_determination(&relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PausedError::ContractPaused.into())));
+    assert!(!client.is_policy_paid(&1));
 }
 
 // ============ Signature / domain binding ============
@@ -496,6 +507,7 @@ fn wrong_signer_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidSignature.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -510,6 +522,7 @@ fn wrong_network_domain_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidSignature.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -524,6 +537,7 @@ fn wrong_contract_address_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidSignature.into())));
+    assert_nothing_recorded(&f);
 }
 
 // ============ Bounds / invariant guards ============
@@ -538,6 +552,7 @@ fn damage_exceeds_maximum_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::DamageExceedsMaximum.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -550,6 +565,7 @@ fn subscore_out_of_range_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::SubScoreOutOfRange.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -562,6 +578,7 @@ fn invalid_weather_flag_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidWeatherFlag.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -575,6 +592,7 @@ fn weather_flag_damage_mismatch_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::WeatherFlagDamageMismatch.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -588,6 +606,7 @@ fn invalid_weighted_damage_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidWeightedDamage.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -604,6 +623,7 @@ fn below_threshold_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::DamageBelowThreshold.into())));
+    assert_nothing_recorded(&f);
 }
 
 // ============ Policy binding / payout math ============
@@ -620,6 +640,7 @@ fn sum_insured_mismatch_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::SumInsuredMismatch.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -632,6 +653,7 @@ fn wrong_payout_amount_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::InvalidPayoutCalculation.into())));
+    assert_nothing_recorded(&f);
 }
 
 // ============ Freshness ============
@@ -646,6 +668,7 @@ fn future_report_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::ReportInFuture.into())));
+    assert_nothing_recorded(&f);
 }
 
 #[test]
@@ -658,6 +681,7 @@ fn stale_report_rejected() {
         .client
         .try_submit_determination(&f.relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::ReportTooOld.into())));
+    assert_nothing_recorded(&f);
 }
 
 // ============ Farmer limit ============
@@ -704,6 +728,8 @@ fn farmer_over_claim_limit_rejected() {
     let (sig, recid) = sign(&env, &sk, &pr_addr, &domain, &d);
     let res = client.try_submit_determination(&relayer, &d, &sig, &recid);
     assert_eq!(res, Err(Ok(PayoutError::FarmerClaimLimitExceeded.into())));
+    assert!(!client.is_policy_paid(&1));
+    assert_eq!(pmc.claimed_calls(), 0);
 }
 
 // ============ Replay ============
@@ -825,6 +851,27 @@ fn determination_for_another_location_is_rejected() {
         Err(Ok(PayoutError::PlotLocationMismatch.into()))
     );
     assert_eq!(f.adapter.calls(), 0);
+}
+
+#[test]
+fn extreme_coordinates_are_a_plot_mismatch_not_a_trap() {
+    let f = setup();
+    for (lat, lon) in [
+        (i128::MIN, PLOT_LON_E6 as i128),
+        (PLOT_LAT_E6 as i128, i128::MIN),
+        (i128::MAX, PLOT_LON_E6 as i128),
+    ] {
+        let mut d = base_det();
+        d.latitude_e6 = lat;
+        d.longitude_e6 = lon;
+        let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+        assert_eq!(
+            f.client
+                .try_submit_determination(&f.relayer, &d, &sig, &recid),
+            Err(Ok(PayoutError::PlotLocationMismatch.into()))
+        );
+    }
+    assert_nothing_recorded(&f);
 }
 
 #[test]
