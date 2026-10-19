@@ -1,0 +1,17 @@
+[package]
+name = "microcrop-settlement-adapter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "MicroCrop SettlementAdapter — a non-custodial ledger of verified payout obligations and attestations of their funding and settlement. Holds no tokens."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+microcrop-shared = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+proptest = "1"
