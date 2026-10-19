@@ -12,7 +12,7 @@
 //!                 ─▶ sign a DroughtDetermination with a real k256 key
 //!                 ─▶ submit_drought_determination (real secp256k1_recover)
 //!                 ─▶ SettlementAdapter.record_obligation  (Owed; no token anywhere)
-//!                 ─▶ mark_funded (Funder) ─▶ mark_settled (org)  (attestations)
+//!                 ─▶ mark_funded (Funder) ─▶ mark_settled (Funder)  (attestations)
 //! ```
 //!
 //! The payout authority is a genuine secp256k1 signature over the exact digest the
@@ -48,7 +48,7 @@ use k256::ecdsa::SigningKey;
 
 use microcrop_shared::{
     encoding::{determination_digest, drought_determination_digest, DROUGHT_PARAMS_HASH_RDI_1_0},
-    errors::{AdapterError, PayoutError, PolicyError},
+    errors::{AdapterError, CommonError, PayoutError, PolicyError},
     types::{
         CoverageType, CropDetermination, DroughtDetermination, MethodologyKind, ObligationStatus,
         PolicyStatus, Role,
@@ -360,22 +360,38 @@ fn full_lifecycle_determination_to_obligation_to_settlement() {
     assert_eq!(ob.status, ObligationStatus::Funded);
     assert_eq!(ob.funded_by, Some(w.backend.clone()));
 
-    // Settled: the org itself attests, with its own signature and nothing else.
+    // The org owes the obligation, so even signing for itself it cannot attest settlement.
     let rs = reference(&w.env, 0x51);
+    assert_eq!(
+        w.adapter
+            .mock_auths(&[MockAuth {
+                address: &w.org,
+                invoke: &MockAuthInvoke {
+                    contract: &w.adapter.address,
+                    fn_name: "mark_settled",
+                    args: (w.org.clone(), id, rs.clone()).into_val(&w.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_mark_settled(&w.org, &id, &rs),
+        Err(Ok(CommonError::Unauthorized.into()))
+    );
+
+    // Settled: the Funder attests, with its own signature and nothing else.
     let ob = w
         .adapter
         .mock_auths(&[MockAuth {
-            address: &w.org,
+            address: &w.backend,
             invoke: &MockAuthInvoke {
                 contract: &w.adapter.address,
                 fn_name: "mark_settled",
-                args: (w.org.clone(), id, rs.clone()).into_val(&w.env),
+                args: (w.backend.clone(), id, rs.clone()).into_val(&w.env),
                 sub_invokes: &[],
             },
         }])
-        .mark_settled(&w.org, &id, &rs);
+        .mark_settled(&w.backend, &id, &rs);
     assert_eq!(ob.status, ObligationStatus::Settled);
-    assert_eq!(ob.settled_by, Some(w.org.clone()));
+    assert_eq!(ob.settled_by, Some(w.backend.clone()));
     assert_eq!(ob.funding_reference, Some(rf));
     assert_eq!(ob.settlement_reference, Some(rs));
     assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
@@ -915,6 +931,15 @@ mod wasm {
             )
         })
     }
+
+    /// The unoptimized build of the same contract: the same code under a different WASM hash,
+    /// so an upgrade to it is a real code swap.
+    pub fn plain_bytes(name: &str) -> std::vec::Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/wasm32v1-none/release")
+            .join(std::format!("{name}.wasm"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
 }
 
 /// The core flow against the compiled WASM (testing.md, "Cross-contract interactions tested
@@ -999,9 +1024,54 @@ fn wasm_lane_full_flow() {
     assert_eq!(ob.amount, SUM_INSURED * 4_200 / 10_000);
     assert_eq!(pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
     adapter.mark_funded(&backend, &1, &reference(&env, 0xF1));
-    let ob = adapter.mark_settled(&org, &1, &reference(&env, 0x51));
+    let ob = adapter.mark_settled(&backend, &1, &reference(&env, 0x51));
     assert_eq!(ob.status, ObligationStatus::Settled);
     // Replay is refused by the compiled contract too.
+    assert!(pr
+        .try_submit_drought_determination(&relayer, &d, &sig, &recid)
+        .is_err());
+
+    // Happy-path upgrade: the Upgrader swaps each money-path contract to a different WASM hash
+    // (the unoptimized build of the same code) and every piece of state survives.
+    let report = pr.get_report(&policy_id);
+    let policy = pm.get_policy(&policy_id);
+    for (name, upgrade) in [
+        ("microcrop_settlement_adapter", 0u8),
+        ("microcrop_payout_receiver", 1u8),
+        ("microcrop_policy_manager", 2u8),
+    ] {
+        let hash = env
+            .deployer()
+            .upload_contract_wasm(wasm::plain_bytes(name).as_slice());
+        let stranger = Address::generate(&env);
+        match upgrade {
+            0 => {
+                assert!(adapter.try_upgrade(&stranger, &hash).is_err());
+                adapter.upgrade(&admin, &hash);
+            }
+            1 => {
+                assert!(pr.try_upgrade(&stranger, &hash).is_err());
+                pr.upgrade(&admin, &hash);
+            }
+            _ => {
+                assert!(pm.try_upgrade(&stranger, &hash).is_err());
+                pm.upgrade(&admin, &hash);
+            }
+        }
+    }
+    assert_eq!(adapter.get_obligation(&1).unwrap(), ob);
+    assert_eq!(adapter.find_obligation(&pr_addr, &policy_id), Some(1));
+    assert!(adapter.has_role(&Role::Funder, &backend));
+    assert_eq!(adapter.payout_receiver(), Some(pr_addr.clone()));
+    assert_eq!(pr.get_report(&policy_id), report);
+    assert!(pr.is_policy_paid(&policy_id));
+    assert_eq!(pm.get_policy(&policy_id), policy);
+    // The upgraded contracts still run: an identical settlement is a no-op and replay is
+    // still refused.
+    assert_eq!(
+        adapter.mark_settled(&backend, &1, &reference(&env, 0x51)),
+        ob
+    );
     assert!(pr
         .try_submit_drought_determination(&relayer, &d, &sig, &recid)
         .is_err());

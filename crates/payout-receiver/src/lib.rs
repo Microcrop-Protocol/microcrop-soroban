@@ -9,8 +9,8 @@
 //!
 //! ## Option B: no custody (2026-10-19)
 //! No token moves here or anywhere on-chain. A verified determination becomes an
-//! `Obligation` (status `Owed`) in the SettlementAdapter; the org, or the `Funder` role acting
-//! for it, later attests off-chain funding and settlement there. The adapter is admin-settable
+//! `Obligation` (status `Owed`) in the SettlementAdapter; the `Funder` role (the backend)
+//! later attests off-chain funding and settlement there. The adapter is admin-settable
 //! (`set_settlement_adapter`, bound by a handshake), so the stub can be swapped for a real
 //! FundingFacility without redeploying this contract.
 //!
@@ -163,8 +163,8 @@ pub struct DamageReportReceived {
 }
 
 /// A verified determination was recorded as an obligation in the SettlementAdapter. No
-/// payout is initiated on-chain: the org (or the Funder acting for it) settles off-chain and
-/// attests it in the adapter.
+/// payout is initiated on-chain: the org settles off-chain and the Funder attests it in the
+/// adapter.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObligationRequested {
@@ -730,10 +730,15 @@ impl PayoutReceiver {
     }
 
     /// The signed coordinates are the insured plot's, within one micro-degree per axis (321).
+    /// Checked arithmetic: an extreme coordinate (e.g. `i128::MIN`) is a mismatch, not a trap.
     fn require_plot(env: &Env, policy: &Policy, lat_e6: i128, lon_e6: i128) {
-        if (lat_e6 - policy.lat_e6 as i128).abs() > PLOT_COORD_TOLERANCE_E6
-            || (lon_e6 - policy.lon_e6 as i128).abs() > PLOT_COORD_TOLERANCE_E6
-        {
+        let off = |signed: i128, insured: i64| {
+            signed
+                .checked_sub(insured as i128)
+                .and_then(i128::checked_abs)
+                .is_none_or(|d| d > PLOT_COORD_TOLERANCE_E6)
+        };
+        if off(lat_e6, policy.lat_e6) || off(lon_e6, policy.lon_e6) {
             panic_with_error!(env, PayoutError::PlotLocationMismatch);
         }
     }

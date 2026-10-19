@@ -107,6 +107,7 @@ fn adapter_error_codes() {
         (AdapterError::ObligationAlreadySettled, 505),
         (AdapterError::InvalidReference, 506),
         (AdapterError::InvalidPayoutReceiver, 507),
+        (AdapterError::CounterOverflow, 508),
     ];
     for (e, n) in codes {
         assert_eq!(e as u32, n, "{:?}", e);

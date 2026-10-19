@@ -3,10 +3,9 @@
 //!
 //! Option B (2026-10-19): the non-custodial replacement for the per-org Treasury. After the
 //! PayoutReceiver verifies a signed determination it records here what is owed: one
-//! obligation per (PayoutReceiver, policy). The org that backs the policy, or the
-//! `Role::Funder` holder acting for it, then attests that the obligation was funded and
-//! settled off-chain (mobile money), each step identified by a 32-byte reference hash of the
-//! off-chain payment record.
+//! obligation per (PayoutReceiver, policy). The `Role::Funder` holder (the MicroCrop backend)
+//! then attests that the obligation was funded and settled off-chain (mobile money), each step
+//! identified by a 32-byte reference hash of the off-chain payment record.
 //!
 //! This is the "minimal FundingFacility/SettlementAdapter stub" of the Stellar Instaward SOW
 //! (deliverable 2): it tracks verified obligations and their funding status without pooling
@@ -16,10 +15,11 @@
 //! ## What it is not
 //! - It holds no tokens, imports no token interface and makes no cross-contract calls. The
 //!   `amount` of an obligation is a unit of account (USDC, 7dp base units), not a balance.
-//! - `Funded` and `Settled` are ATTESTATIONS, not proof of payment. Backend-onboarded orgs
-//!   have keyless addresses (derived from the org id), so in practice every transition is
-//!   made by the `Funder` role, held by the MicroCrop backend. The reference hash, the
-//!   revocable role and the events are the audit trail; nothing here proves money moved.
+//! - `Funded` and `Settled` are ATTESTATIONS, not proof of payment. Only the `Funder` role
+//!   makes them. The org is the party that owes the money, so letting it mark its own
+//!   obligation settled would be a self-waive (and, once an org held a real key, it could race
+//!   the Funder's real settlement into a 505). The reference hash, the revocable role and the
+//!   events are the audit trail; nothing here proves money moved.
 //! - It has no pause. It is not value-bearing: the worst a misuse can do is write a wrong
 //!   attestation, which a pause would not prevent and the events expose. The PayoutReceiver
 //!   keeps its pause, which stops new obligations.
@@ -32,10 +32,10 @@
 //! ## Authorisation (security.md classes 1 and 2)
 //! - `record_obligation`: `caller` must equal the PayoutReceiver stored here AND
 //!   `caller.require_auth()` (a direct call from that contract satisfies it).
-//! - `mark_funded` / `mark_settled`: `caller.require_auth()`, then `caller` must be the
-//!   obligation's `org` (loaded from storage, never from an argument) or hold `Role::Funder`.
+//! - `mark_funded` / `mark_settled`: `caller.require_auth()`, then `caller` must hold
+//!   `Role::Funder` (the org cannot mark its own obligation).
 //! - `set_payout_receiver`, `grant_role`, `revoke_role`: `Role::Admin`; `upgrade`:
-//!   `Role::Upgrader`.
+//!   `Role::Upgrader`. Role grants and revocations emit `RoleGranted` / `RoleRevoked`.
 //!
 //! ## Keying
 //! Policy ids are unique only per PolicyManager. Obligations are looked up by
@@ -69,6 +69,28 @@ use microcrop_shared::{
 pub const MAX_PAGE_SIZE: u32 = 50;
 
 // ============ Events ============
+
+/// `by` granted `role` to `who` (e.g. `Role::Funder`, the adapter's most powerful grant).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleGranted {
+    #[topic]
+    pub role: Role,
+    #[topic]
+    pub who: Address,
+    pub by: Address,
+}
+
+/// `by` revoked `role` from `who`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleRevoked {
+    #[topic]
+    pub role: Role,
+    #[topic]
+    pub who: Address,
+    pub by: Address,
+}
 
 /// The PayoutReceiver this adapter accepts obligations from was set or rotated.
 #[contractevent]
@@ -186,6 +208,12 @@ impl SettlementAdapter {
         ttl::touch_contract(&env);
         roles::require_role(&env, &caller, Role::Admin);
         roles::grant_role(&env, role, &who);
+        RoleGranted {
+            role,
+            who,
+            by: caller,
+        }
+        .publish(&env);
     }
 
     /// Revoke a role (ADMIN only).
@@ -193,6 +221,12 @@ impl SettlementAdapter {
         ttl::touch_contract(&env);
         roles::require_role(&env, &caller, Role::Admin);
         roles::revoke_role(&env, role, &who);
+        RoleRevoked {
+            role,
+            who,
+            by: caller,
+        }
+        .publish(&env);
     }
 
     /// True if `who` holds `role` here. Read-only, no auth.
@@ -256,14 +290,16 @@ impl SettlementAdapter {
             .get(&DataKey::NextObligationId)
             .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotInitialized));
         // Checked arithmetic (security.md class 5): traps rather than wrapping.
-        let next = id.checked_add(1).expect("obligation id overflow");
+        let next = id
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(&env, AdapterError::CounterOverflow));
         s.set(&DataKey::NextObligationId, &next);
 
         let count_key = DataKey::OrgObligationCount(org.clone());
         let org_index: u32 = p.get(&count_key).unwrap_or(0);
         let new_count = org_index
             .checked_add(1)
-            .expect("org obligation count overflow");
+            .unwrap_or_else(|| panic_with_error!(&env, AdapterError::CounterOverflow));
 
         let ob = Obligation {
             id,
@@ -300,8 +336,8 @@ impl SettlementAdapter {
         ob
     }
 
-    /// Attest that obligation `obligation_id` was funded. `caller` must sign and be the
-    /// obligation's org or hold `Role::Funder`. `Owed -> Funded`; repeating it with the same
+    /// Attest that obligation `obligation_id` was funded. `caller` must sign and hold
+    /// `Role::Funder`. `Owed -> Funded`; repeating it with the same
     /// reference is a no-op; a different reference is refused (504); a Settled obligation is
     /// refused (505). `reference_hash` must not be all zero (506).
     pub fn mark_funded(
@@ -342,8 +378,8 @@ impl SettlementAdapter {
         ob
     }
 
-    /// Attest that obligation `obligation_id` was settled. `caller` must sign and be the
-    /// obligation's org or hold `Role::Funder`. `Owed | Funded -> Settled` (funding may be
+    /// Attest that obligation `obligation_id` was settled. `caller` must sign and hold
+    /// `Role::Funder`. `Owed | Funded -> Settled` (funding may be
     /// implicit); repeating it with the same reference is a no-op; a different reference is
     /// refused (505). `reference_hash` must not be all zero (506).
     pub fn mark_settled(
@@ -461,7 +497,7 @@ impl SettlementAdapter {
     // ---- private ----
 
     /// Common prefix of both marks: user-path TTL, the caller's signature, a non-zero
-    /// reference, the obligation exists (503), and the caller is its org or a Funder (1).
+    /// reference, the caller holds `Role::Funder` (1), and the obligation exists (503).
     fn begin_mark(
         env: &Env,
         caller: &Address,
@@ -473,12 +509,11 @@ impl SettlementAdapter {
         if reference_hash.to_array() == [0u8; 32] {
             panic_with_error!(env, AdapterError::InvalidReference);
         }
-        let ob = Self::load(env, obligation_id);
-        // The authority is the org stored on the obligation, never a caller-supplied address.
-        if *caller != ob.org && !roles::has_role(env, Role::Funder, caller) {
+        // Funder only: the org owes the obligation, so it may not attest its own settlement.
+        if !roles::has_role(env, Role::Funder, caller) {
             panic_with_error!(env, CommonError::Unauthorized);
         }
-        ob
+        Self::load(env, obligation_id)
     }
 
     fn load(env: &Env, obligation_id: u64) -> Obligation {

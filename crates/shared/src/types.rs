@@ -267,7 +267,7 @@ pub enum ObligationStatus {
 /// A verified payout obligation, recorded by the SettlementAdapter. The adapter holds no
 /// tokens: `amount` is a unit of account (USDC, 7dp base units), not a balance.
 ///
-/// `Funded` / `Settled` are ATTESTATIONS by the obligation's org or a `Role::Funder` holder,
+/// `Funded` / `Settled` are ATTESTATIONS by a `Role::Funder` holder (never the org itself),
 /// identified by a 32-byte reference hash of an off-chain payment record. They are an
 /// audit trail, not proof of payment.
 #[contracttype]

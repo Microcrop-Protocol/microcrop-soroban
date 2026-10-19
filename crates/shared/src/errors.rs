@@ -153,4 +153,7 @@ pub enum AdapterError {
     InvalidReference = 506,
     /// `set_payout_receiver` with the adapter's own address.
     InvalidPayoutReceiver = 507,
+    /// The obligation id or an org's obligation count would overflow (unreachable in
+    /// practice; replaces a bare panic).
+    CounterOverflow = 508,
 }

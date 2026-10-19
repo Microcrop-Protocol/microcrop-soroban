@@ -28,7 +28,7 @@ use microcrop_shared::{
 
 use crate::{
     DataKey, ObligationFunded, ObligationRecorded, ObligationSettled, PayoutReceiverSet,
-    SettlementAdapter, SettlementAdapterClient, MAX_PAGE_SIZE,
+    RoleGranted, RoleRevoked, SettlementAdapter, SettlementAdapterClient, MAX_PAGE_SIZE,
 };
 
 const NOW: u64 = 1_700_000_000;
@@ -367,16 +367,17 @@ fn the_same_policy_id_from_a_rotated_receiver_is_a_distinct_obligation() {
 // ============ 11-16. marks ============
 
 #[test]
-fn the_org_and_the_funder_may_mark_and_nobody_else() {
+fn only_the_funder_may_mark() {
     let f = setup();
     record(&f, 1);
     record(&f, 2);
     let r = reference(&f.env, 0xF1);
 
-    // Strangers, the PayoutReceiver and another org are refused.
+    // The org itself (it owes the money: a self-mark would be a waive), strangers, the
+    // PayoutReceiver, another org and the admin are all refused.
     let stranger = Address::generate(&f.env);
     let other_org = Address::generate(&f.env);
-    for who in [&stranger, &f.pr, &other_org, &f.admin] {
+    for who in [&f.org, &stranger, &f.pr, &other_org, &f.admin] {
         contract_err(
             f.c.try_mark_funded(who, &1, &r),
             CommonError::Unauthorized as u32,
@@ -386,38 +387,56 @@ fn the_org_and_the_funder_may_mark_and_nobody_else() {
             CommonError::Unauthorized as u32,
         );
     }
-
-    // The org needs its own signature.
-    host_auth_err(
+    // The org signing exactly its own mark_settled is still refused, and nothing changed.
+    contract_err(
         f.c.mock_auths(&[MockAuth {
-            address: &f.funder,
+            address: &f.org,
             invoke: &MockAuthInvoke {
                 contract: &f.id,
-                fn_name: "mark_funded",
+                fn_name: "mark_settled",
                 args: (f.org.clone(), 1u64, r.clone()).into_val(&f.env),
                 sub_invokes: &[],
             },
         }])
-        .try_mark_funded(&f.org, &1, &r),
+        .try_mark_settled(&f.org, &1, &r),
+        CommonError::Unauthorized as u32,
+    );
+    assert_eq!(
+        f.c.get_obligation(&1).unwrap().status,
+        ObligationStatus::Owed
     );
 
-    // The org, signing for exactly this call.
-    let args = (f.org.clone(), 1u64, r.clone()).into_val(&f.env);
-    let ob =
+    // The Funder needs its own signature: the org's does not stand in for it.
+    host_auth_err(
         f.c.mock_auths(&[MockAuth {
             address: &f.org,
             invoke: &MockAuthInvoke {
                 contract: &f.id,
                 fn_name: "mark_funded",
-                args: (f.org.clone(), 1u64, r.clone()).into_val(&f.env),
+                args: (f.funder.clone(), 1u64, r.clone()).into_val(&f.env),
                 sub_invokes: &[],
             },
         }])
-        .mark_funded(&f.org, &1, &r);
+        .try_mark_funded(&f.funder, &1, &r),
+    );
+
+    // The Funder, signing for exactly this call.
+    let args = (f.funder.clone(), 1u64, r.clone()).into_val(&f.env);
+    let ob =
+        f.c.mock_auths(&[MockAuth {
+            address: &f.funder,
+            invoke: &MockAuthInvoke {
+                contract: &f.id,
+                fn_name: "mark_funded",
+                args: (f.funder.clone(), 1u64, r.clone()).into_val(&f.env),
+                sub_invokes: &[],
+            },
+        }])
+        .mark_funded(&f.funder, &1, &r);
     assert_eq!(
         f.env.auths(),
         std::vec![(
-            f.org.clone(),
+            f.funder.clone(),
             AuthorizedInvocation {
                 function: AuthorizedFunction::Contract((
                     f.id.clone(),
@@ -429,7 +448,7 @@ fn the_org_and_the_funder_may_mark_and_nobody_else() {
         )]
     );
     assert_eq!(ob.status, ObligationStatus::Funded);
-    assert_eq!(ob.funded_by, Some(f.org.clone()));
+    assert_eq!(ob.funded_by, Some(f.funder.clone()));
     assert_eq!(ob.funded_at, NOW);
     assert_eq!(ob.funding_reference, Some(r.clone()));
 
@@ -471,9 +490,11 @@ fn funding_twice_is_a_no_op_with_the_same_reference_and_refused_with_another() {
     let again = f.c.mark_funded(&f.funder, &1, &r);
     assert_eq!(again, first);
     assert_eq!(f.env.events().all().events().len(), 0);
-    // Even the org cannot overwrite the funder's reference.
+    // Not even a second Funder can overwrite the first one's reference.
+    let funder2 = Address::generate(&f.env);
+    f.c.grant_role(&f.admin, &Role::Funder, &funder2);
     contract_err(
-        f.c.try_mark_funded(&f.org, &1, &reference(&f.env, 0xF2)),
+        f.c.try_mark_funded(&funder2, &1, &reference(&f.env, 0xF2)),
         504,
     );
     assert_eq!(f.c.get_obligation(&1).unwrap(), first);
@@ -507,10 +528,10 @@ fn settlement_from_owed_and_from_funded_and_its_immutability() {
         std::vec![expected.to_xdr(&f.env, &f.id)]
     );
 
-    // Owed -> Funded -> Settled, by the org.
+    // Owed -> Funded -> Settled.
     f.c.mark_funded(&f.funder, &2, &rf);
     f.env.ledger().set_timestamp(NOW + 100);
-    let s2 = f.c.mark_settled(&f.org, &2, &rs);
+    let s2 = f.c.mark_settled(&f.funder, &2, &rs);
     assert_eq!(s2.status, ObligationStatus::Settled);
     assert_eq!(s2.funding_reference, Some(rf.clone()));
     assert_eq!(s2.funded_at, NOW);
@@ -554,6 +575,33 @@ fn a_revoked_funder_is_refused() {
         f.c.try_revoke_role(&f.funder, &Role::Admin, &f.admin),
         CommonError::Unauthorized as u32,
     );
+}
+
+#[test]
+fn role_grants_and_revocations_emit_events() {
+    let f = setup();
+    let who = Address::generate(&f.env);
+    f.c.grant_role(&f.admin, &Role::Funder, &who);
+    assert_eq!(
+        f.env.events().all(),
+        std::vec![RoleGranted {
+            role: Role::Funder,
+            who: who.clone(),
+            by: f.admin.clone(),
+        }
+        .to_xdr(&f.env, &f.id)]
+    );
+    f.c.revoke_role(&f.admin, &Role::Funder, &who);
+    assert_eq!(
+        f.env.events().all(),
+        std::vec![RoleRevoked {
+            role: Role::Funder,
+            who: who.clone(),
+            by: f.admin.clone(),
+        }
+        .to_xdr(&f.env, &f.id)]
+    );
+    assert!(!f.c.has_role(&Role::Funder, &who));
 }
 
 // ============ 17. receiver binding ============
@@ -879,7 +927,7 @@ mod props {
                     if now.status != ObligationStatus::Owed {
                         let by = if now.status == ObligationStatus::Settled { now.settled_by.clone() } else { now.funded_by.clone() };
                         let by = by.unwrap();
-                        prop_assert!(by == now.org || by == f.funder, "marked by an unauthorized caller");
+                        prop_assert!(by == f.funder, "marked by someone other than the Funder");
                     }
                     seen.insert(id, now);
                 }
