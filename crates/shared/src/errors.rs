@@ -54,58 +54,10 @@ pub enum PolicyError {
     CoverageNotOffered = 118,
 }
 
-/// `Treasury` domain errors. Range 200..=299.
-#[contracterror]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u32)]
-pub enum TreasuryError {
-    ZeroAddress = 200,
-    ZeroAmount = 201,
-    PremiumAlreadyReceived = 202,
-    PayoutAlreadyProcessed = 203,
-    InsufficientOrgReserve = 204,
-    FeeTooHigh = 205,
-    InsufficientBalance = 206,
-    PremiumNotReceived = 207,
-    ExceedsRecoverableSurplus = 208,
-    OrgNotResolved = 209,
-    PolicyManagerNotSet = 210,
-    NotPayoutReceiver = 211,
-    BpsTooHigh = 212,
-    WouldBreachReserve = 213,
-    NoFeesToWithdraw = 214,
-    // 215 / 216 are the crate-local `treasury::PausedError` codes; do not reuse them here.
-    /// The USDC token passed to the constructor does not report `decimals() == 7`. Every
-    /// amount constant and the Lit signer's scaling assume 7dp (Stellar Asset Contract).
-    UsdcDecimalsMismatch = 217,
-    /// `set_org_reserve_ratio_bps` below `MIN_RESERVE_RATIO_BPS` (30%): the smallest valid
-    /// payout is 30% of cover, so a lower floor lets the org withdraw the money a claim needs.
-    ReserveRatioTooLow = 218,
-    /// `receive_premium` for a policy that is not PENDING or ACTIVE (cancelled, expired,
-    /// claimed or claim-pending): crediting it would hand the org withdrawable surplus.
-    PolicyNotOpenForPremium = 219,
-    /// `receive_premium` for an ACTIVE policy whose coverage already ended (`now > end_date`).
-    PolicyCoverageEnded = 220,
-    /// `settle_pending_payout` for a policy with no recorded pending payout (never recorded,
-    /// or already settled).
-    NoPendingPayout = 221,
-    /// `request_payout` for a policy that already has a recorded pending payout.
-    PayoutAlreadyPending = 222,
-    /// `receive_premium` with an amount other than the policy's recorded `premium`.
-    PremiumAmountMismatch = 223,
-    /// `settle_pending_payout` for a pending payout that is not at the head of its org's
-    /// first-in-first-out queue. Settle `pending_payout_head(org)` first.
-    NotPendingQueueHead = 224,
-    /// `settle_pending_payout` could not transfer USDC to the backend wallet (trustline
-    /// missing or deauthorized by the issuer). The claim stays recorded; rotate the wallet
-    /// with `set_backend_wallet` and settle again.
-    PayoutTransferFailed = 225,
-    /// `set_payout_receiver` while any org has an unsettled pending payout. Each pending
-    /// claim's marker lives in the current PayoutReceiver, so switching would strand it and,
-    /// with first-in-first-out settlement, block the org's whole queue. Settle first, or
-    /// upgrade the PayoutReceiver in place.
-    PayoutsStillPending = 226,
-}
+// 200..=299 were the `Treasury` domain errors (and 215/216 its crate-local pause codes).
+// The Treasury was removed by Option B (SettlementAdapter, 2026-10-19). The range is retired
+// with it: never reuse any code in 200..=299, so a log line from a Treasury-era deployment
+// can never be misread.
 
 /// `PayoutReceiver` domain errors. Range 300..=399. Order mirrors the validation steps.
 #[contracterror]
@@ -131,7 +83,8 @@ pub enum PayoutError {
     DeterminationAlreadyConsumed = 316,
     InvalidSignature = 317,
     // 318 is the crate-local `payout_receiver::PausedError::ContractPaused`.
-    /// `settle_pending_claim` for a policy with no claim awaiting funding.
+    /// Retired with the Treasury (was `settle_pending_claim` with nothing pending). Kept so
+    /// the code stays reserved; never raised, never reuse 319.
     NoPendingClaim = 319,
     /// The policy's coverage type is not one the submitted methodology settles: CROP_DAMAGE
     /// settles `Comprehensive` only, CROP_DROUGHT settles `Drought` only (see `CoverageType`).
@@ -155,6 +108,13 @@ pub enum PayoutError {
     EvidenceOutsideCoverWindow = 326,
     /// `assessed_at` is before the end of the 110-day measurement window.
     SeasonNotComplete = 327,
+    /// `set_settlement_adapter` with an address that is not a SettlementAdapter bound to this
+    /// PayoutReceiver (`adapter.payout_receiver() != this`), or with this contract itself.
+    SettlementAdapterNotBound = 328,
+    /// The SettlementAdapter returned an obligation that is not exactly the one requested
+    /// (receiver, policy, org, amount, digest, status `Owed`). Return values are checked,
+    /// never trusted.
+    ObligationNotRecorded = 329,
 }
 
 /// `PolicyNft` domain errors. Range 400..=499.
@@ -169,4 +129,31 @@ pub enum NftError {
     PolicyNotFound = 404,
     NotPolicyManager = 405,
     TokenNotFound = 406,
+}
+
+/// `SettlementAdapter` domain errors. Range 500..=599.
+#[contracterror]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum AdapterError {
+    /// `record_obligation` from a caller other than the configured PayoutReceiver.
+    NotPayoutReceiver = 500,
+    /// `record_obligation` with `amount <= 0`.
+    InvalidAmount = 501,
+    /// (PayoutReceiver, policy) already has an obligation with a different org, amount or
+    /// determination digest.
+    ObligationConflict = 502,
+    /// No obligation with that id.
+    ObligationNotFound = 503,
+    /// `mark_funded` on a Funded obligation with a different reference.
+    ObligationAlreadyFunded = 504,
+    /// Any transition out of Settled, except repeating the identical `mark_settled`.
+    ObligationAlreadySettled = 505,
+    /// An all-zero reference hash.
+    InvalidReference = 506,
+    /// `set_payout_receiver` with the adapter's own address.
+    InvalidPayoutReceiver = 507,
+    /// The obligation id or an org's obligation count would overflow (unreachable in
+    /// practice; replaces a bare panic).
+    CounterOverflow = 508,
 }

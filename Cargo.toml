@@ -3,10 +3,13 @@ resolver = "2"
 members = [
     "crates/shared",
     "crates/policy-manager",
-    "crates/treasury",
+    "crates/settlement-adapter",
     "crates/payout-receiver",
     "crates/policy-nft",
     "crates/integration-tests",
+    # Testnet evidence only (scripts/testnet-evidence.sh). Not in default-members, so the
+    # deploy-time wasm build never produces it and deploy.sh never deploys it.
+    "crates/testnet-policy-fixture",
 ]
 
 # `cargo build --target wasm32v1-none` builds these and ONLY these. integration-tests is a
@@ -17,7 +20,7 @@ members = [
 default-members = [
     "crates/shared",
     "crates/policy-manager",
-    "crates/treasury",
+    "crates/settlement-adapter",
     "crates/payout-receiver",
     "crates/policy-nft",
 ]
@@ -30,7 +33,7 @@ microcrop-shared = { path = "crates/shared" }
 
 # Release profile tuned for small, deterministic Soroban WASM.
 # opt-level "z" + lto + strip minimise code size; overflow-checks stay ON because all
-# money math (i128 USDC) must trap on overflow rather than wrap. panic = "abort" removes
+# money math (i128 USDC amounts, ids, counters) must trap on overflow rather than wrap. panic = "abort" removes
 # unwinding machinery (contracts trap on panic). Applied to release/wasm builds only —
 # `cargo test` uses the dev profile (unwind) so #[should_panic] tests still work.
 [profile.release]

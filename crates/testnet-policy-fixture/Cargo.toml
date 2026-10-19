@@ -1,0 +1,16 @@
+[package]
+name = "microcrop-testnet-policy-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "TESTNET ONLY. A PolicyManager stand-in that injects policy state for the SettlementAdapter evidence lane. Not a sale; never deployed by deploy.sh; refuses to deploy on mainnet."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+microcrop-shared = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

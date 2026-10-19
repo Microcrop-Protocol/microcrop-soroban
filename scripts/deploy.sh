@@ -2,12 +2,17 @@
 #
 # MicroCrop Soroban deployment — deploy, wire and configure all four contracts.
 #
+# The four contracts (Option B, 2026-10-19): PolicyNft, PolicyManager, SettlementAdapter,
+# PayoutReceiver. There is no Treasury and no USDC token anywhere: a verified determination
+# becomes an obligation in the SettlementAdapter, settled off-chain.
+#
 # WHY A SCRIPT AND NOT A CHECKLIST. The four contracts are not independent: PayoutReceiver
-# takes Treasury and PolicyManager addresses in its constructor, and six cross-contract ROLE
-# grants have to be made after deployment or the money path silently does not work. A missed
-# grant does not fail at deploy time — it fails later, on the first payout, on chain, with
-# real money. The sequence below is lifted from crates/integration-tests, which exercises the
-# identical wiring against all four real contracts, so it is verified rather than remembered.
+# takes the SettlementAdapter and PolicyManager addresses in its constructor, the adapter has
+# to be bound back to the PayoutReceiver, and five cross-contract ROLE grants have to be made
+# after deployment or the claim path silently does not work. A missed step does not fail at
+# deploy time — it fails later, on the first claim, on chain. The sequence below is lifted
+# from crates/integration-tests, which exercises the identical wiring against all four real
+# contracts, so it is verified rather than remembered.
 #
 # IDEMPOTENT AND RESUMABLE. Every deployed address is written to the state file as soon as it
 # is known. Re-running skips what is already done. A deploy that dies halfway (a funding
@@ -18,6 +23,11 @@
 #   ./scripts/deploy.sh --network testnet
 #   ./scripts/deploy.sh --network testnet --dry-run
 #   ./scripts/deploy.sh --network mainnet          # requires typing the confirmation phrase
+#   ./scripts/deploy.sh --network testnet --state-dir <dir>   # a fresh deployment elsewhere
+#
+# Environment: ADMIN_KEY, BACKEND_ADDR, RELAYER_ADDR, AUTHORIZED_SIGNER_PUBKEY (required);
+# FUNDER_ADDR (optional, default BACKEND_ADDR: who may mark obligations funded/settled);
+# NETWORK_DOMAIN (optional, default sha256(passphrase)).
 #
 set -euo pipefail
 
@@ -30,7 +40,7 @@ while [[ $# -gt 0 ]]; do
     --network) NETWORK="${2:?--network needs a value}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --state-dir) STATE_DIR="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -66,10 +76,12 @@ command -v stellar >/dev/null || die "stellar CLI not found. Install: cargo inst
 command -v jq      >/dev/null || die "jq not found (brew install jq)"
 
 : "${ADMIN_KEY:?ADMIN_KEY is required — the stellar CLI identity that will hold Admin+Upgrader on all four contracts}"
-: "${USDC_SAC:?USDC_SAC is required — the USDC Stellar Asset Contract address for this network}"
-: "${BACKEND_WALLET:?BACKEND_WALLET is required — G... address that receives platform fees}"
-: "${BACKEND_ADDR:?BACKEND_ADDR is required — G... address the backend signs policy/premium calls with}"
+: "${BACKEND_ADDR:?BACKEND_ADDR is required — G... address the backend signs policy calls with}"
 : "${RELAYER_ADDR:?RELAYER_ADDR is required — G... address allowed to submit determinations}"
+# The Funder (and only the Funder: never the org that owes it) may mark ANY org's obligation
+# funded / settled in the SettlementAdapter. These are
+# attestations by the paying agent (the backend's mobile-money off-ramp), not proof of payment.
+FUNDER_ADDR="${FUNDER_ADDR:-$BACKEND_ADDR}"
 
 # The 65-byte uncompressed SEC-1 public key of the Lit PKP, hex, WITH the 0x04 prefix.
 # NOT the 0x… Ethereum address: the contract recovers a pubkey from the signature and compares
@@ -101,7 +113,7 @@ else
 fi
 
 WASM_DIR="target/wasm32v1-none/release"
-for w in microcrop_policy_nft microcrop_policy_manager microcrop_treasury microcrop_payout_receiver; do
+for w in microcrop_policy_nft microcrop_policy_manager microcrop_settlement_adapter microcrop_payout_receiver; do
   [[ -f "$WASM_DIR/$w.wasm" ]] || die "missing $WASM_DIR/$w.wasm — run: cargo build --release --target wasm32v1-none"
   # Deploy the OPTIMIZED wasm: it is ~16-22% smaller, and code rent is paid per byte for the
   # contract's whole life. The rent figures in the docs assume these files.
@@ -118,6 +130,12 @@ if [[ "$NETWORK" == "mainnet" && "$DRY_RUN" == "0" ]]; then
 fi
 
 say "network=$NETWORK  state=$STATE  dry-run=$DRY_RUN"
+
+# A state file from a Treasury-era deployment cannot be resumed into Option B: its
+# PayoutReceiver was constructed with a Treasury and has no adapter. Deploy fresh elsewhere.
+if [[ -n "$(state_get treasury)" ]]; then
+  die "state file belongs to a Treasury deployment; use --state-dir"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Deploy — order matters: PayoutReceiver's constructor consumes two addresses
@@ -146,26 +164,14 @@ deploy() {                      # deploy <state-key> <wasm-name> [--ctor-args...
 ADMIN_ADDR="$(stellar keys address "$ADMIN_KEY" 2>/dev/null || echo "G_DRYRUN_ADMIN")"
 say "admin address: $ADMIN_ADDR"
 
-# The Treasury constructor refuses a token that does not report 7 decimals (error 217), but by
-# then three contracts are already deployed. Check first so a wrong USDC_SAC costs nothing.
-if [[ "$DRY_RUN" == "1" ]]; then
-  printf '  \033[2mDRY-RUN:\033[0m check decimals() of %s == 7\n' "$USDC_SAC" >&2
-else
-  USDC_DECIMALS="$(stellar contract invoke --id "$USDC_SAC" --source "$ADMIN_KEY" \
-      --network "$NETWORK" --send no -- decimals | tail -1 | tr -d '"[:space:]')"
-  [[ "$USDC_DECIMALS" == "7" ]] \
-    || die "USDC_SAC $USDC_SAC reports decimals() = '$USDC_DECIMALS'; the contracts need 7"
-  say "USDC_SAC decimals: 7"
-fi
-
 NFT="$(deploy policy_nft microcrop_policy_nft \
         --admin "$ADMIN_ADDR" --name "MicroCrop Policy" --symbol "MCP")"
 PM="$(deploy policy_manager microcrop_policy_manager \
         --admin "$ADMIN_ADDR")"
-TREASURY="$(deploy treasury microcrop_treasury \
-        --usdc "$USDC_SAC" --backend_wallet "$BACKEND_WALLET" --admin "$ADMIN_ADDR")"
+ADAPTER="$(deploy settlement_adapter microcrop_settlement_adapter \
+        --admin "$ADMIN_ADDR")"
 PR="$(deploy payout_receiver microcrop_payout_receiver \
-        --treasury "$TREASURY" --policy_manager "$PM" --admin "$ADMIN_ADDR")"
+        --settlement_adapter "$ADAPTER" --policy_manager "$PM" --admin "$ADMIN_ADDR")"
 
 # ---------------------------------------------------------------------------
 # 2. Wire + 3. Roles + 4. Configure
@@ -185,20 +191,22 @@ step() {                        # step <state-key> <contract-addr> <fn> [--args.
 say "--- wiring cross-contract references ---"
 step wire_pm_nft        "$PM"       set_policy_nft      --policy_nft "$NFT"
 step wire_nft_pm        "$NFT"      set_policy_manager  --policy_manager "$PM"
-step wire_treasury_pm   "$TREASURY" set_policy_manager  --policy_manager "$PM"
-step wire_treasury_pr   "$TREASURY" set_payout_receiver --payout_receiver "$PR"
+# The handshake: until the adapter names the PayoutReceiver, every determination reverts
+# (NotPayoutReceiver, 500) — fail closed, but nothing settles.
+step wire_adapter_pr    "$ADAPTER"  set_payout_receiver --payout_receiver "$PR"
 
 say "--- granting cross-contract roles ---"
-# Without these the deploy LOOKS fine and the money path is dead: the backend cannot create a
-# policy, PolicyManager cannot mint a certificate, and PayoutReceiver cannot draw a payout.
+# Without these the deploy LOOKS fine and the claim path is dead: the backend cannot create a
+# policy, PolicyManager cannot mint a certificate, PayoutReceiver cannot mark a policy claimed,
+# and no obligation can ever be marked funded or settled.
 # Role is a #[repr(u32)] contracttype enum, so the CLI takes its NUMBER, not its name:
-# Admin=0 Backend=1 Oracle=2 Payout=3 Relayer=4 Upgrader=5 Minter=6 (crates/shared/src/types.rs).
+# Admin=0 Backend=1 Oracle=2 (3 retired) Relayer=4 Upgrader=5 Minter=6 Funder=7
+# (crates/shared/src/types.rs).
 step role_pm_backend    "$PM"       grant_role --role 1 --who "$BACKEND_ADDR"
-step role_tr_backend    "$TREASURY" grant_role --role 1 --who "$BACKEND_ADDR"
-step role_nft_minter    "$NFT"      grant_role --role 6  --who "$PM"
-step role_pm_oracle     "$PM"       grant_role --role 2  --who "$PR"
-step role_tr_payout     "$TREASURY" grant_role --role 3  --who "$PR"
+step role_nft_minter    "$NFT"      grant_role --role 6 --who "$PM"
+step role_pm_oracle     "$PM"       grant_role --role 2 --who "$PR"
 step role_pr_relayer    "$PR"       grant_role --role 4 --who "$RELAYER_ADDR"
+step role_ad_funder     "$ADAPTER"  grant_role --role 7 --who "$FUNDER_ADDR"
 
 say "--- configuring the payout authority ---"
 step cfg_signer  "$PR" set_authorized_signer --pubkey "${AUTHORIZED_SIGNER_PUBKEY#0x}"
@@ -210,7 +218,8 @@ step cfg_drought "$PR" set_methodology_enabled --kind 1 --enabled true
 
 # Rent cap: ordinary calls extend instance + code only below 3 days, to 10 days, and admin
 # calls extend nothing, so a fresh upload sits at the network minimum (7 days on testnet).
-# The permissionless keeper extends all four contracts to 30 days; the backend then runs it
+# The permissionless keeper (PayoutReceiver.extend_contract_ttl) extends all four contracts —
+# itself, the SettlementAdapter, PolicyManager and PolicyNft — to 30 days; the backend runs it
 # daily (a no-op above 23 days). Not recorded as a step: it is meant to be repeated.
 # --send=yes is required: a TTL extension writes no ledger entry, emits no event and needs no
 # auth, so the CLI's default classifies the simulation as read-only and never submits it
@@ -230,8 +239,10 @@ cat <<EOF
 ========== DEPLOYED ($NETWORK) ==========
 PolicyNft        $NFT
 PolicyManager    $PM
-Treasury         $TREASURY
+SettlementAdapter $ADAPTER
 PayoutReceiver   $PR
+
+Funder (adapter) $FUNDER_ADDR
 
 NETWORK_DOMAIN   $NETWORK_DOMAIN
   ^ the off-chain signer MUST use this exact value, or no determination will ever verify.

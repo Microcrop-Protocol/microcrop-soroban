@@ -2,9 +2,10 @@
 
 **Honest framing:** this workspace is a **preparation port**, not a completed migration.
 The four contracts are faithfully re-implemented in Rust, compile to `wasm32v1-none`
-WASM, and pass their unit and integration suites (216 tests). A first testnet deployment
-exists (2026-10, `deployments/testnet.json`); they are not integrated with the off-chain
-stack and have no mainnet deployment. An AI-assisted Soroban review (2026-10) found 11
+WASM, and pass their unit and integration suites (202 tests, plus 1 ignored real-WASM
+lane that passes after a wasm build). Treasury-era testnet deployments exist (2026-10,
+`deploy-v2`); Option B has not been deployed yet. The contracts are not integrated with the
+off-chain stack and have no mainnet deployment. An AI-assisted Soroban review (2026-10) found 11
 issues; all are fixed on this code (see
 [§6](#6-audit-fixes-2026-10--where-the-port-now-departs-from-the-solidity)), but that review
 is not a substitute for an independent audit.
@@ -12,10 +13,18 @@ is not a substitute for an independent audit.
 **2026-10-18:** PayoutReceiver settles CROP_DROUGHT determinations (`crop-drought-rdi-1.0`,
 the live methodology) and storage rent is capped. See [§9](#9-crop_drought-path-option-a)
 and [§10](#10-rent-cap).
+
+**2026-10-19 — Option B:** the custodial per-org Treasury is removed. A verified
+determination becomes an obligation in a non-custodial `SettlementAdapter`
+(`Owed → Funded → Settled`, attested off-chain payment), the PayoutReceiver's adapter is
+admin-settable behind a binding handshake, and no contract holds a token. See
+[§11](#11-option-b-settlementadapter).
 The [DEFERRED](#deferred--not-yet-done) section is the load-bearing part of this document.
 
-**Product-architecture decision (2026-08-21):** the faithful Treasury port is now a
-legacy/reference implementation, not the target mainnet design. The carrier will keep
+**Product-architecture decision (2026-08-21; first step shipped as Option B, §11):** the
+faithful Treasury port is now a legacy/reference implementation, not the target mainnet
+design (it was removed from this workspace on 2026-10-19 and lives in git history at
+`ed52203`). The carrier will keep
 its statutory reserve and investments off-platform. Soroban should record a
 local-currency policy and verified payout obligation, while a bounded funding facility
 and regulated settlement adapter execute the last-mile payment. The obligation should
@@ -52,7 +61,7 @@ PolicyManager/Treasury v3.1.0, PayoutReceiver v2.1.0).
 | `block.chainid` (replay domain separation)       | **`network_domain: BytesN<32>`** stored + admin-settable (see §4)                            |
 | `address(this)`                                  | `env.current_contract_address()`                                                             |
 | `abi.encode` / `keccak256` / `ecrecover`         | `shared::encoding` byte layout + `env.crypto().keccak256` + `env.crypto().secp256k1_recover` |
-| ERC-20 USDC (`transfer`, allowances)             | SEP-41 Stellar Asset Contract via `soroban_sdk::token::TokenClient` (SAC balance, **no trustline needed** for the contract) |
+| ERC-20 USDC (`transfer`, allowances)             | none since Option B (§11): no contract holds or moves a token; amounts are 7dp USDC base units as a unit of account. (The Treasury used the SEP-41 Stellar Asset Contract via `TokenClient`.) |
 | UUPS `upgradeToAndCall`                          | `env.deployer().update_current_contract_wasm(hash)` behind an `Upgrader`-role `upgrade()` fn |
 | `try/catch` on external call                     | generated client's `try_*` method returning `Result`                                        |
 | cross-contract call (interface)                  | `#[contractclient]` trait → generated `...Client` (`shared/interfaces.rs`)                   |
@@ -64,20 +73,35 @@ PolicyManager/Treasury v3.1.0, PayoutReceiver v2.1.0).
 
 ### PolicyManager (`crates/policy-manager`) ← PolicyManager.sol v3.1.0
 Preserved: duration bounds; PENDING→ACTIVE window reset preserving duration; per-org
-**outstanding exposure** accounting that drives Treasury solvency; id starts at 1;
+**outstanding exposure** accounting (it drove Treasury solvency; since Option B it is a view
+only); id starts at 1;
 `PendingCounted` flag (Finding 8). NFT status updates are **best-effort** via the fallible
 `try_update_policy_status` client (Soroban equivalent of Solidity `try/catch`) so lifecycle
 transitions can never be bricked. Changed by the 2026-10 audit fixes (§6): sum bounds in
 7dp; exposure accrues at **create** (release on cancel/expire/claim); open cap is
 `open (ACTIVE+PENDING) + claims in the rolling window ≤ 3`; claim cap is 3 per rolling
-365 days (not a calendar-year bucket); farmer index is paginated; new `ClaimPending`
-status. Changed by §7: `create_policy` takes the plot coordinates (`lat_e6`, `lon_e6`,
+365 days (not a calendar-year bucket); farmer index is paginated; a `ClaimPending`
+status (removed by Option B, §11: ordinal 5 is retired). Changed by §7: `create_policy` takes the plot coordinates (`lat_e6`, `lon_e6`,
 degrees x 1e6) and stores them on `Policy`; permissionless `extend_policy_ttl(policy_id)`. Roles: create/activate = `Backend`; cancel PENDING = `Backend` or `Admin`, cancel
 ACTIVE = `Admin` only; expire = anyone after `end_date`;
-mark_as_claimed/mark_claim_pending/increment_claim_count = `Oracle`; setters = `Admin`;
-upgrade = `Upgrader`.
+mark_as_claimed/increment_claim_count = `Oracle` (`mark_claim_pending` removed by Option
+B; `mark_as_claimed` accepts ACTIVE only); setters = `Admin`; upgrade = `Upgrader`.
 
-### Treasury (`crates/treasury`) ← Treasury.sol v3.1.0
+### Treasury — removed by Option B (2026-10-19)
+The crate, its tests and snapshots were deleted; the history below describes the port as it
+was at `ed52203` and applies only to Treasury-era deployments. Its error range 200..=299
+(215/216 included) is retired and never reused. See §11.
+
+### SettlementAdapter (`crates/settlement-adapter`) — new, no Solidity source
+Non-custodial obligation ledger (§11). `record_obligation` only by the bound PayoutReceiver
+(address check + its auth); `mark_funded` / `mark_settled` by `Role::Funder` (7) only (the
+org that owes the obligation cannot mark it); `set_payout_receiver`, `grant_role`,
+`revoke_role` = `Admin` (grants and revocations emit `RoleGranted` / `RoleRevoked`);
+`upgrade` = `Upgrader`. Holds no tokens, makes no cross-contract calls, no pause. Errors
+500..=508.
+
+<details><summary>Treasury port as it was (Treasury-era deployments only)</summary>
+
 Money math preserved 1:1: premium split `fee = amount * fee_bps(org) / 10_000`;
 per-org reserve credit; `receive_premium` pulls USDC from caller (`TokenClient::transfer`);
 `request_payout` funds **only** from the policy's org reserve; surplus-only withdrawals
@@ -96,6 +120,8 @@ kept. Solvency invariant `balance ≥ total_org_reserves + accumulated_fees` ass
 Roles: `receive_premium` = `Backend`; `request_payout` = `Payout` **and** `caller ==
 payout_receiver`; reserve/fee setters = `Admin`.
 
+</details>
+
 ### PayoutReceiver (`crates/payout-receiver`) ← PayoutReceiver.sol v2.1.0 (security crux)
 The full **12-step validation runs in the exact Solidity order**, then CEI effects, then
 interactions. Signature is the **sole** payout authority; `Relayer` is anti-spam only.
@@ -105,13 +131,18 @@ on-chain** and compared to the signed value; freshness (`MAX_REPORT_AGE=3600`, s
 farmer claim limit; on-chain digest reconstruction via `shared::encoding::
 determination_digest`; `secp256k1_recover` byte-compared to the stored SEC-1 65-byte key;
 **triple replay guard** (temporary `ConsumedDetermination` + persistent `PolicyPaid` +
-Treasury `PayoutProcessed`). Added by §6: when Treasury reports a short reserve the policy
+Treasury `PayoutProcessed`; since Option B the third layer is the adapter's one obligation
+per (PayoutReceiver, policy)). **Option B (§11):** the Treasury call is replaced by
+`SettlementAdapter.record_obligation` with a field-by-field return check (329); the adapter
+is admin-settable (`set_settlement_adapter`, bound by handshake, 328); `settle_pending_claim`,
+`is_claim_pending` and the pending-claim machinery below are removed.
+Added by §6: when Treasury reports a short reserve the policy
 becomes `ClaimPending` and the permissionless `settle_pending_claim(policy_id)` pays it in
 full later. Added by §7: step 6c rejects any coverage type but `Comprehensive`, step 6d
 binds the signed coordinates to the policy's plot, `settle_pending_claim` accepts only the
 org's queue head, and the permissionless `extend_policy_ttl(policy_id)` bumps the policy's
 entries in all four contracts. The contract passes `env.current_contract_address()` as the
-`caller` to its Treasury/PolicyManager sub-invocations (a contract auto-authorizes its own
+`caller` to its PolicyManager and SettlementAdapter (formerly Treasury) sub-invocations (a contract auto-authorizes its own
 sub-calls).
 
 ### PolicyNFT (`crates/policy-nft`) ← PolicyNFT.sol
@@ -135,7 +166,8 @@ distributor index preserved but stored one entry per token and read in pages
    separation for the determination digest is a stored 32-byte value set by
    `set_network_domain` (Admin, port-only new setter). **The off-chain Lit PKP signer MUST
    use the identical 32 bytes**, or every signature fails recovery.
-3. **USDC = SEP-41 Stellar Asset Contract**, not ERC-20. Balances via `TokenClient`; the
+3. **USDC = SEP-41 Stellar Asset Contract**, not ERC-20 (Treasury era; since Option B no
+   contract holds a token, but every amount is still 7dp USDC base units). Balances via `TokenClient`; the
    contract holds SAC balances directly (no trustline provisioning in-contract). **Stellar
    USDC has 7 decimals, not 6**: 1 USDC = 10_000_000 base units. Every amount constant is
    restated in 7dp (`MIN_SUM_INSURED = 1_000_000_000` = 100 USDC, `MAX_SUM_INSURED =
@@ -155,7 +187,7 @@ distributor index preserved but stored one entry per token and read in pages
    contracts follow a **rent cap** (§10): ordinary calls extend instance + code only below
    3 days, to 10 days; a permissionless keeper (`extend_contract_ttl`) extends all four
    contracts to 30 days; data entries live as long as the policy needs them
-   (`end_date + 30 d`, 60 days for pending claims and role grants). The temporary replay
+   (`end_date + 30 d`, 60 days for open obligations and role grants). The temporary replay
    marker stays at ~7 days (it only has to outlive the 1-hour freshness window).
 8. **Events use `#[contractevent]`.** `env.events().publish(...)` is deprecated in SDK 27;
    `#[topic]` fields replace Solidity `indexed`. Some zero-value "previous value" event
@@ -163,6 +195,7 @@ distributor index preserved but stored one entry per token and read in pages
 9. **Pausable error codes.** OpenZeppelin `Pausable` has no code in the frozen shared
    `TreasuryError`/`PayoutError` ranges, so Treasury and PayoutReceiver each define a small
    crate-local `#[contracterror]` paused code (`215/216` and `318` respectively). See §5.
+   215/216 are retired with the Treasury; the SettlementAdapter has no pause (§11).
 10. **Legacy shims omitted.** `setLegacyPolicyOrg`, `__gap`, `__deprecated` storage padding
     are gone — this is a fresh chain with no state to migrate or storage layout to preserve.
 
@@ -171,7 +204,32 @@ distributor index preserved but stored one entry per token and read in pages
 ## 4. Frozen cross-contract contract (do not drift)
 
 `crates/shared` is the coordination boundary; changing it requires re-checking all four
-contracts. In particular **`encoding.rs` is FROZEN**: both determination byte layouts must
+contracts. The cross-contract client traits (`interfaces.rs`) since Option B:
+
+```rust
+// PayoutReceiver -> SettlementAdapter
+pub trait ISettlementAdapter {
+    fn record_obligation(env: Env, caller: Address, policy_id: u64, org: Address,
+                         amount: i128, determination_digest: BytesN<32>) -> Obligation;
+    fn payout_receiver(env: Env) -> Option<Address>;
+    fn find_obligation(env: Env, payout_receiver: Address, policy_id: u64) -> Option<u64>;
+    fn extend_obligation_ttl(env: Env, obligation_id: u64);
+}
+// PayoutReceiver -> PolicyManager (mark_claim_pending, org_outstanding_sum_insured and
+// policy_org are no longer called cross-contract; the views stay on PolicyManager)
+pub trait IPolicyManager {
+    fn get_policy(env: Env, policy_id: u64) -> Policy;
+    fn policy_exists(env: Env, policy_id: u64) -> bool;
+    fn can_farmer_claim(env: Env, farmer: Address) -> bool;
+    fn mark_as_claimed(env: Env, caller: Address, policy_id: u64);
+    fn increment_claim_count(env: Env, caller: Address, farmer: Address);
+    fn extend_policy_ttl(env: Env, policy_id: u64);
+    fn extend_contract_ttl(env: Env);
+}
+```
+
+`ITreasury` is deleted. `crates/shared/src/abi_tests.rs` pins every error code number and
+the `Role`, `PolicyStatus` and `ObligationStatus` ordinals. In particular **`encoding.rs` is FROZEN**: both determination byte layouts must
 byte-for-byte match the off-chain signer.
 
 | | CROP_DAMAGE (retired) | CROP_DROUGHT |
@@ -199,21 +257,20 @@ preparation build into a real migration.
 **Integration & deployment**
 - [x] ~~**Not deployed** anywhere.~~ Testnet deployment exists (2026-10,
       `deployments/testnet.json`). Mainnet: not deployed.
-- [ ] **The drought path and the rent cap are not on testnet yet.** Upgrade PolicyManager,
-      Treasury and PayoutReceiver in place (runbook: *Upgrading to the drought path and the
-      rent cap*). **PolicyNft cannot be upgraded** (no `upgrade` fn, as in the Solidity): the
-      testnet NFT keeps the old extend-to-maximum TTL code on its own entries; its rent-cap
-      change applies to fresh deployments only.
+- [ ] **Option B is not on testnet yet.** It cannot be reached by upgrading a Treasury-era
+      deployment: deploy fresh (`deploy.sh --state-dir`), verify, then run
+      `scripts/testnet-evidence.sh` (§11, runbook *Testnet evidence*).
 - [x] ~~**No end-to-end / cross-contract integration test.**~~ DONE — `crates/integration-tests`
-      registers all four REAL contracts on one `Env` (no mocks) and covers the full
-      premium → determination → payout lifecycle, plus determination replay, wrong-signer
-      rejection and the per-org reserve bound. Still HOST-SIDE only: running this flow against
-      live testnet, with real transaction hashes, remains open.
+      registers all four REAL contracts on one `Env` (no mocks, no token) and covers
+      sale → determination → obligation (Owed → Funded → Settled), replay (also after an
+      adapter swap), the unbound adapter, wrong-signer rejection and the keepers; the
+      `#[ignore]`d `wasm_lane_full_flow` repeats the core flow against the optimized WASM
+      from `target/`. Still HOST-SIDE only: running it against live testnet, with real
+      transaction hashes, is `scripts/testnet-evidence.sh` (not run yet).
 - [x] ~~deploy script / role-granting runbook not automated~~ DONE — `scripts/deploy.sh`
       (idempotent, resumable, dry-run, mainnet-gated) and `scripts/verify-deployment.sh`
       (exact role checks via the new `has_role` view) plus `docs/DEPLOYMENT_RUNBOOK.md`.
-- [ ] **USDC SAC address** for each target network is still not wired. It is a required
-      constructor argument for Treasury, supplied via `USDC_SAC` to the deploy script.
+- [x] ~~**USDC SAC address**~~ no longer needed: no contract touches a token (Option B).
 - [x] ~~`network_domain` value not chosen~~ DECIDED — derived as `sha256(network passphrase)`:
       testnet `cee0302d…ecd472`, mainnet `7ac33997…45a979`. It does what `block.chainid` did
       (binds a determination to one network) and both sides compute it from a public constant,
@@ -246,14 +303,15 @@ preparation build into a real migration.
 
 **Verification & safety**
 - [ ] **No Soroban security audit.** The Solidity was audited; this Rust port has not been.
-      The secp256k1 signature path, replay guards, and per-org solvency need fresh review on
-      Soroban semantics (auth trees, TTL/archival edge cases).
+      The secp256k1 signature path, replay guards, the PayoutReceiver ↔ adapter binding and
+      the obligation state machine need fresh review on Soroban semantics (auth trees,
+      TTL/archival edge cases). Skill-checklist flags are listed in §11.
 - [x] ~~**TTL/rent policy is placeholder.**~~ Rent cap (§10). An archived persistent entry
       fails the read rather than reading as absent, so archival does not open a replay; the
       cost is a restore (`an_archived_policy_paid_flag_never_pays_out`).
 - [ ] **Keeper job not built.** The backend must call `PayoutReceiver.extend_contract_ttl()`
-      daily and `extend_policy_ttl(id)` for open or pending policies whose shortest TTL is
-      under 30 days (runbook), and must submit them even though simulation reports them
+      daily and `extend_policy_ttl(id)` for open policies and policies with an Owed or Funded
+      obligation whose shortest TTL is under 30 days (runbook), and must submit them even though simulation reports them
       read-only (CLI: `--send=yes`). Without it, code and instances fall back to the 10-day
       user-path safety net and the first call after a lapse pays up to ~10 days of code rent
       for each contract it touches (§10). Alert on keeper failure.
@@ -263,16 +321,21 @@ preparation build into a real migration.
       each file is the contract spec section (doc comments of every shared type and error are
       embedded in all four contracts); PolicyNft's code section grew ~4.4 KB from the need-based
       TTL helpers, not investigated further. Trimming spec docs and the helpers are rent levers.
+      Option B (2026-10-19, optimized): PayoutReceiver 62,217 B, PolicyManager 51,898,
+      SettlementAdapter 41,873 (the Treasury's 64,683 is gone), PolicyNft 39,865.
 - [ ] **Shared paused-code fragmentation** (§3.9): recommend adding one shared paused error
       to `microcrop_shared::errors` so all contracts share a code, instead of three local
       enums. Deferred to avoid touching the frozen shared crate mid-port.
 - [ ] **`org` resolution panic semantics** (§3.1): `policy_org(unknown)` panics rather than
       returning a sentinel; confirm no Soroban caller depends on the old address(0) behavior.
 - [ ] **Fuzz / property tests** for the payout math and the encoder byte layout are not
-      written (the encoder is the single most replay-sensitive surface).
-- [x] ~~`cargo clippy` was not run~~ — now run as a local gate. 7 warnings pre-date the
+      written (the encoder is the single most replay-sensitive surface). The adapter's state
+      machine has a proptest (status monotone, one obligation per (PR, policy), settled
+      reference immutable, count = distinct records).
+- [x] ~~`cargo clippy` was not run~~ — now run as a local gate. 7 warnings pre-dated the
       audit fixes (duplicated test attributes, two needless borrows, one manual range
-      check); neither the audit fixes nor the drought path / rent cap added any.
+      check); Option B removed three of them with the deleted Treasury tests and added none
+      (4 remain).
       `cargo fmt --all -- --check` is clean.
 - [ ] **Lit signer amount scaling (drought action).** The drought action must sign
       `sum_insured` and `payout_amount` as exact 7dp Stellar USDC (`toChainBaseUnits`, not
@@ -282,7 +345,8 @@ preparation build into a real migration.
       handled by extend-to-max plus `extend_policy_ttl` (§7). Still open: measure the
       restore cost of an archived entry inside the relayer's 3600 s freshness window if the
       keep-alive is missed.
-- [x] ~~**Order among pending claims.**~~ Per-org first-in-first-out queue (§7).
+- [x] ~~**Order among pending claims.**~~ Per-org first-in-first-out queue (§7); moot since
+      Option B removed pending claims.
 - [ ] **Signer rule: one determination per policy per assessment window.** Operational
       requirement on the Lit action, not enforced on-chain (§7, item 7).
 - [ ] **Backend plot coordinates.** The Stellar backend must pass `lat_e6`/`lon_e6` to
@@ -306,8 +370,9 @@ preparation build into a real migration.
       season (intended: a grace period would leak W1 rainfall to the buyer).
 
 **Product parity not ported**
-- [ ] **Non-custodial target contracts** — replace mandatory `Treasury` custody with
-      `PolicyRegistry`, `PayoutObligation`, `FundingFacility`, and `SettlementAdapter`.
+- [ ] **Non-custodial target contracts** — first step DONE (Option B, §11): the Treasury is
+      replaced by a minimal `SettlementAdapter` stub. Still open: `PolicyRegistry`, a real
+      `FundingFacility` (swappable in via `set_settlement_adapter`), local-currency amounts.
       Policy and benefit amounts must be denominated in the market's local currency;
       any USDC amount belongs to a short-lived provider quote/settlement record.
 - [ ] **Logos Storage manifest** — add CID, content hash, schema version, encryption-key
@@ -332,7 +397,7 @@ preparation build into a real migration.
 | 6 | Backend could cancel ACTIVE cover after a loss | Backend cancels PENDING only; ACTIVE needs Admin | `CancelActiveRequiresAdmin` (116) |
 | 7 | only Backend could expire an ended policy | permissionless; `now > end_date` is the gate; repeat call is a no-op | `expire_policy(policy_id)` (no caller); event `PolicyExpired` |
 | 8 | premium credited to a closed policy | read the policy; PENDING, or ACTIVE and not ended | `PolicyNotOpenForPremium` (219), `PolicyCoverageEnded` (220) |
-| 9, 11 | a short reserve reverted a valid claim with no record; it then lapsed | **pending claims**: Treasury records the full payout, the policy becomes `ClaimPending` (cannot expire, be cancelled, or be settled by another determination), `reserve_required` includes it, and anyone can call `PayoutReceiver.settle_pending_claim(policy_id)` once the reserve covers it | `request_payout -> bool`; new `settle_pending_payout`, `get_pending_payout`, `org_pending_payouts`, `mark_claim_pending`, `settle_pending_claim`, `is_claim_pending`; `PolicyStatus::ClaimPending = 5`; errors 221, 222, 319 |
+| 9, 11 | (superseded by Option B, §11: pending claims removed) a short reserve reverted a valid claim with no record; it then lapsed | **pending claims**: Treasury records the full payout, the policy becomes `ClaimPending` (cannot expire, be cancelled, or be settled by another determination), `reserve_required` includes it, and anyone can call `PayoutReceiver.settle_pending_claim(policy_id)` once the reserve covers it | `request_payout -> bool`; new `settle_pending_payout`, `get_pending_payout`, `org_pending_payouts`, `mark_claim_pending`, `settle_pending_claim`, `is_claim_pending`; `PolicyStatus::ClaimPending = 5`; errors 221, 222, 319 |
 
 Leads fixed alongside: role grants extend their TTL on grant and on use; persistent
 entries in all four contracts request ~400 days (was 30 / 90), and paged reads extend the
@@ -366,17 +431,18 @@ Review follow-ups in the same PR:
 | 7 | the relayer chooses which of two signed determinations settles a policy | **signer-side rule, no contract change**: the Lit action issues at most one determination per policy per assessment window: no new signature for a policy while an earlier one is within `MAX_REPORT_AGE` (3600 s) or the policy is paid. No clean contract-side rule exists: "highest `assessed_at` consumed" cannot help because the first valid submission already pays, and any rule that lets a later determination win needs a dispute window, which delays every payout. The preimage is unchanged | none on-chain; operational requirement on the signer |
 
 Rows 3, 4 and 9 above are superseded (2026-10-18): TTLs follow the rent cap (§10), not the
-network maximum, and only `Drought` cover is sold (§9).
+network maximum, and only `Drought` cover is sold (§9). Rows 1, 2, 6 and 8 and the Treasury
+half of 9 are superseded by Option B (§11): there is no Treasury, no premium on-chain and no
+pending-claim queue.
 
 ## 8. Bottom line
 
 The Rust/Soroban re-implementation is **complete and green** as a parity/reference
 version: it builds to WASM on the correct target and its tests preserve the old model's
-security invariants. It is suitable for testnet experiments, but the custody Treasury
-must not be treated as the final carrier architecture. Freeze and implement the
-non-custodial obligation/facility interfaces, local-currency model, Logos Storage
-commitment, shared `network_domain`, and Lit PKP signer agreement before any live pilot
-or mainnet consideration.
+verification invariants. Since Option B (§11) there is no custody: verified claims become
+attested obligations. Still before any live pilot or mainnet consideration: a real
+FundingFacility, the local-currency model, the Logos Storage commitment, the Lit PKP signer
+agreement, mainnet governance (D-B3) and an independent audit.
 
 ## 9. CROP_DROUGHT path (Option A)
 
@@ -413,13 +479,13 @@ limit (315); digest rebuilt on-chain; not consumed (316); signer recovered (317)
 Effects and interactions are the crop path's, factored into `settle_verified`; the report
 stores `weather_damage = satellite_damage = 0`; new event `DroughtEvidenceRecorded`.
 `PolicyPaid` is shared, so a policy settles at most once across both methodologies
-(Treasury `PayoutProcessed` is the third layer). Pending claims are unchanged.
+(the third layer was Treasury `PayoutProcessed`; since Option B it is the adapter's one
+obligation per (PayoutReceiver, policy)).
 
 **Methodology allow-list.** Instance key `MethodologyEnabled(MethodologyKind)`
 (`CropDualIndex10 = 0`, `CropDroughtRdi10 = 1`), absent = disabled,
 `set_methodology_enabled` (Admin), `is_methodology_enabled`. `submit_determination` (crop)
-checks it too: leave crop disabled after the upgrade. A claim already pending still
-settles, because `settle_pending_claim` does not re-verify.
+checks it too: leave crop disabled after the upgrade.
 
 **View.** `drought_determination_digest(d) -> BytesN<32>` for the oracle and backend to
 simulate against the live contract and domain.
@@ -480,10 +546,11 @@ after the growth in §5 (table below). Data entries are cheap (556 B for 180 day
 | Class | Rule | Kept alive by |
 |---|---|---|
 | Instance + code, user path | below 3 d → 10 d (safety net only) | any call (`touch_contract`) |
-| Instance + code, keeper | below 23 d → 30 d | `extend_contract_ttl()`: PayoutReceiver's extends itself and Treasury and calls PolicyManager's, which extends PolicyManager and PolicyNft |
+| Instance + code, keeper | below 23 d → 30 d | `extend_contract_ttl()`: PayoutReceiver's extends itself and the SettlementAdapter (Treasury before Option B) and calls PolicyManager's, which extends PolicyManager and PolicyNft |
 | Role grants | below 30 d → 60 d | grant and every use |
 | Per-policy: PM `Policy`, `PendingCounted`, farmer index item; Treasury `PremiumReceived`, `PayoutProcessed`; PR `PolicyPaid`, `Report`; NFT `Certificate`, `Owner`, `PolicyToToken`, `DistributorPolicy` | `end_date + 30 d`, clamped; activation re-applies it to PM `Policy` and the shared per-farmer / per-org entries, but not to the farmer index item (`FarmerPolicyAt`, whose position the policy does not record) nor to a `PremiumReceived` set while PENDING: those keep the create-time need, short by the PENDING period, until `extend_policy_ttl` (Treasury's flag) or a restore (index item); a closed policy keeps its TTL (`PayoutProcessed` at least 60 d) | the lifecycle calls; `extend_policy_ttl(id)` when the need is past the maximum |
-| Pending claim: `ClaimPending`, `PendingPayout`, `OrgQueueAt/Head/Tail`, `OrgPendingPayouts`, PM `Policy` while CLAIM_PENDING | below 30 d → 60 d | settlement attempts and `extend_policy_ttl` |
+| Open obligation (Option B): adapter `Obligation`, `ObligationOf`, `OrgObligationAt` while Owed / Funded; `OrgObligationCount` at least 60 d. A Settled obligation is left to archive | below 30 d → 60 d | record, every mark, `extend_obligation_ttl`, and `extend_policy_ttl` (best effort) |
+| (Treasury era only) pending claim: `ClaimPending`, `PendingPayout`, `OrgQueueAt/Head/Tail`, `OrgPendingPayouts`, PM `Policy` while CLAIM_PENDING | below 30 d → 60 d | settlement attempts and `extend_policy_ttl` |
 | Shared per-farmer / per-org: `Farmer*`, `OrgOutstanding`, `OrgReserve`, ratio and fee settings, `DistributorCount` | longest need of any policy touching it, at least 60 d; `FarmerClaimTimes` 365 d | every touch |
 | Temporary `ConsumedDetermination` | 7 d | `PolicyPaid` is the durable guard |
 
@@ -511,12 +578,17 @@ on testnet yet.
 |---|---|---|
 | Admin and config calls | ≤ 0.09 XLM (`grant_role`), others ≈ 0.01 | ≤ 0.011 XLM |
 | `create_policy` | 2.54 XLM | ≈ 0.31 XLM (mainnet's 120-day creation floor applies) |
-| `receive_premium` | 832.6 → 0.60 XLM | ≈ 0.07 XLM |
+| `receive_premium` (Treasury era; removed by Option B) | 832.6 → 0.60 XLM | ≈ 0.07 XLM |
 | `activate_policy` | 2.52 XLM | ≈ 0.31 XLM |
-| `submit_drought_determination` (pending path) | 662.6 → 1.05 XLM | ≈ 0.13 XLM |
+| `submit_drought_determination` (Treasury era, pending path) | 662.6 → 1.05 XLM | ≈ 0.13 XLM |
 | Code rent per day: PayoutReceiver / Treasury / PolicyManager / PolicyNft | ≈ 5.0 / 5.2 / 4.1 / 2.8 XLM | ≈ 0.62 / 0.64 / 0.50 / 0.34 XLM |
 | Keeper, all four contracts | ≈ 17 XLM/day, ≈ 119 XLM/week | ≈ 2.1 XLM/day, ≈ 14.7 XLM/week |
 | Worst-case user call after a keeper lapse | up to ~10 days of code rent for **each** contract the call touches: a determination touches all four, ≈ 150–170 XLM | ≈ 19–21 XLM |
+
+The table predates Option B and is not re-measured. Scaling by optimized size, the
+SettlementAdapter's code rent (41,873 B) should be about 0.65× the Treasury's (64,683 B),
+roughly 3.4 XLM/day on testnet; the keeper and lapse rows shrink accordingly. Measure on
+testnet before relying on these.
 
 The lapse row: each contract a call touches tops up separately (below 3 days to 10 days),
 so one call can pay for all four. An `extend_policy_ttl` after a lapse was measured on the
@@ -525,3 +597,180 @@ host extending all four contracts by 8 days in one call. Alert on keeper failure
 
 Mainnet deploy budget: uploads pay the 120-day minimum, about 252 XLM for the four code
 entries (was 213 before the growth); the keeper has nothing to do until about day 97.
+
+## 11. Option B: SettlementAdapter
+
+**Why.** Deliverable 2 of the Stellar Instaward SOW asks for "a minimal
+FundingFacility/SettlementAdapter stub ... [that] tracks verified obligations and their
+funding status without pooling or custodying farmer premiums itself", with the
+PayoutReceiver wired to it instead of a Treasury-style contract. It is also the company's
+2026-09-09 non-custodial decision (no deposits, no pooled reserves). Option B (decided
+2026-10-19) removes the per-org USDC Treasury and puts a small obligation ledger in its
+place. Every verification step of the PayoutReceiver is unchanged.
+
+**Flow.**
+
+```
+submit_drought_determination  (all checks of §9, unchanged)
+  -> effects: ConsumedDetermination (temp), PolicyPaid, Report
+  -> adapter.record_obligation(this, policy_id, org, payout, digest) -> Obligation
+       checked field by field, else ObligationNotRecorded (329)
+  -> pm.mark_as_claimed, pm.increment_claim_count
+  -> events DeterminationVerified, DamageReportReceived, ObligationRequested
+off-chain: the backend off-ramps the payout (M-Pesa) as paying agent
+  -> adapter.mark_funded(funder, id, sha256(order reference))     when the order is accepted
+  -> adapter.mark_settled(funder, id, sha256(receipt ref))        when the receipt arrives
+```
+
+The transaction is atomic: an adapter error (500 unbound, 502 conflict, 3 not configured)
+reverts the determination's effects too, so it can be resubmitted after the fix.
+
+**State machine.** `Owed → Funded → Settled`, or `Owed → Settled` (funding may be
+implicit). Status never moves backwards. A repeated mark with the same reference is a no-op
+(webhooks arrive twice); with a different reference it is refused (`ObligationAlreadyFunded`
+504, `ObligationAlreadySettled` 505); any transition out of `Settled` except the identical
+`mark_settled` is 505; an all-zero reference is 506. Disputed and Waived are deliberately left
+out: a waive by the obligor is self-dealing, and a dispute needs an adjudicator role. Adding
+enum variants later is forward-compatible.
+
+**Attestation, not proof (read this before citing a `Settled`).** Organisation addresses are
+keyless: the backend derives them as `sha256("microcrop:org:stellar:v1:" + orgId)`, so nobody
+holds their key. Even so, the adapter does not let an org mark its own obligation (#1): the
+org is the party that owes the money, so an org-signed `Settled` would be a self-waive, and
+once an org held a real key it could race the Funder's real settlement into a 505. Every
+transition is made by `Role::Funder`, held by the backend account.
+`Funded` and `Settled` are therefore the paying agent's attestations, identified by a
+reference hash of the off-chain record (no phone number or name ever goes on-chain). The
+events, the reference hashes and the revocable role are the audit trail; nothing on-chain
+proves money moved.
+
+**Keying.** Policy ids are unique only per PolicyManager. Obligations are looked up by
+`ObligationOf(payout_receiver, policy_id)`, so pointing the adapter at a new PayoutReceiver
+never collides with the old one's obligations (which would otherwise fail 502 and brick new
+claims). Within one PayoutReceiver there is at most one obligation per policy (an identical
+re-record returns the existing one, no write, no event; anything else is 502). Across
+PayoutReceivers sharing one PolicyManager, the policy's `Claimed` status (308) stops a second
+claim. Replay after a PayoutReceiver → adapter swap is still 310, because `PolicyPaid` lives
+in the PayoutReceiver.
+
+**Binding.** `PayoutReceiver::set_settlement_adapter(caller, adapter)` (Admin) accepts only a
+contract whose `payout_receiver()` returns this PayoutReceiver; anything else, the
+PayoutReceiver itself, or a non-adapter contract is `SettlementAdapterNotBound` (328). It is
+not pause-gated (an incident swap). `SettlementAdapter::set_payout_receiver` (Admin) may
+rotate at any time; the old PayoutReceiver's next record fails 500 and its obligations stay
+markable. Until the first binding, determinations fail closed (3 / 500); `deploy.sh` and
+`verify-deployment.sh` enforce it.
+
+**Storage and TTL.** Instance: `PayoutReceiver`, `NextObligationId`. Persistent:
+`Obligation(id)`, `ObligationOf(PR, policy)`, `OrgObligationAt(org, i)` below 30 d → 60 d on
+every write and by `extend_obligation_ttl` while not Settled; `OrgObligationCount(org)` at
+least 60 d. A Settled obligation is left to archive: it is restorable, and an archived entry
+fails closed (the host refuses the read), so record and mark trap rather than recreate it
+fresh. Every state-changing entrypoint calls `touch_contract` (below 3 d → 10 d);
+`extend_contract_ttl` keeps it alive (below 23 d → 30 d), and `PayoutReceiver::
+extend_contract_ttl` covers the adapter. `get_org_obligations` pages are capped at 50.
+
+**Removed.** `crates/treasury` (code, tests, snapshots); `ITreasury`; `TreasuryError`;
+`PolicyManager::mark_claim_pending` and `PolicyClaimPending`; `PayoutReceiver::
+settle_pending_claim`, `is_claim_pending`, `ClaimPending(u64)`, and the events
+`PayoutInitiated`, `ClaimAwaitingFunding`, `PendingClaimSettled`; `receive_premium` (the
+premium proof stays off-chain, the M-Pesa reference); the USDC SAC everywhere.
+
+**Retired codes (never reuse).** Errors 200..=226 (the whole 200..=299 range, 215/216
+included), `NoPendingClaim` 319 (variant kept, never raised), `PolicyStatus` ordinal 5
+(`ClaimPending`; the backend keeps it for decoding legacy deployments), `Role` 3 (`Payout`;
+variant kept). New: `Role::Funder = 7`, `ObligationStatus {Owed 0, Funded 1, Settled 2}`,
+`PayoutError` 328/329, `AdapterError` 500..=508 (508 `CounterOverflow`, unreachable, replaces
+two bare panics). All pinned by `shared/src/abi_tests.rs`.
+
+**Testnet-only fixture.** `crates/testnet-policy-fixture` (`TestnetPolicyFixture`) implements
+the `IPolicyManager` methods the PayoutReceiver calls; its admin injects policy state with
+`set_policy` (not a sale), and its constructor panics on the mainnet network id. It is a
+workspace member but not a default member, so `deploy.sh` never builds or deploys it. It
+exists for `scripts/testnet-evidence.sh` (runbook *Testnet evidence*).
+
+**Why positive evidence on the real contracts takes a season.** `activate_policy` sets
+`start_date = now`; a drought determination needs `season_start >= start_day`,
+`assessed_at >= season_start + 110 d` (327), and freshness `now <= assessed_at + 3600`. So
+the earliest positive result on a real sale is 110 days after activation (~117 with the
+archive lag; around Feb 2027 if activated now, and Jul–Sep 2027 through the backend's KE
+long-rains sale gate). The crop path settles `Comprehensive` only (320), which `create_policy`
+refuses (118). Earlier testnet runs (`deploy-v2`) hit exactly #327, #326, #322 and #118.
+Hence the two evidence lanes: Lane P (real contracts, stops at #327 before signature
+recovery) and Lane E (identical WASM on the fixture, a real 2022 ERA5 season signed by a
+throwaway key). Testnet resets roughly quarterly may intervene before 110 days; a durable
+production-lane proof may need mainnet with a tiny sum insured. A real M-Pesa receipt behind
+`mark_settled` needs a real payout.
+
+**Stellar skill checklists** (`stellar-dev` smart-contracts skill, `security.md` and
+`testing.md`). Satisfied by this design:
+
+- privileged functions authorised against storage: `record_obligation` = stored
+  PayoutReceiver + `require_auth`; marks = the stored Funder grant only;
+  `set_payout_receiver`, `grant_role`, `revoke_role`, `set_settlement_adapter` = Admin;
+  `upgrade` = Upgrader;
+- re-auth at every layer: the PayoutReceiver passes its own address and the adapter
+  `require_auth`s it; marks `require_auth` the caller;
+- initialisation once (`__constructor`);
+- external calls allowlisted and return values checked: the adapter is admin-set, bound by
+  handshake (328) and its return value is checked (329); the adapter makes no external calls
+  (classes 4, 9);
+- arithmetic: `amount > 0`, ids and counts `checked_add`, `overflow-checks = true` (class 5);
+- typed `#[contracttype]` storage keys (class 6);
+- TTL: persistent obligations extended on touch plus a keeper; no temporary storage in the
+  adapter, so no TTL-as-security (class 8);
+- bounded loops: pages capped at 50 (class 10);
+- events for every obligation transition and config change; no error code renumbered;
+- upgrade gated and tested; pause not applicable (the adapter is not value-bearing; the
+  PayoutReceiver pause stays and stops new obligations);
+- tests: `try_` error paths, edge amounts (0, −1, `i128::MIN`), `env.auths()` trees and
+  `set_auths(&[])`, `to_xdr` event equality, `get_ttl`, real-contract integration plus an
+  `#[ignore]`d real-WASM lane, a proptest, committed snapshots.
+
+**Flags against the checklists (open):**
+
+1. No `.github` CI and no SEP-55 release or build attestation; `deploy.sh` deploys a local
+   build, the skill says to deploy the release artifact. The repo is public, so the
+   attestation workflow is available. `verify-deployment.sh` step 7 (on-chain wasm hash ==
+   local optimized build) is a stand-in.
+2. Auditable state changes without events: the adapter's `grant_role` / `revoke_role` now
+   emit `RoleGranted` / `RoleRevoked` (Funder is its most powerful grant). Still silent in
+   PolicyManager, PayoutReceiver and PolicyNft: `grant_role`, `revoke_role`,
+   `set_network_domain`, `pause`, `unpause`, `upgrade`. Fix in `shared/roles.rs` plus the
+   setters, as a follow-up.
+3. `upgrade` refusal tests exist for PolicyManager, PayoutReceiver and the adapter. The
+   happy path is covered only by the `#[ignore]`d `wasm_lane_full_flow`: the Upgrader swaps
+   each of the three to a different WASM hash (the unoptimized build of the same code) and
+   all state survives. A schema-changing upgrade (a real v2) is not tested.
+4. One key (`alice` on testnet) holds Admin and Upgrader everywhere. With a settable adapter,
+   Admin can redirect obligations, which equals Upgrader power. Mainnet should use a multisig
+   or custom account and a timelock on `set_settlement_adapter` (D-B3).
+5. (Fixed) `require_plot` used an unchecked `(i128 - i128).abs()` and trapped on an extreme
+   coordinate; it now uses `checked_sub` / `checked_abs` and returns 321 (tested with
+   `i128::MIN` / `i128::MAX`).
+6. Attestation centralisation: the Funder, and only the Funder, can mark any obligation
+   settled. Mitigated by the reference-hash trail, revocable (and now evented) role grants
+   and the transition events; documented, not solved. §8 backend requirement: treat only a
+   `Settled` whose `settled_by` is the backend's Funder account as payment completion, and
+   alert on anything else (defence in depth if a second Funder is ever granted).
+7. Integration tests register native rlib contracts; the `#[ignore]`d `wasm_lane_full_flow`
+   covers the compiled WASM and must be run explicitly.
+8. Optional hardening: the PayoutReceiver could require `NetworkDomain ==
+   env.ledger().network_id()`, removing an admin misconfiguration class.
+9. Adapter swap and rent: after `set_settlement_adapter`, the PayoutReceiver's keeper calls
+   reach only the new adapter. The §8 keeper (`passPolicyTtl` / `passObligations`) must also
+   call `extend_contract_ttl()` daily on every previous adapter that still has an obligation
+   not Settled, and `extend_obligation_ttl(id)` directly on `claim.adapterContractId`
+   (runbook, keeper step 3).
+
+**Open decisions (product owner).**
+
+- **D-B1, who pays and when.** Default here: MicroCrop off-ramps as paying agent as soon as
+  the obligation is `Owed`; `Funded` = off-ramp order accepted, `Settled` = M-Pesa receipt.
+  MicroCrop carries the credit exposure until the partner reimburses off-chain. Alternative:
+  hold the off-ramp until the partner remits (`Funded` = remittance confirmed by ops).
+- **D-B2, Tier 1 on Stellar.** A partner-attested trigger (`PartnerSettlementReport` →
+  `mark_settled`) needs Tier 1 sales on Stellar and sign-off to relax the backend's
+  partner-settlement / money-path separation guard.
+- **D-B3, mainnet governance.** Multisig for Admin/Upgrader, and a timelock on
+  `set_settlement_adapter`, before any mainnet deploy.

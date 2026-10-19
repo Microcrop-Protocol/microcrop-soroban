@@ -15,7 +15,7 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 microcrop-shared = { workspace = true }
 # The four REAL contract crates (rlib halves of their cdylib/rlib builds). NO mocks here.
 microcrop-policy-manager = { path = "../policy-manager" }
-microcrop-treasury = { path = "../treasury" }
+microcrop-settlement-adapter = { path = "../settlement-adapter" }
 microcrop-payout-receiver = { path = "../payout-receiver" }
 microcrop-policy-nft = { path = "../policy-nft" }
 # Host-side (std) secp256k1 signer used ONLY in tests to produce a real recoverable signature

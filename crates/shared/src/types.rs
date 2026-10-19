@@ -36,8 +36,12 @@ pub enum CoverageType {
     Comprehensive = 4,
 }
 
-/// Policy lifecycle states — ordinals 0..4 preserved from `PolicyManager.PolicyStatus`;
-/// `ClaimPending` (5) is Soroban-only.
+/// Policy lifecycle states — ordinals 0..4 preserved from `PolicyManager.PolicyStatus`.
+///
+/// Ordinal 5 is retired: it was `ClaimPending`, the custodial "verified but the org reserve is
+/// short" state of the Treasury era. Option B (SettlementAdapter) records an obligation
+/// instead and the policy goes straight to `Claimed`. Never reuse 5: off-chain decoders keep
+/// it for legacy Treasury-era deployments.
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -47,11 +51,7 @@ pub enum PolicyStatus {
     Expired = 2,
     Cancelled = 3,
     Claimed = 4,
-    /// A valid determination was verified but the org reserve could not pay it in full. The
-    /// claim is recorded in Treasury and settles via `PayoutReceiver::settle_pending_claim`
-    /// once the reserve covers it. The policy cannot expire, be cancelled, or be settled by
-    /// another determination while in this state; it moves to `Claimed` on settlement.
-    ClaimPending = 5,
+    // 5 retired (custodial pending claim); never reuse.
 }
 
 /// Access-control roles. Replaces the `keccak256("..._ROLE")` `bytes32` role ids of
@@ -63,12 +63,14 @@ pub enum Role {
     /// `DEFAULT_ADMIN_ROLE` + `ADMIN_ROLE` — grants/revokes roles, config, pause, and the
     /// escape hatch of cancelling an ACTIVE policy.
     Admin = 0,
-    /// `BACKEND_ROLE` — create/activate policies, cancel PENDING ones; receive premiums.
+    /// `BACKEND_ROLE` — create/activate policies, cancel PENDING ones.
     /// (Cancelling ACTIVE cover is Admin-only; expiry is permissionless.)
     Backend = 1,
     /// `ORACLE_ROLE` — mark claimed / increment claim count (PayoutReceiver only).
     Oracle = 2,
-    /// `PAYOUT_ROLE` — request payouts (PayoutReceiver only).
+    /// Retired with the Treasury (was `PAYOUT_ROLE`, the PayoutReceiver's right to draw an
+    /// org reserve). Kept so the ordinal stays reserved; nothing grants or checks it. Never
+    /// reuse 3.
     Payout = 3,
     /// `RELAYER_ROLE` — anti-spam gate on who may submit a determination.
     Relayer = 4,
@@ -76,6 +78,10 @@ pub enum Role {
     Upgrader = 5,
     /// `MINTER_ROLE` — mint policy certificate NFTs (PolicyManager only).
     Minter = 6,
+    /// SettlementAdapter only: may mark ANY org's obligation funded or settled. Held by the
+    /// MicroCrop backend account, the paying agent that runs the mobile-money off-ramp. Its
+    /// marks are attestations, not proof of payment (see `Obligation`).
+    Funder = 7,
 }
 
 /// Insurance policy — mirrors `PolicyManager.Policy`, plus the v3 backing `org`
@@ -98,7 +104,8 @@ pub struct Policy {
     pub coverage_type: CoverageType,
     pub status: PolicyStatus,
     pub created_at: u64,
-    /// v3 backing org (the org's wallet address whose reserve funds any payout).
+    /// The backing org (the partner that owes any payout). Under Option B the org's
+    /// obligations are recorded in the SettlementAdapter; nothing on-chain holds its money.
     pub org: Address,
 }
 
@@ -237,4 +244,55 @@ pub struct PolicyCertificate {
     pub region: String,
     pub plot_id: u64,
     pub is_active: bool,
+}
+
+/// Lifecycle of a SettlementAdapter obligation. Status only ever moves forward:
+/// `Owed -> Funded -> Settled`, or `Owed -> Settled` when funding is implicit.
+///
+/// Disputed / Waived are deliberately absent: a waive by the obligor is self-dealing and a
+/// dispute needs an adjudicator role. Adding variants later is forward-compatible.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum ObligationStatus {
+    /// Recorded by the PayoutReceiver after a verified determination. Nobody has paid yet.
+    Owed = 0,
+    /// The funder (or the org) attests that money to pay the farmer has been committed, e.g.
+    /// the mobile-money off-ramp order was accepted.
+    Funded = 1,
+    /// The funder (or the org) attests that the farmer was paid, e.g. the M-Pesa receipt.
+    Settled = 2,
+}
+
+/// A verified payout obligation, recorded by the SettlementAdapter. The adapter holds no
+/// tokens: `amount` is a unit of account (USDC, 7dp base units), not a balance.
+///
+/// `Funded` / `Settled` are ATTESTATIONS by a `Role::Funder` holder (never the org itself),
+/// identified by a 32-byte reference hash of an off-chain payment record. They are an
+/// audit trail, not proof of payment.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Obligation {
+    /// Adapter-assigned id, from 1.
+    pub id: u64,
+    /// The PayoutReceiver that recorded it; also the namespace of `policy_id`.
+    pub payout_receiver: Address,
+    pub policy_id: u64,
+    pub org: Address,
+    /// USDC base units (7dp). Unit of account only: no token moves.
+    pub amount: i128,
+    /// The PayoutReceiver's on-chain determination digest (`DeterminationVerified.preimage_hash`).
+    pub determination_digest: BytesN<32>,
+    pub status: ObligationStatus,
+    pub recorded_at: u64,
+    /// Position of this obligation in the org's index (`get_org_obligations`).
+    pub org_index: u32,
+    pub funded_by: Option<Address>,
+    /// Unix seconds; 0 until Funded.
+    pub funded_at: u64,
+    pub funding_reference: Option<BytesN<32>>,
+    pub settled_by: Option<Address>,
+    /// Unix seconds; 0 until Settled.
+    pub settled_at: u64,
+    pub settlement_reference: Option<BytesN<32>>,
 }

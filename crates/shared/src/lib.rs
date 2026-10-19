@@ -20,3 +20,6 @@ pub mod interfaces;
 pub mod roles;
 pub mod ttl;
 pub mod types;
+
+#[cfg(test)]
+mod abi_tests;

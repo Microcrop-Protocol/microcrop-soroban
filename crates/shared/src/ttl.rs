@@ -1,11 +1,11 @@
-//! Storage TTL policy shared by all four contracts: a rent cap.
+//! Storage TTL policy shared by all the contracts: a rent cap.
 //!
 //! Soroban rents storage. Extending an entry's TTL charges, up front, the rent for every
 //! ledger it is extended by. The previous policy extended every entry, the instance and the
 //! contract CODE to the network maximum (~180 days) on every touch. Because a fresh upload
 //! starts at the network minimum (7 days on testnet), the first ordinary call to each
 //! contract paid ~173 days of code rent: 362–833 XLM per contract on testnet, charged to
-//! whichever user or money-path call happened to touch it first (`receive_premium`,
+//! whichever user or money-path call happened to touch it first (then `receive_premium`,
 //! `submit_determination`). The per-day cost of keeping code alive is a property of the
 //! network and the wasm size; this module only decides **who pays it, and when**.
 //!
@@ -17,21 +17,20 @@
 //! | instance + code, keeper | below 23 d -> 30 d | permissionless `extend_contract_ttl()` ([`keep_contract_alive`]) |
 //! | role grants | below 30 d -> 60 d | grant and every use ([`extend_role`]) |
 //! | per-policy entries | need = `end_date + 30 d`, clamped to the max | the lifecycle calls ([`extend_for_policy`]) |
-//! | pending-claim entries | below 30 d -> 60 d | settlement attempts, `extend_policy_ttl` ([`extend_pending`]) |
+//! | open obligations (Owed/Funded) + their lookup/index items | below 30 d -> 60 d | record, every mark, `extend_obligation_ttl` ([`extend_pending`]) |
 //! | shared per-farmer / per-org entries | `max(current, need, 60 d)` | every touch ([`extend_shared`]) |
 //!
 //! ## Archived entries fail closed
 //! The host refuses to read an expired persistent entry ("accessing no-longer-live entry");
-//! the transaction has to restore it first. So an archived `PolicyPaid`, `PayoutProcessed`,
-//! `PremiumReceived`, role grant or reserve never reads as absent or `false`: the call traps,
+//! the transaction has to restore it first. So an archived `PolicyPaid`, obligation,
+//! obligation lookup or role grant never reads as absent or `false`: the call traps,
 //! or the entry is restored and reads its true value. Instance flags (paused, signer, network
 //! domain, enabled methodologies) archive with the whole instance, which makes the contract
 //! unusable rather than unpaused. Shortening a TTL therefore changes cost and availability,
 //! never correctness. Rules that keep it so: no security flag lives in temporary storage
-//! except the redundant replay marker, and no positive guard (`PolicyPaid`,
-//! `PayoutProcessed`, `PremiumReceived`) is ever `remove()`d. Entries that are removed
-//! (revoked role grants, `ClaimPending`, Treasury's `PendingPayout` and `OrgQueueAt`,
-//! `PendingCounted`) are removed only when their absence is the correct state.
+//! except the redundant replay marker, and no positive guard (`PolicyPaid`, an obligation or
+//! its `ObligationOf` lookup) is ever `remove()`d. Entries that are removed (revoked role
+//! grants, `PendingCounted`) are removed only when their absence is the correct state.
 //!
 //! ## Measured network limits (2026-10-13, `getLedgerEntries` on `ConfigSettingStateArchival`)
 //!
@@ -63,7 +62,7 @@ pub const KEEPER_TARGET_LEDGERS: u32 = 30 * DAY_LEDGERS;
 pub const ROLE_THRESHOLD_LEDGERS: u32 = 30 * DAY_LEDGERS;
 /// See [`ROLE_THRESHOLD_LEDGERS`].
 pub const ROLE_TARGET_LEDGERS: u32 = 60 * DAY_LEDGERS;
-/// Pending-claim entries: extended when below 30 days, to 60 days.
+/// Open-obligation entries: extended when below 30 days, to 60 days.
 pub const PENDING_THRESHOLD_LEDGERS: u32 = 30 * DAY_LEDGERS;
 /// See [`PENDING_THRESHOLD_LEDGERS`].
 pub const PENDING_TARGET_LEDGERS: u32 = 60 * DAY_LEDGERS;
@@ -142,7 +141,7 @@ pub fn extend_for_policy<K: IntoVal<Env, Val>>(env: &Env, key: &K, end_date: u64
     extend_to(env, key, n);
 }
 
-/// Pending-claim entry: extend below 30 days to 60 days.
+/// Open-obligation entry (SettlementAdapter): extend below 30 days to 60 days.
 pub fn extend_pending<K: IntoVal<Env, Val>>(env: &Env, key: &K) {
     let max = env.storage().max_ttl();
     env.storage().persistent().extend_ttl(
