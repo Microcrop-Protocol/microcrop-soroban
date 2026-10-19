@@ -9,6 +9,10 @@ off-chain. Two scripts do the work:
 ./scripts/deploy.sh --network testnet --dry-run   # print every call, change nothing
 ./scripts/deploy.sh --network testnet             # do it
 ./scripts/verify-deployment.sh --network testnet  # read the result back
+
+# mainnet: only the SEP-55 verified build of a release tag (see "Cutting a release")
+./scripts/deploy.sh --network mainnet --release v0.2.0
+./scripts/verify-deployment.sh --network mainnet --release v0.2.0
 ```
 
 ---
@@ -33,7 +37,8 @@ identical wiring against all four real contracts. It is verified, not remembered
 |---|---|
 | `stellar` CLI | `cargo install --locked stellar-cli` |
 | `jq` | `brew install jq` |
-| Built wasm | `cargo build --release --target wasm32v1-none` — produces 4 artifacts (47–76 KB; the script optimizes them to 40–63 KB). The testnet fixture is not a default member and is never built or deployed by `deploy.sh` |
+| `gh` CLI, logged in | `brew install gh && gh auth login`. Needed for `--release`: it downloads the release assets and verifies their build attestations |
+| The wasm | **Mainnet:** a release tag (`--release vX.Y.Z`); nothing to build. **Testnet:** either a release tag or a local build, `cargo build --release --target wasm32v1-none` (4 artifacts; the script optimizes them). The testnet fixture is not a default member and is never built, released or deployed by `deploy.sh` |
 | Funded admin identity | `stellar keys generate deployer --network testnet --fund` |
 
 ### Environment
@@ -166,9 +171,12 @@ Checks, and exits non-zero on any failure:
 4. the signer and domain;
 5. CROP_DROUGHT enabled, the retired CROP_DAMAGE disabled;
 6. every instance and code entry has at least 23 days of TTL left;
-7. each deployed instance's wasm hash equals `sha256` of the local `*.optimized.wasm`. This
-   proves the chain runs the bytes in `target/`, not that `target/` came from a given commit;
-   it stands in for a SEP-55 build attestation until a release workflow exists.
+7. each deployed instance's wasm hash equals `sha256` of the **attested release asset** for
+   `--release <tag>` (default: the release `deploy.sh` recorded in the state file), after that
+   asset's build attestation has been verified. Together that says the chain runs bytes a
+   GitHub workflow built from the tagged commit. A deployment made from a local build is
+   compared with the local `*.optimized.wasm` instead, which proves only that the chain runs
+   the bytes in `target/`; on mainnet that case fails.
 
 Set `BACKEND_ADDR`, `RELAYER_ADDR`, `FUNDER_ADDR` and `AUTHORIZED_SIGNER_PUBKEY` in the
 environment to enable every check. `--state-dir` points it at a deployment made with
@@ -189,7 +197,8 @@ Set `BACKEND_ADDR` and `RELAYER_ADDR` in the environment to check those grants t
 
 ## Mainnet
 
-`--network mainnet` requires typing a confirmation phrase.
+`--network mainnet` requires `--release <tag>` (a local build is refused, `--dry-run`
+included) and typing a confirmation phrase. See **Cutting a release** below.
 
 **Before you do:** these contracts have had **no Soroban security audit**. The Solidity
 originals were reviewed in-house only; the Rust port has not been reviewed at all. The
@@ -202,6 +211,108 @@ is Upgrader-equivalent power. Use a multisig or custom account, and consider a t
 
 Storage TTL follows the rent cap (see **Storage rent: the keeper** below); the restore cost
 of an entry that archives anyway has not been measured.
+
+---
+
+## Cutting a release (SEP-55 verified build)
+
+Nothing on chain ties a WASM hash to source code. [SEP-55](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0055.md)
+closes that gap: GitHub Actions builds the contract with its source repository stamped into
+the WASM's `contractmetav0` (`source_repo=github:Microcrop-Protocol/microcrop-soroban`) and
+publishes a GitHub build attestation over the binary. Anyone can then walk from the on-chain
+hash to the commit and the workflow run that produced it. The repository is public, which
+the attestation needs: verifiers read it unauthenticated.
+
+### Steps
+
+1. **Merge to `master`** with CI green (`.github/workflows/ci.yml`: fmt, clippy
+   `-D warnings`, `cargo test --workspace`, `stellar contract build` of every contract crate
+   with the release CLI, the source_repo check, a size report, and the real-WASM lane).
+2. **Tag the merged commit** with a plain semver tag and push it:
+   ```bash
+   git tag -a v0.2.0 -m "v0.2.0" <merged-commit> && git push origin v0.2.0
+   ```
+   `.github/workflows/release.yml` runs. A guard job (read-only) refuses a tag that is not
+   `vMAJOR.MINOR.PATCH[-pre]` or whose commit is not on `master`. Then one job per contract
+   calls `stellar-expert/soroban-build-workflow` with `package: <crate>`.
+3. **Release assets.** Each job creates its own GitHub release, named
+   `v0.2.0_<crate>_pkg<crate-version>_cli25.1.0` (the `_pkg…` part is omitted when the tag
+   equals the crate version), with one asset, `<crate>_v<crate-version>.wasm`, already
+   optimized, plus a build attestation over that file. It also registers the build with
+   stellar.expert's contract validation. Four contracts, four releases:
+   `microcrop-policy-nft`, `microcrop-policy-manager`, `microcrop-settlement-adapter`,
+   `microcrop-payout-receiver`. The testnet fixture is never released.
+4. **Deploy those files**, never a local rebuild (a different compiler environment gives a
+   different hash, which matches no attestation):
+   ```bash
+   ./scripts/deploy.sh --network testnet --release v0.2.0     # rehearse first
+   ./scripts/deploy.sh --network mainnet --release v0.2.0
+   ./scripts/verify-deployment.sh --network mainnet --release v0.2.0
+   ```
+   `deploy.sh` downloads the four assets to `<state-dir>/releases/v0.2.0/` and, before
+   deploying anything, verifies each one:
+   ```bash
+   gh attestation verify <file> --repo Microcrop-Protocol/microcrop-soroban \
+     --signer-workflow stellar-expert/soroban-build-workflow/.github/workflows/release.yml \
+     --signer-digest e43b241f114bcf02151c30d61088506c6ad3ae0b \
+     --source-ref refs/tags/v0.2.0 --deny-self-hosted-runners
+   ```
+   and checks its `source_repo` metadata. Any failure stops the deploy. The release is
+   recorded in the state file, and a resume with a different release or a local build is
+   refused. `--signer-workflow` is required: the attestation is signed by the reusable
+   workflow, not by a workflow in this repository, so a bare `--repo` check rejects it.
+   `--release-dir <dir>` uses assets already on disk (still verified).
+
+To upgrade a live contract, cut a release the same way and `stellar contract upload` the
+release asset; pass its hash to `upgrade`.
+
+### What it proves, and what it does not
+
+It proves that a specific GitHub Actions run of the pinned workflow built this exact binary
+from this commit of this repository. It says **nothing** about whether that code is correct
+or safe, or whether anyone reviewed it. These contracts have had no Soroban audit; a verified
+build of them is a verified build of unaudited code.
+
+### Residual risk in the pin
+
+`release.yml` pins `soroban-build-workflow` to a full commit SHA (`e43b241f…`, release
+v25.1.0), resolved from its latest release and read at that SHA before pinning: it checks out
+the tagged commit, builds from source, and attests the same file it uploads. The pin freezes
+that one file only. The actions it calls (`actions/checkout@v4`, `stellar/stellar-cli@v25.1.0`,
+`actions/setup-node@v4`, `actions/attest-build-provenance@v1`) are on mutable tags, resolve at
+run time with this job's `contents: write`, `id-token: write` and `attestations: write`, and
+cannot be pinned by a caller. If that is unacceptable, fork the workflow into this
+organisation, pin those actions to SHAs in the fork, and point `release.yml` (and
+`RELEASE_SIGNER_WORKFLOW` in `scripts/lib/release.sh`) at the fork.
+
+Bumping the pin: resolve the new latest release
+(`gh release view --repo stellar-expert/soroban-build-workflow`), its SHA
+(`gh api repos/stellar-expert/soroban-build-workflow/commits/<tag> --jq .sha`), read
+`.github/workflows/release.yml` at that SHA, then update the SHA in `release.yml` and
+**append** it to `RELEASE_SIGNER_DIGESTS` in `scripts/lib/release.sh` (old releases keep
+verifying against the old digest). The CLI version in `ci.yml` (`STELLAR_CLI_VERSION`) should
+follow the CLI that workflow uses.
+
+`home_domain` is not set: MicroCrop serves no SEP-1 `stellar.toml` yet. Add
+`home_domain: <bare domain>` to `release.yml` once one exists.
+
+### How anyone checks a deployed contract
+
+- **stellar.expert**: open the contract; its build info shows the source repository, the
+  commit and the workflow run when the hash matches a registered build.
+- **Stellar Lab, contract explorer**: the
+  [build info](https://developers.stellar.org/docs/tools/lab/smart-contracts/contract-explorer#build-info)
+  panel reads the same metadata and attestation.
+- **By hand**:
+  ```bash
+  stellar contract fetch --id <C...> --network mainnet --out-file deployed.wasm
+  stellar contract info meta --wasm deployed.wasm     # source_repo=github:Microcrop-Protocol/microcrop-soroban
+  gh attestation verify deployed.wasm --repo Microcrop-Protocol/microcrop-soroban \
+    --signer-workflow stellar-expert/soroban-build-workflow/.github/workflows/release.yml
+  # or without gh: https://api.github.com/repos/Microcrop-Protocol/microcrop-soroban/attestations/sha256:<sha256 of deployed.wasm>
+  ```
+  The verified output names the source commit (`sourceRepositoryDigest`) and tag
+  (`sourceRepositoryRef`) to review.
 
 ---
 

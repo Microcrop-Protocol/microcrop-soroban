@@ -729,10 +729,13 @@ production-lane proof may need mainnet with a tiny sum insured. A real M-Pesa re
 
 **Flags against the checklists (open):**
 
-1. No `.github` CI and no SEP-55 release or build attestation; `deploy.sh` deploys a local
-   build, the skill says to deploy the release artifact. The repo is public, so the
-   attestation workflow is available. `verify-deployment.sh` step 7 (on-chain wasm hash ==
-   local optimized build) is a stand-in.
+1. (Addressed, not yet exercised) CI and a SEP-55 release now exist: `ci.yml` on every PR,
+   `release.yml` builds and attests each contract on a `vX.Y.Z` tag through
+   `soroban-build-workflow` pinned to a reviewed SHA; `deploy.sh --release` deploys only
+   verified release assets and mainnet refuses a local build; `verify-deployment.sh` step 7
+   compares the on-chain hash with the attested asset. No release has been cut yet, so the
+   workflow has not run on this repo. Residual: the reusable workflow's own actions are on
+   mutable tags (runbook, *Cutting a release*).
 2. Auditable state changes without events: the adapter's `grant_role` / `revoke_role` now
    emit `RoleGranted` / `RoleRevoked` (Funder is its most powerful grant). Still silent in
    PolicyManager, PayoutReceiver and PolicyNft: `grant_role`, `revoke_role`,
