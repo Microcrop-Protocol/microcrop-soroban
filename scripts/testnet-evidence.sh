@@ -127,7 +127,7 @@ inv() {                          # inv <label> <source> <contract> [cli flags...
   LAST_OUT="$(stellar contract invoke --id "$id" --source "$src" --network "$NETWORK" \
       ${extra[@]+"${extra[@]}"} "$@" 2>&1)" || rc=$?
   printf '%s\n' "$LAST_OUT" > "$LOGS/$label.log"
-  LAST_HASH="$(printf '%s' "$LAST_OUT" | grep -o 'Signing transaction: [0-9a-f]*' | tail -1 | awk '{print $3}')"
+  LAST_HASH="$(printf '%s' "$LAST_OUT" | { grep -o 'Signing transaction: [0-9a-f]*' || true; } | tail -1 | awk '{print $3}')"
   return "$rc"
 }
 ok_inv() {                       # like inv, but must succeed; records the tx
