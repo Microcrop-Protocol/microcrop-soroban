@@ -263,8 +263,63 @@ the attestation needs: verifiers read it unauthenticated.
    workflow, not by a workflow in this repository, so a bare `--repo` check rejects it.
    `--release-dir <dir>` uses assets already on disk (still verified).
 
-To upgrade a live contract, cut a release the same way and `stellar contract upload` the
-release asset; pass its hash to `upgrade`.
+   It then checks that **all four assets were built from one commit, and that the tag still
+   points at it**. Each attestation only says "built from `refs/tags/v0.2.0`"; a tag that was
+   deleted and re-pushed on another commit after a partial failure (see *A release that fails
+   partway*) can leave a release whose four assets carry the same tag but come from two
+   commits. `deploy.sh`, `verify-deployment.sh` and `verify-release.sh` all refuse that, and a
+   tag that moved after the build. An attestation that names no source commit is refused too.
+
+**To upgrade a live contract**, cut a release the same way, then verify it before uploading
+anything. `upgrade` takes a hash, so nothing on the upgrade path checks the attestation for
+you:
+
+```bash
+./scripts/verify-release.sh v0.2.1        # downloads to releases/v0.2.1/, verifies all four,
+                                          # prints each file's sha256; exits non-zero on any failure
+HASH=$(stellar contract upload --wasm releases/v0.2.1/microcrop-settlement-adapter_v<ver>.wasm \
+  --source admin --network mainnet)
+# then `upgrade` with $HASH, which must equal the sha256 verify-release.sh printed
+```
+
+### A release that fails partway
+
+The reusable workflow creates the GitHub release **before** it attests the file. If a job
+fails between the two (the stellar.expert registration call has a 15-second timeout and sits
+between them), that contract's release exists with no attestation. `deploy.sh` refuses it
+("NO valid attestation"), so nothing unsafe ships, but "Re-run failed jobs" fails too: the
+release name is taken.
+
+Recover without moving the tag:
+
+1. Delete **only** the broken per-contract release and its tag:
+   ```bash
+   gh release delete v0.2.0_<crate>_..._cli25.1.0 --cleanup-tag --yes \
+     --repo Microcrop-Protocol/microcrop-soroban
+   ```
+2. On the same workflow run, **Re-run failed jobs**. It rebuilds from the same tagged commit.
+3. `./scripts/verify-release.sh v0.2.0` before deploying.
+
+**Never delete, move or re-push the `vX.Y.Z` tag itself.** The jobs whose releases survived
+would not rebuild, and the release would mix two commits. If the tagged commit itself is
+wrong, cut `vX.Y.Z+1`.
+
+### Protect the tags and master (repository settings, once)
+
+Anyone with write access can push a `v*` tag on any master commit, and that starts a run
+with `contents: write`, `id-token: write` and `attestations: write`. The guard job checks
+the tag's format and that its commit is on `master`; it does not check who pushed it or
+whether CI passed on it. Close that in **Settings → Rules → Rulesets**:
+
+- a **tag** ruleset that includes `v*` and **excludes `v*_*`**: restrict creations, updates
+  and deletions to the release maintainers (bypass list), and block force pushes. With
+  updates and deletions restricted, a `vX.Y.Z` cannot be moved. The exclusion matters: the
+  per-contract `v*_*` tags are created by the workflow's `GITHUB_TOKEN`, and a ruleset that
+  covered them would fail every release. Those tags never trigger `release.yml`.
+- a **branch** ruleset on `master`: require a pull request and the `CI` status checks
+  (`.github/workflows/ci.yml`) to pass, and block force pushes.
+
+Neither is set yet. They are repository settings, not files, so this branch cannot add them.
 
 ### What it proves, and what it does not
 
@@ -285,12 +340,23 @@ cannot be pinned by a caller. If that is unacceptable, fork the workflow into th
 organisation, pin those actions to SHAs in the fork, and point `release.yml` (and
 `RELEASE_SIGNER_WORKFLOW` in `scripts/lib/release.sh`) at the fork.
 
+Two behaviours of the pinned workflow to know about, both covered by the checks above:
+
+- **Its per-contract tags are created at `master`'s head, not the built commit.** It runs
+  `gh release create` without `--target`, so each `vX.Y.Z_<crate>_…` tag, and the release's
+  "Source code" archive, point at whatever `master` was when the job ran. The build itself
+  checks out the `vX.Y.Z` commit. **The attestation's `sourceRepositoryDigest` is the
+  authoritative source commit**, not the per-contract tag and not the archive.
+- **It creates the release before it attests the file**, so a failed attestation leaves a
+  release with no attestation. Verification refuses it; recovery is above.
+
 Bumping the pin: resolve the new latest release
 (`gh release view --repo stellar-expert/soroban-build-workflow`), its SHA
 (`gh api repos/stellar-expert/soroban-build-workflow/commits/<tag> --jq .sha`), read
 `.github/workflows/release.yml` at that SHA, then update the SHA in `release.yml` and
 **append** it to `RELEASE_SIGNER_DIGESTS` in `scripts/lib/release.sh` (old releases keep
-verifying against the old digest). The CLI version in `ci.yml` (`STELLAR_CLI_VERSION`) should
+verifying against the old digest), and update the `--signer-digest` in `release.yml`'s
+`release_description`. The CLI version in `ci.yml` (`STELLAR_CLI_VERSION`) should
 follow the CLI that workflow uses.
 
 `home_domain` is not set: MicroCrop serves no SEP-1 `stellar.toml` yet. Add
@@ -308,7 +374,8 @@ follow the CLI that workflow uses.
   stellar contract fetch --id <C...> --network mainnet --out-file deployed.wasm
   stellar contract info meta --wasm deployed.wasm     # source_repo=github:Microcrop-Protocol/microcrop-soroban
   gh attestation verify deployed.wasm --repo Microcrop-Protocol/microcrop-soroban \
-    --signer-workflow stellar-expert/soroban-build-workflow/.github/workflows/release.yml
+    --signer-workflow stellar-expert/soroban-build-workflow/.github/workflows/release.yml \
+    --signer-digest e43b241f114bcf02151c30d61088506c6ad3ae0b --deny-self-hosted-runners
   # or without gh: https://api.github.com/repos/Microcrop-Protocol/microcrop-soroban/attestations/sha256:<sha256 of deployed.wasm>
   ```
   The verified output names the source commit (`sourceRepositoryDigest`) and tag

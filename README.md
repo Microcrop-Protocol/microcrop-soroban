@@ -155,12 +155,17 @@ cargo fmt --all -- --check                     ->  clean
   a GitHub release with its WASM and a build attestation over it; stellar.expert and Stellar
   Lab show the source commit for the deployed hash.
 - **Deploy the release, not a local build:** `./scripts/deploy.sh --network mainnet
-  --release vX.Y.Z` verifies every asset's attestation before deploying it, and mainnet
-  refuses anything else.
+  --release vX.Y.Z` verifies every asset's attestation, and that all four come from the
+  one commit the tag points at, before deploying it; mainnet refuses anything else.
+  `./scripts/verify-release.sh vX.Y.Z` runs the same checks on their own (use it before an
+  `upgrade`).
 
 A verified build proves which commit a workflow run built the binary from. It does not prove
 the code is safe; these contracts are unaudited. The pin covers the reusable workflow file,
-not the actions it calls, which are on mutable tags. Steps, verification commands and the
+not the actions it calls, which are on mutable tags. That workflow creates each release
+before attesting it and tags it at `master`'s head, so the attestation's source commit, not
+the release's tag or archive, is the authoritative one. Tag and `master` rulesets are not set
+yet (runbook, *Protect the tags and master*). Steps, verification commands and the
 residual risk: [`docs/DEPLOYMENT_RUNBOOK.md`](docs/DEPLOYMENT_RUNBOOK.md), *Cutting a release*.
 
 On macOS without an accepted Xcode licence, build with the Command Line Tools:
