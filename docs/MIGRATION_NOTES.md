@@ -2,11 +2,16 @@
 
 **Honest framing:** this workspace is a **preparation port**, not a completed migration.
 The four contracts are faithfully re-implemented in Rust, compile to `wasm32v1-none`
-WASM, and pass their unit and integration suites (118 tests). They have **not** been
-deployed, integrated with the off-chain stack, or reconciled with live state. An AI-assisted
-Soroban review (2026-10) found 11 issues; all are fixed on this code (see
+WASM, and pass their unit and integration suites (216 tests). A first testnet deployment
+exists (2026-10, `deployments/testnet.json`); they are not integrated with the off-chain
+stack and have no mainnet deployment. An AI-assisted Soroban review (2026-10) found 11
+issues; all are fixed on this code (see
 [§6](#6-audit-fixes-2026-10--where-the-port-now-departs-from-the-solidity)), but that review
 is not a substitute for an independent audit.
+
+**2026-10-18:** PayoutReceiver settles CROP_DROUGHT determinations (`crop-drought-rdi-1.0`,
+the live methodology) and storage rent is capped. See [§9](#9-crop_drought-path-option-a)
+and [§10](#10-rent-cap).
 The [DEFERRED](#deferred--not-yet-done) section is the load-bearing part of this document.
 
 **Product-architecture decision (2026-08-21):** the faithful Treasury port is now a
@@ -143,17 +148,15 @@ distributor index preserved but stored one entry per token and read in pages
    UUPS), so there is no `upgrade` fn — matching source. The other three keep `upgrade`.
 6. **Explicit `caller` + `require_auth`** everywhere replaces implicit `msg.sender`.
 7. **Storage TTL / rent.** No EVM equivalent: an entry whose TTL lapses is archived and
-   must be restored before use. Every persistent and instance entry (policies, premium /
-   payout flags, pending claims and their queue, role grants, each contract instance) is
-   extended to the network maximum on every touch, read through `Storage::max_ttl()` so it
-   follows the live network config. Measured 2026-10-13 (`getLedgerEntries` on
-   `ConfigSettingStateArchival`, protocol 29): `max_entry_ttl` = **3,110,400 ledgers
-   (~180 days at 5 s)** on both mainnet and testnet; `min_persistent_ttl` is 2,073,600
-   (mainnet) / 120,960 (testnet). A 365-day policy therefore outlives one TTL; the
-   permissionless `PayoutReceiver::extend_policy_ttl(policy_id)` bumps that policy's entries
-   in all four contracts (runbook: call it at least every ~150 days). The temporary replay
-   marker stays at ~7 days (it only has to outlive the 1-hour freshness window). Paged index
-   reads extend each entry they read.
+   must be restored before use, and every extension is charged up front. Measured
+   2026-10-13 (`getLedgerEntries` on `ConfigSettingStateArchival`, protocol 29):
+   `max_entry_ttl` = **3,110,400 ledgers (~180 days at 5 s)** on both mainnet and testnet;
+   `min_persistent_ttl` is 2,073,600 (mainnet) / 120,960 (testnet). Since 2026-10-18 the
+   contracts follow a **rent cap** (§10): ordinary calls extend instance + code only below
+   3 days, to 10 days; a permissionless keeper (`extend_contract_ttl`) extends all four
+   contracts to 30 days; data entries live as long as the policy needs them
+   (`end_date + 30 d`, 60 days for pending claims and role grants). The temporary replay
+   marker stays at ~7 days (it only has to outlive the 1-hour freshness window).
 8. **Events use `#[contractevent]`.** `env.events().publish(...)` is deprecated in SDK 27;
    `#[topic]` fields replace Solidity `indexed`. Some zero-value "previous value" event
    fields were dropped (no zero Address to emit).
@@ -168,11 +171,23 @@ distributor index preserved but stored one entry per token and read in pages
 ## 4. Frozen cross-contract contract (do not drift)
 
 `crates/shared` is the coordination boundary; changing it requires re-checking all four
-contracts. In particular **`encoding.rs` is FROZEN**: the determination byte layout
-(`SCHEMA_VERSION="1.0"`, `KIND="CROP_DAMAGE"`, `METHODOLOGY="crop-dualindex-1.0"`, 10
-evidence words + 6 result words, big-endian two's-complement, `network_domain` in place of
-`block.chainid`, contract XDR bytes in place of `address(this)`) must byte-for-byte match
-the off-chain signer. `interfaces.rs` client signatures must match the real inherent methods.
+contracts. In particular **`encoding.rs` is FROZEN**: both determination byte layouts must
+byte-for-byte match the off-chain signer.
+
+| | CROP_DAMAGE (retired) | CROP_DROUGHT |
+|---|---|---|
+| methodology | `crop-dualindex-1.0` | `crop-drought-rdi-1.0` |
+| kind word | `keccak("CROP_DAMAGE")` = `0x5f9a…` | `keccak("CROP_DROUGHT")` = `0xf2b99be7…b6fe` |
+| evidence | 10 words (`encode_inputs`) | 13 words, 416 B (`encode_drought_inputs`) |
+| result | 6 words | 5 words: policy id, bp, drought damage, payout, assessed_at |
+| preimage | 392 B | 360 B |
+
+Common to both: 32-byte big-endian two's-complement words, `keccak("1.0")` schema word,
+`network_domain` (`sha256(passphrase)`) in place of `block.chainid`, the 40-byte contract
+XDR (`00000012 00000001 ‖ id`) in place of `address(this)`, digest = `keccak(preimage)` is
+both the recovery message and the replay key. Golden vectors: `crates/shared/src/encoding/
+tests.rs` (`drought_golden_vectors`). `interfaces.rs` client signatures must match the real
+inherent methods.
 
 ---
 
@@ -182,7 +197,13 @@ These are known gaps. None are "bugs" in the ported logic; they are the work tha
 preparation build into a real migration.
 
 **Integration & deployment**
-- [ ] **Not deployed** anywhere (no testnet, no mainnet). No contract addresses exist.
+- [x] ~~**Not deployed** anywhere.~~ Testnet deployment exists (2026-10,
+      `deployments/testnet.json`). Mainnet: not deployed.
+- [ ] **The drought path and the rent cap are not on testnet yet.** Upgrade PolicyManager,
+      Treasury and PayoutReceiver in place (runbook: *Upgrading to the drought path and the
+      rent cap*). **PolicyNft cannot be upgraded** (no `upgrade` fn, as in the Solidity): the
+      testnet NFT keeps the old extend-to-maximum TTL code on its own entries; its rent-cap
+      change applies to fresh deployments only.
 - [x] ~~**No end-to-end / cross-contract integration test.**~~ DONE — `crates/integration-tests`
       registers all four REAL contracts on one `Env` (no mocks) and covers the full
       premium → determination → payout lifecycle, plus determination replay, wrong-signer
@@ -197,24 +218,24 @@ preparation build into a real migration.
       testnet `cee0302d…ecd472`, mainnet `7ac33997…45a979`. It does what `block.chainid` did
       (binds a determination to one network) and both sides compute it from a public constant,
       so no magic number has to be shipped. Set by `scripts/deploy.sh`; overridable.
-- [ ] **The Lit PKP off-chain signer has not been updated** to produce Soroban-format digests
-      (keccak over `shared::encoding`, `network_domain` instead of chainid, XDR contract address
-      instead of `address(this)`). Until both sides agree byte-for-byte, nothing verifies. Note
-      the signer needs the PKP's 65-byte SEC-1 PUBLIC KEY, not its 0x address — the deploy
-      script rejects an address, because passing one silently fails every signature check.
+- [ ] **The Lit drought action does not yet sign the Soroban drought preimage** (spec Part 3,
+      `microcrop-lit-oracle`: `src/chain/stellar-drought.shared.js`, `chain`/`networkDomain`
+      jsParams in `lit-actions/drought-oracle.js`, `drought.ts`, `drought-scope.ts`). Until it
+      ships and its new CID is re-registered (`scripts/rebuild-group.ts`, master key), the
+      production PKP cannot sign anything this PayoutReceiver accepts. The JS encoder must
+      reproduce `drought_golden_vectors` byte for byte. Until then the drought orchestrator
+      must skip policies with `chain === 'stellar'`: it passes the Base domain, so a Stellar
+      policy would get a valid Base signature for the Base policy with the same numeric id.
+      Note the contract stores the PKP's 65-byte SEC-1 PUBLIC KEY, not its 0x address.
 - [ ] **Backend / indexer / relayer integration** untouched — the EVM stack (ethers.js
       listeners, Ponder indexer, relayer) still targets Base. Ledger events, XDR decoding,
       and Stellar RPC are not wired.
 
-- [ ] **The signed preimage is hardcoded to ONE methodology and ONE evidence schema.**
-      `METHODOLOGY_CROP = b"crop-dualindex-1.0"` is a keccak domain constant, and the ten
-      `encode_inputs` evidence fields are dual-index-shaped (`ndvi_scaled`, `weather_temp_c_e2`,
-      `weather_precip_e2`, `weather_humidity`, `weather_wind_e2`). The drought methodology's
-      actual evidence is completely different (`rainW1_e2`, `rainW2_e2`, `rainRefW1_e2`,
-      `rainRefW2_e2`, `cddW2Days`, `lgpDays`, `seasonStartEpoch`), which is why adding drought
-      needed a separate PayoutReceiver path. **Every new methodology therefore costs a contract
-      upgrade plus an audit.** Parameterising the methodology domain and generalising the
-      evidence encoding is nearly free before deployment and an upgrade afterwards.
+- [ ] **Each methodology is a frozen constant in its own preimage.** The drought path is a
+      second entrypoint with its own layout (§9); which methodologies are accepted is an admin
+      switch (`MethodologyKind`), but **adding one is still a contract upgrade plus an audit**
+      (by design: the methodology string is signed, not a parameter). rdi-1.1 (basis-point
+      native, debiased) would be a third `MethodologyKind` with its own step 4/5 invariant.
 - [ ] **There is no observation-source field anywhere in the signed preimage** — no dataset, no
       product version, no served grid cell. The determination-stability work
       (microcrop-context/docs/DETERMINATION_STABILITY.md) found the same farmer gets a different
@@ -227,10 +248,21 @@ preparation build into a real migration.
 - [ ] **No Soroban security audit.** The Solidity was audited; this Rust port has not been.
       The secp256k1 signature path, replay guards, and per-org solvency need fresh review on
       Soroban semantics (auth trees, TTL/archival edge cases).
-- [x] ~~**TTL/rent policy is placeholder.**~~ Long-lived entries now go to the measured
-      network maximum on every touch, with a keep-alive helper (§3.7, §7). An archived
-      persistent entry fails the read rather than reading as absent, so archival does not
-      open a replay; the cost is a restore.
+- [x] ~~**TTL/rent policy is placeholder.**~~ Rent cap (§10). An archived persistent entry
+      fails the read rather than reading as absent, so archival does not open a replay; the
+      cost is a restore (`an_archived_policy_paid_flag_never_pays_out`).
+- [ ] **Keeper job not built.** The backend must call `PayoutReceiver.extend_contract_ttl()`
+      daily and `extend_policy_ttl(id)` for open or pending policies whose shortest TTL is
+      under 30 days (runbook), and must submit them even though simulation reports them
+      read-only (CLI: `--send=yes`). Without it, code and instances fall back to the 10-day
+      user-path safety net and the first call after a lapse pays up to ~10 days of code rent
+      for each contract it touches (§10). Alert on keeper failure.
+- [ ] **Code size grew** (optimized wasm, `stellar contract optimize`, 2026-10-18; code rent
+      scales with it): PayoutReceiver 45,271 -> 59,816 B (the drought path), PolicyManager
+      47,369 -> 52,602, Treasury 60,283 -> 64,683, PolicyNft 29,246 -> 38,481. Roughly half of
+      each file is the contract spec section (doc comments of every shared type and error are
+      embedded in all four contracts); PolicyNft's code section grew ~4.4 KB from the need-based
+      TTL helpers, not investigated further. Trimming spec docs and the helpers are rent levers.
 - [ ] **Shared paused-code fragmentation** (§3.9): recommend adding one shared paused error
       to `microcrop_shared::errors` so all contracts share a code, instead of three local
       enums. Deferred to avoid touching the frozen shared crate mid-port.
@@ -240,11 +272,12 @@ preparation build into a real migration.
       written (the encoder is the single most replay-sensitive surface).
 - [x] ~~`cargo clippy` was not run~~ — now run as a local gate. 7 warnings pre-date the
       audit fixes (duplicated test attributes, two needless borrows, one manual range
-      check); the fixes added none. `cargo fmt --all -- --check` is clean.
-- [ ] **Lit signer amount scaling.** `microcrop-lit-oracle/lit-actions/crop-oracle.js:231`
-      scales `sumInsured` by `1e6`. The Stellar path must scale by `1e7` while the Base path
-      stays at `1e6`, so the change has to be chain-aware. Until it ships, every Stellar
-      determination fails `SumInsuredMismatch`.
+      check); neither the audit fixes nor the drought path / rent cap added any.
+      `cargo fmt --all -- --check` is clean.
+- [ ] **Lit signer amount scaling (drought action).** The drought action must sign
+      `sum_insured` and `payout_amount` as exact 7dp Stellar USDC (`toChainBaseUnits`, not
+      `Math.round(x * 1e6)` in `drought-scope.ts`). A 6dp amount fails `SumInsuredMismatch`
+      (311) on every policy.
 - [x] ~~**TTL against real network limits.**~~ Measured (180 days on both networks) and
       handled by extend-to-max plus `extend_policy_ttl` (§7). Still open: measure the
       restore cost of an archived entry inside the relayer's 3600 s freshness window if the
@@ -255,9 +288,22 @@ preparation build into a real migration.
 - [ ] **Backend plot coordinates.** The Stellar backend must pass `lat_e6`/`lon_e6` to
       `create_policy` computed exactly as the Lit action does (`Math.round(deg * 1e6)` from
       the same plot record), store those values on its own policy record, and create
-      policies as `Comprehensive`. The Lit action must sign the coordinates stored for the
+      policies as `Drought`. The Lit action must sign the coordinates stored for the
       policy, not the live plot record: a plot edited or re-geocoded after sale would
       otherwise make every determination revert `PlotLocationMismatch`.
+- [ ] **Backend prerequisites for the drought path.** `/api/internal/active-policies`
+      (microcrop-core `84fc572`) emits no `coverageType`, `plantingDate`, `seasonLengthDays`,
+      `marketCode`, `chain` or `currency`, and `sumInsured` is a float, so the drought
+      orchestrator skips every policy today ("coverageType absent"). For Stellar it also needs
+      the Soroban u64 policy id as `onChainPolicyId` and an exact 7dp sum insured (`units.js`).
+      The backend should check that the Stellar determination's `damage_percent_bp` equals the
+      canonical body's `result.damagePercentBp` from the same run.
+- [ ] **Sale-side rule for drought cover.** A drought determination settles only if the
+      planting day is on or after the UTC day cover started and the 110-day window ends by
+      `end_date` (326). Sell at least ~140 days (110 + 7-day archive lag + margin) and
+      activate on or before planting day (`create_policy` enforces only the hard floor:
+      Drought cover under 117 days reverts `InvalidDuration`); cover bought after planting cannot settle that
+      season (intended: a grace period would leak W1 rainfall to the buyer).
 
 **Product parity not ported**
 - [ ] **Non-custodial target contracts** — replace mandatory `Treasury` custody with
@@ -319,6 +365,9 @@ Review follow-ups in the same PR:
 | 9 | (round 2) some long-lived org and farmer entries were never extended | Treasury reads `OrgFeeSet` / `OrgFeeBps` / `OrgRatioSet` / `OrgReserveRatioBps` through the extending getter; `extend_policy_ttl` also extends the org reserve, fee and ratio entries, the org queue head / tail / pending total while a claim is pending (Treasury), and `OrgOutstanding` plus the farmer's claim times and counters (PolicyManager) | none |
 | 7 | the relayer chooses which of two signed determinations settles a policy | **signer-side rule, no contract change**: the Lit action issues at most one determination per policy per assessment window: no new signature for a policy while an earlier one is within `MAX_REPORT_AGE` (3600 s) or the policy is paid. No clean contract-side rule exists: "highest `assessed_at` consumed" cannot help because the first valid submission already pays, and any rule that lets a later determination win needs a dispute window, which delays every payout. The preimage is unchanged | none on-chain; operational requirement on the signer |
 
+Rows 3, 4 and 9 above are superseded (2026-10-18): TTLs follow the rent cap (§10), not the
+network maximum, and only `Drought` cover is sold (§9).
+
 ## 8. Bottom line
 
 The Rust/Soroban re-implementation is **complete and green** as a parity/reference
@@ -328,3 +377,151 @@ must not be treated as the final carrier architecture. Freeze and implement the
 non-custodial obligation/facility interfaces, local-currency model, Logos Storage
 commitment, shared `network_domain`, and Lit PKP signer agreement before any live pilot
 or mainnet consideration.
+
+## 9. CROP_DROUGHT path (Option A)
+
+**Why.** The production PKP signs only `crop-drought-rdi-1.0` (the crop-oracle action was
+revoked from the Lit group), so the Soroban contracts could settle nothing. The drought
+action already signs a chain-neutral canonical body (SHA-256 over canonical JSON). Using
+that as the payout authority (Option B) is unsound against the real code: its
+`subject.policyId` is the backend's database id, not the Soroban u64 policy id; it carries
+no USDC amount (`assertChainAndCurrencyNeutral` forbids `*usdc` keys); and it names no
+network or contract, while testnet uses the production PKP key and canonical determinations
+are published. So the drought action signs a second, chain-bound preimage (Option A), and
+the canonical body stays for the notary and the partner `amountOwed`.
+
+**Type and digest.** `DroughtDetermination` (types.rs, 18 fields) and
+`encode_drought_inputs` / `encode_drought_preimage` / `drought_determination_digest`
+(encoding.rs; layout table in §4). `DROUGHT_PARAMS_HASH_RDI_1_0 = keccak(DROUGHT_PARAMS_JSON)
+= 0x2580af…47cf`, computed by the oracle's own code. The 13 evidence words are
+byte-identical to the EVM `abi.encode` (only the sum-insured scale differs): with the EVM
+conformance fixture's values the Soroban encoder reproduces its pinned inputs hash
+`0xe6e25b76…2976`.
+
+**`PayoutReceiver::submit_drought_determination(caller, d, signature, recovery_id)`** —
+checks in order: relayer, not paused (318), touch; signer configured (300); methodology
+enabled (322); bounds `bp <= 10000` (301), `drought_damage <= 100` (323), evidence (325:
+`lgp_days == 180`, `cdd_w2_days <= 40`, both normals non-zero, every rain value
+`<= 1e9`, `season_start_epoch % 86400 == 0`, params hash = rdi-1.0's); `bp == dd * 100`
+(324); **on-chain index recompute** (324; not on EVM); `bp >= 3000` (306); policy exists,
+ACTIVE, `now <= end_date`, unpaid (307–310); `coverage_type == Drought` (320); sum insured
+(311); plot within 1e-6 degree (321); **evidence window** — planting on or after the UTC day
+cover started and `season_start + 110 d <= end_date` (326), `assessed_at >= season_start +
+110 d` (327); `payout == sum_insured * bp / 10000` floor (312); freshness (313/314); claim
+limit (315); digest rebuilt on-chain; not consumed (316); signer recovered (317).
+
+Effects and interactions are the crop path's, factored into `settle_verified`; the report
+stores `weather_damage = satellite_damage = 0`; new event `DroughtEvidenceRecorded`.
+`PolicyPaid` is shared, so a policy settles at most once across both methodologies
+(Treasury `PayoutProcessed` is the third layer). Pending claims are unchanged.
+
+**Methodology allow-list.** Instance key `MethodologyEnabled(MethodologyKind)`
+(`CropDualIndex10 = 0`, `CropDroughtRdi10 = 1`), absent = disabled,
+`set_methodology_enabled` (Admin), `is_methodology_enabled`. `submit_determination` (crop)
+checks it too: leave crop disabled after the upgrade. A claim already pending still
+settles, because `settle_pending_claim` does not re-verify.
+
+**View.** `drought_determination_digest(d) -> BytesN<32>` for the oracle and backend to
+simulate against the live contract and domain.
+
+**PolicyManager.** `create_policy` sells `Drought` only (118 otherwise). Re-opening
+`Comprehensive` needs an audited upgrade once a cause-agnostic methodology is live.
+
+**Rounding.** Payout rounds down. rdi-1.0 emits whole percent (multiples of 100 bp);
+measured over a grid of satisfaction ratios, its integer index is biased +2.4 / −1.3 points
+against exact arithmetic (up to +240 bp; not strictly round-up). Fixing that is a new
+methodology version (new string, backtest, agronomist sign-off), not a contract change.
+
+**Vectors and their sources.**
+
+| Vector | Generated by | Checked by |
+|---|---|---|
+| V1–V3 drought inputs hash / preimage / digest (`drought_golden_vectors`) | this Rust encoder | rebuilt byte for byte with the oracle's existing `stellar.shared.js` helpers + ethers v6 (throwaway copy); the oracle's Part 3 test must pin them |
+| V1 signature r‖s, recovery id 1 | ethers v6 `SigningKey(TEST_PRIVATE_KEY).sign` (oracle test key) | Rust: recovers to that key via the host's `secp256k1_recover` |
+| 225-point recompute grid | the oracle's `calculateDroughtDamage` (1bc2d9d) on synthetic archive bodies | `rdi_v1_drought_damage` |
+| EVM inputs hash `0xe6e25b76…2976` | Solidity / oracle / backend (`DroughtConformance.t.sol`, contracts@ae163d1) | `encode_drought_inputs` |
+| params hash `0x2580af…47cf` | ethers v6 over the oracle's `DROUGHT_PARAMS_JSON` | keccak in Rust |
+| real 2022 season, pilot pixel 1.0167 N / 35.0062 E: 42% | the oracle's `calculateDroughtDamage` on the live Open-Meteo ERA5 response (fetched 2026-10-18) | integration test `real_era5_season_settles_end_to_end` |
+
+The EVM conformance fixture (45% from W1 12500/20000, W2 3000/18000) fails the recompute:
+those rains give 100%. That fixture is internally inconsistent; it is used here only for
+the byte layout.
+
+**Decisions left to the product owner.** (1) Late enrolment: strict by default (activate on
+or before planting); a grace period needs a constant and leaks W1 rainfall. (2) The on-chain
+recompute hard-codes Ky 40/150, which the pinned params hash already freezes. (3) Coverage at
+sale is hard-coded to Drought, not an admin list. (4) Keeper target 30 days for code (60
+would halve the keeper's frequency but lose up to twice the prepaid rent on an upgrade).
+
+## 10. Rent cap
+
+**Where the fees came from** (testnet transaction metas). Rent = `ceil(size ×
+fee_per_rent_1kb × ledgers / (1024 × 1215))`, code entries divided by 3; code rent size =
+XDR size + `wasm_module_memory_cost`. Testnet `fee_per_rent_1kb` = 8,113 stroops, mainnet
+1,000 (8.1× cheaper). About 99.9% of each first-touch fee was the **contract code entry**
+being extended from its 7-day deploy TTL to the network maximum (~173 more days), because
+`ttl.rs` called `extend_ttl(max, max)` on every touch:
+
+| First touch | Charged | Paid for |
+|---|---|---|
+| PolicyManager.set_policy_nft | 636.61 XLM | PM code, 981,078 rent bytes (16.8× the wasm) |
+| PolicyNft.set_policy_manager | 362.36 XLM | NFT code, 558,014 rent bytes |
+| Treasury.receive_premium | 832.58 XLM | Treasury code, 1,279,236 rent bytes — on the money path |
+| PayoutReceiver.submit_determination | 662.56 XLM | PR code, 1,014,107 rent bytes |
+| create_policy / activate_policy | 2.63 / 2.65 XLM | data entries only |
+
+Ongoing rent of the four code entries, unchanged by any TTL policy, at the pre-drought code
+sizes: testnet 14.39 XLM/day (432/30 d), mainnet 1.77 XLM/day (53/30 d); about 17 and 2.1
+after the growth in §5 (table below). Data entries are cheap (556 B for 180 days:
+1.13 XLM testnet, 0.14 mainnet).
+
+**Policy now** (`crates/shared/src/ttl.rs`, 1 day = 17,280 ledgers):
+
+| Class | Rule | Kept alive by |
+|---|---|---|
+| Instance + code, user path | below 3 d → 10 d (safety net only) | any call (`touch_contract`) |
+| Instance + code, keeper | below 23 d → 30 d | `extend_contract_ttl()`: PayoutReceiver's extends itself and Treasury and calls PolicyManager's, which extends PolicyManager and PolicyNft |
+| Role grants | below 30 d → 60 d | grant and every use |
+| Per-policy: PM `Policy`, `PendingCounted`, farmer index item; Treasury `PremiumReceived`, `PayoutProcessed`; PR `PolicyPaid`, `Report`; NFT `Certificate`, `Owner`, `PolicyToToken`, `DistributorPolicy` | `end_date + 30 d`, clamped; activation re-applies it to PM `Policy` and the shared per-farmer / per-org entries, but not to the farmer index item (`FarmerPolicyAt`, whose position the policy does not record) nor to a `PremiumReceived` set while PENDING: those keep the create-time need, short by the PENDING period, until `extend_policy_ttl` (Treasury's flag) or a restore (index item); a closed policy keeps its TTL (`PayoutProcessed` at least 60 d) | the lifecycle calls; `extend_policy_ttl(id)` when the need is past the maximum |
+| Pending claim: `ClaimPending`, `PendingPayout`, `OrgQueueAt/Head/Tail`, `OrgPendingPayouts`, PM `Policy` while CLAIM_PENDING | below 30 d → 60 d | settlement attempts and `extend_policy_ttl` |
+| Shared per-farmer / per-org: `Farmer*`, `OrgOutstanding`, `OrgReserve`, ratio and fee settings, `DistributorCount` | longest need of any policy touching it, at least 60 d; `FarmerClaimTimes` 365 d | every touch |
+| Temporary `ConsumedDetermination` | 7 d | `PolicyPaid` is the durable guard |
+
+Admin and config calls extend nothing. Paged index views no longer extend what they read.
+
+**Archived-entry safety.** The host refuses an expired persistent entry until it is
+restored, so an archived `PolicyPaid`, `PayoutProcessed`, `PremiumReceived`, role grant,
+`FarmerClaimTimes`, `OrgOutstanding` or `OrgReserve` never reads as absent or false: it
+fails closed, or it is restored and reads its true value. Instance flags (`Paused`, signer,
+domain, `MethodologyEnabled`) archive with the whole instance. No security flag is in
+temporary storage except the redundant replay marker, and no positive guard (`PolicyPaid`,
+`PayoutProcessed`, `PremiumReceived`) is ever `remove()`d. What is removed (revoked role
+grants, `ClaimPending`, `PendingPayout`, `OrgQueueAt`, `PendingCounted`) is removed only
+when its absence is the correct state.
+
+**Expected fees after the change.** Data-entry rows: measured on the host (the four
+optimized wasm builds registered in one `Env` with the testnet ledger limits, rent read from
+the host's per-call metering). Code rows: the network's code rent size per contract (XDR
+size + `wasm_module_memory_cost`, from the 2026-10-13 testnet metas above) scaled by the
+optimized wasm growth in §5, because the local host (soroban-env-host 27) under-reports
+module memory cost against the network's protocol 29 cost model. Nothing here is measured
+on testnet yet.
+
+| Call | Testnet | Mainnet |
+|---|---|---|
+| Admin and config calls | ≤ 0.09 XLM (`grant_role`), others ≈ 0.01 | ≤ 0.011 XLM |
+| `create_policy` | 2.54 XLM | ≈ 0.31 XLM (mainnet's 120-day creation floor applies) |
+| `receive_premium` | 832.6 → 0.60 XLM | ≈ 0.07 XLM |
+| `activate_policy` | 2.52 XLM | ≈ 0.31 XLM |
+| `submit_drought_determination` (pending path) | 662.6 → 1.05 XLM | ≈ 0.13 XLM |
+| Code rent per day: PayoutReceiver / Treasury / PolicyManager / PolicyNft | ≈ 5.0 / 5.2 / 4.1 / 2.8 XLM | ≈ 0.62 / 0.64 / 0.50 / 0.34 XLM |
+| Keeper, all four contracts | ≈ 17 XLM/day, ≈ 119 XLM/week | ≈ 2.1 XLM/day, ≈ 14.7 XLM/week |
+| Worst-case user call after a keeper lapse | up to ~10 days of code rent for **each** contract the call touches: a determination touches all four, ≈ 150–170 XLM | ≈ 19–21 XLM |
+
+The lapse row: each contract a call touches tops up separately (below 3 days to 10 days),
+so one call can pay for all four. An `extend_policy_ttl` after a lapse was measured on the
+host extending all four contracts by 8 days in one call. Alert on keeper failure; lowering
+`USER_TARGET_LEDGERS` would cap this at the price of more frequent top-ups.
+
+Mainnet deploy budget: uploads pay the 120-day minimum, about 252 XLM for the four code
+entries (was 213 before the growth); the keeper has nothing to do until about day 97.

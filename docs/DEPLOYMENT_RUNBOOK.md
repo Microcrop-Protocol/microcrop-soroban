@@ -107,6 +107,16 @@ Note 11–13 grant roles to *contracts*, not people. That is the part most often
 
 15. `PayoutReceiver.set_authorized_signer(pubkey)`
 16. `PayoutReceiver.set_network_domain(domain)`
+17. `PayoutReceiver.set_methodology_enabled(kind = 1, true)` — CROP_DROUGHT. Absent means
+    disabled, so nothing settles until this runs. Kind 0 (CROP_DAMAGE) is retired: leave it off.
+
+**Keep the contracts alive**
+
+18. `PayoutReceiver.extend_contract_ttl()` — extends all four contracts' instance and code
+    to 30 days. A fresh upload sits at the network minimum (7 days on testnet) and admin calls
+    extend nothing, so run it right after the deploy (`--send=yes`: the CLI does not submit a
+    TTL-only call by default); the backend keeper then runs it daily (see *Storage rent: the
+    keeper* below).
 
 ---
 
@@ -129,8 +139,8 @@ To redo one step, delete its key from the state file and re-run.
 ```
 
 Checks all four contracts are live and reachable, all six cross-references are wired, the
-money-path roles are granted, and the signer and domain are set. Exits non-zero on any
-failure.
+money-path roles are granted, the signer and domain are set, CROP_DROUGHT is enabled and the
+retired CROP_DAMAGE methodology is disabled. Exits non-zero on any failure.
 
 Set `BACKEND_ADDR` and `AUTHORIZED_SIGNER_PUBKEY` in the environment to enable the backend
 role and signer checks too.
@@ -158,9 +168,8 @@ secp256k1 signature path, the replay guards and the per-org solvency logic all n
 review against Soroban semantics — auth trees, TTL and archival edge cases behave differently
 from the EVM.
 
-Storage TTL is now set against the measured network limit (see **Storage TTL: keep open
-policies alive** below), but the restore cost of an entry that archives anyway has not
-been measured.
+Storage TTL follows the rent cap (see **Storage rent: the keeper** below); the restore cost
+of an entry that archives anyway has not been measured.
 
 ---
 
@@ -224,32 +233,62 @@ stellar contract invoke --id "$TREASURY" --network testnet --source admin \
 and settle the queue as above. Before deploying, confirm the backend wallet holds an
 authorized USDC trustline; alert on any `PayoutTransferFailed` event.
 
-**Storage TTL: keep open policies alive.** Soroban archives an entry whose TTL runs out.
-The network's `max_entry_ttl` is 3,110,400 ledgers (~180 days at 5 s) on both mainnet and
-testnet (measured 2026-10-13 with `getLedgerEntries` on `ConfigSettingStateArchival`;
-re-check with the query below). The contracts extend every entry they touch to that
-maximum, but a 365-day policy outlives one TTL, and a policy nobody touches for ~180 days
-archives. The backend must call the permissionless keep-alive for every PENDING, ACTIVE or
-CLAIM_PENDING policy at least every **150 days** (and once more after a claim, so the paid
-flags outlive any late dispute):
+**Storage rent: the keeper.** Soroban charges rent up front for every TTL extension. The
+contracts used to extend every entry, instance and code to the network maximum (~180 days)
+on every touch, so the first ordinary call to each contract paid ~173 days of code rent
+(362–833 XLM on testnet). They now follow a rent cap (`crates/shared/src/ttl.rs`,
+MIGRATION_NOTES §10):
+
+- ordinary calls extend instance + code only below 3 days, to 10 days (a safety net);
+- admin and config calls extend nothing;
+- data entries live as long as the policy needs them: `end_date + 30 days` per policy
+  (clamped to the ~180-day network maximum), 60 days for pending claims and role grants,
+  the longest need of any policy (at least 60 days) for per-farmer and per-org entries.
+
+So **the backend must run a keeper**, as a repeatable job:
+
+1. **Daily:** `extend_contract_ttl()` on PayoutReceiver. It extends PayoutReceiver and
+   Treasury below 23 days to 30 days, then calls PolicyManager's, which does the same for
+   PolicyManager and PolicyNft. Above 23 days it is a no-op, so running it daily costs one
+   transaction fee most days and about 7 days of code rent once a week (estimated testnet
+   ≈ 119 XLM a week for all four, mainnet ≈ 14.7 XLM; MIGRATION_NOTES §10).
+2. **For each PENDING, ACTIVE or CLAIM_PENDING policy whose shortest TTL is under 30 days:**
+   `extend_policy_ttl(policy_id)` on PayoutReceiver. It extends the policy's entries in all
+   four contracts to their need, never to the maximum. Needed for policies whose need is past
+   the ~180-day maximum and for pending claims (60-day target).
+
+**The keeper must always submit.** Both calls only extend TTLs: simulation shows no ledger
+write, no event and no auth, so a client that sends only "state-changing" simulations never
+sends them. The stellar CLI (28.x) does exactly that by default and prints "Simulation
+identified as read-only. Send by rerunning with `--send=yes`." Pass `--send=yes`; the
+backend keeper must likewise sign and submit the transaction regardless of how the
+simulation looks, and check `liveUntilLedgerSeq` afterwards (`verify-deployment.sh` step 6
+fails when any instance or code entry has under 23 days left).
 
 ```bash
-stellar contract invoke --id "$PR" --network mainnet --source <any funded key> \
+stellar contract invoke --id "$PR" --network testnet --source <any funded key> --send=yes \
+  -- extend_contract_ttl
+stellar contract invoke --id "$PR" --network testnet --source <any funded key> --send=yes \
   -- extend_policy_ttl --policy_id <id>
 ```
 
-It extends the policy's entries in all four contracts (PayoutReceiver `PolicyPaid` /
-`Report` / `ClaimPending`, Treasury `PremiumReceived` / `PayoutProcessed` / `PendingPayout`
-and its queue slot, PolicyManager `Policy` / `PendingCounted`, PolicyNft certificate) and
-each contract instance. It also extends the org and farmer entries the policy depends on:
-Treasury `OrgReserve`, the admin-set `OrgFeeSet` / `OrgFeeBps` / `OrgRatioSet` /
-`OrgReserveRatioBps`, and, while a claim is pending, `OrgQueueHead` / `OrgQueueTail` /
-`OrgPendingPayouts`; PolicyManager `OrgOutstanding` and the farmer's `FarmerClaimTimes` /
-`FarmerActiveCount` / `FarmerPendingCount` / `FarmerPolicyCount`. The fee and ratio entries
-are also extended whenever Treasury reads them. An entry that archives anyway is not lost:
-it is restored (`stellar contract restore`, or automatically by a transaction whose
-footprint includes it), at a fee. An org or farmer with no policy kept alive and no
-activity for ~180 days needs a restore on next use.
+If the keeper lapses, nothing breaks, but it gets expensive: each contract a call touches
+tops itself up separately (below 3 days to 10 days), so a call pays up to ~10 days of code
+rent **for each contract it touches**. A determination touches all four: estimated
+≈ 150–170 XLM on testnet, ≈ 19–21 XLM on mainnet, charged to the relayer. Alert on keeper
+failure. CLI fallback (the same as the keeper, without the contracts):
+
+```bash
+stellar contract extend --id C... --network testnet --source <key> \
+  --durability persistent --ledgers-to-extend 518400            # instance, ~30 days
+stellar contract extend --wasm-hash <hash> --network testnet --source <key> \
+  --durability persistent --ledgers-to-extend 518400            # code entry
+```
+
+An entry that archives anyway is not lost and never reads as absent: it is restored
+(`stellar contract restore`, or automatically by a transaction whose footprint includes it),
+at a fee. Mainnet deploy budget: uploads pay the 120-day minimum (≈ 252 XLM for the four code
+entries at the current sizes) and the keeper has nothing to do until about day 97.
 
 ```bash
 # re-check the network limit (read-only; LedgerKey = CONFIG_SETTING / STATE_ARCHIVAL)
@@ -257,15 +296,44 @@ curl -s -X POST https://mainnet.sorobanrpc.com -H 'Content-Type: application/jso
   -d '{"jsonrpc":"2.0","id":1,"method":"getLedgerEntries","params":{"keys":["AAAACAAAAAo="],"xdrFormat":"json"}}'
 ```
 
-**Policies carry the plot coordinates and must be `Comprehensive`.** `create_policy` now
-takes `lat_e6` and `lon_e6` (degrees x 1e6, i64) right after `plot_id`. Compute them from
-the same plot record the Lit action reads and round the same way (`Math.round(deg * 1e6)`);
-a determination whose signed coordinates differ by more than 1 micro-degree on either axis
-reverts `PlotLocationMismatch` (321). The only determination kind, CROP_DAMAGE, settles only
-`CoverageType::Comprehensive` policies, so `create_policy` refuses any other coverage type
-with `CoverageNotOffered` (118) and no premium can be taken for cover that could never pay
-(the EVM backend already creates every policy as COMPREHENSIVE). PayoutReceiver keeps the
-claim-time check (`CoverageNotSettledByMethodology`, 320) as defence in depth.
+**Policies carry the plot coordinates and must be `Drought`.** `create_policy` takes
+`lat_e6` and `lon_e6` (degrees x 1e6, i64) right after `plot_id`. Compute them from the
+same plot record the Lit action reads and round the same way (`Math.round(deg * 1e6)`); a
+determination whose signed coordinates differ by more than 1 micro-degree on either axis
+reverts `PlotLocationMismatch` (321). The only methodology the signer can sign,
+CROP_DROUGHT (`crop-drought-rdi-1.0`), settles only `CoverageType::Drought`, so
+`create_policy` refuses any other coverage type with `CoverageNotOffered` (118);
+PayoutReceiver keeps the claim-time check (`CoverageNotSettledByMethodology`, 320). The EVM
+backend creates policies as COMPREHENSIVE; the Stellar backend must create them as DROUGHT
+(`CoverageType` 0).
+
+**Sell drought cover for the whole season, before planting.** A drought determination
+settles only if (a) the planting day (`season_start_epoch`, 00:00 UTC) is on or after the
+UTC day the cover started — `activate_policy` resets `start_date` to now — and (b) the
+110-day measurement window ends by `end_date`; otherwise it reverts
+`EvidenceOutsideCoverWindow` (326). It is also refused before the window ends
+(`SeasonNotComplete`, 327). The oracle runs at least 7 days after the window (archive lag).
+So: sell at least ~140 days of cover and activate on or before planting day.
+`create_policy` refuses Drought cover under 117 days (110 + 7; `InvalidDuration`, 106),
+because such a policy takes a premium and can never settle; 117 is that floor, not the
+recommended sale. Cover bought
+after planting cannot settle that season; this is the anti-adverse-selection rule, not a
+bug.
+
+**Submitting a drought determination.** The relayer submits exactly what the Lit action
+signed (the oracle's `stellar` envelope: `determination` as snake_case fields, `signature`
+as 64-byte `r‖s`, `recoveryId` 0/1) within 3600 s of `assessed_at`:
+
+```bash
+stellar contract invoke --id "$PR" --network testnet --source relayer \
+  -- submit_drought_determination --caller <RELAYER_G...> \
+  --d '<DroughtDetermination JSON>' --signature <128 hex> --recovery_id <0|1>
+# what the contract will verify, for comparison with the oracle's digest:
+stellar contract invoke --id "$PR" --network testnet --send no \
+  -- drought_determination_digest --d '<DroughtDetermination JSON>'
+```
+
+`sum_insured` and `payout_amount` are 7-decimal USDC (a 6dp amount fails 311).
 
 **Freeze the coordinates on the policy.** The coordinates are fixed at `create_policy`. The
 backend must store the `lat_e6` / `lon_e6` it passed on its own policy record, and the Lit
@@ -307,6 +375,60 @@ claims, not only for one with many open policies.
 **Paged indexes.** `get_farmer_policies` and `get_distributor_policies` take
 `(start, limit)` and return at most 50 ids per call (a transaction may touch at most 100
 ledger entries); use the matching `*_count` view to page.
+
+## Upgrading to the drought path and the rent cap
+
+For a deployment made before 2026-10-18 (testnet today). PolicyManager, Treasury and
+PayoutReceiver upgrade in place and keep their storage; **PolicyNft has no `upgrade`** (as
+in the Solidity), so it keeps the old extend-to-maximum code on its own entries. Order:
+
+```bash
+cargo build --target wasm32v1-none --release
+for c in policy_manager treasury payout_receiver; do
+  stellar contract optimize --wasm target/wasm32v1-none/release/microcrop_$c.wasm
+done
+# upload each optimized wasm; each prints a 32-byte hash
+PM_HASH=$(stellar contract upload --wasm target/wasm32v1-none/release/microcrop_policy_manager.optimized.wasm --source admin --network testnet)
+TR_HASH=$(stellar contract upload --wasm target/wasm32v1-none/release/microcrop_treasury.optimized.wasm --source admin --network testnet)
+PR_HASH=$(stellar contract upload --wasm target/wasm32v1-none/release/microcrop_payout_receiver.optimized.wasm --source admin --network testnet)
+# upgrade (Upgrader role)
+stellar contract invoke --id "$PM" --source admin --network testnet -- upgrade --caller <ADMIN_G...> --new_wasm_hash "$PM_HASH"
+stellar contract invoke --id "$TREASURY" --source admin --network testnet -- upgrade --caller <ADMIN_G...> --new_wasm_hash "$TR_HASH"
+stellar contract invoke --id "$PR" --source admin --network testnet -- upgrade --caller <ADMIN_G...> --new_wasm_hash "$PR_HASH"
+# enable CROP_DROUGHT; CROP_DAMAGE stays disabled (absent = disabled)
+stellar contract invoke --id "$PR" --source admin --network testnet -- set_methodology_enabled --caller <ADMIN_G...> --kind 1 --enabled true
+# keeper: all four to 30 days (--send=yes, or the CLI only simulates it)
+stellar contract invoke --id "$PR" --source admin --network testnet --send=yes -- extend_contract_ttl
+./scripts/verify-deployment.sh --network testnet
+```
+
+Each upload is a new code entry: it starts at the network minimum and the old code entry's
+prepaid rent is lost, which is why the keeper target is 30 days and not the maximum. After
+the upgrade, a claim already recorded as pending still settles (`settle_pending_claim` does
+not re-verify), but no new crop determination is accepted (322).
+
+**Rent checks after the upgrade.** Simulate every entrypoint: nothing above ≈ 1.5 XLM except
+the keeper, with one testnet exception below; `extend_contract_ttl`'s cost should be about
+the days extended × 17 XLM on testnet; `liveUntilLedgerSeq` of the instances and code
+entries ≈ now + 30 days (`verify-deployment.sh` step 6).
+
+**Testnet exception: the old PolicyNft.** PolicyNft has no `upgrade`, so the deployed
+testnet NFT keeps the old behaviour and extends its instance and code to the network
+maximum on every touch. Any call that touches it (`activate_policy` mints, claims update the
+certificate status) pays NFT code rent for every day since its last touch, so those calls
+will exceed 1.5 XLM on testnet. The rent cap reaches PolicyNft only on a fresh deploy (or a
+redeploy of the NFT with re-wiring and the Minter grant); mainnet is a fresh deploy.
+
+**Signer.** Until the drought Lit action signs the Soroban preimage (`chain = stellar`,
+`networkDomain`, the contract StrKey as `verifyingContract`) and its new CID is registered
+with `scripts/rebuild-group.ts` (master key), no determination can verify. Check the live
+PKP's public key equals `AUTHORIZED_SIGNER_PUBKEY` and its digest equals
+`drought_determination_digest` for the deployed contract and domain.
+
+**Live negative checks** on testnet: a historical season for a policy activated now → 326;
+Comprehensive at sale → 118; a crop determination → 322. A live positive settlement on
+testnet needs a real season inside a live policy (planting March–May 2027, window end
+≈ July 2027); until then the positive path is proven by `real_era5_season_settles_end_to_end`.
 
 ## After a successful testnet deploy
 

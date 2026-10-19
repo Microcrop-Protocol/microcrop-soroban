@@ -48,9 +48,9 @@ pub enum PolicyError {
     CancelActiveRequiresAdmin = 116,
     /// `create_policy` with `|lat_e6| > 90_000_000` or `|lon_e6| > 180_000_000`.
     InvalidCoordinates = 117,
-    /// `create_policy` with a coverage type other than `Comprehensive`. The only claim
-    /// methodology (crop damage) measures loss, not its cause, so single-peril cover could
-    /// never pay out. Rejected at sale so no premium is taken for it.
+    /// `create_policy` with a coverage type other than `Drought`. The only methodology the
+    /// signer can sign (CROP_DROUGHT, `crop-drought-rdi-1.0`) indemnifies drought only, so any
+    /// other cover could take a premium and never pay. Rejected at sale.
     CoverageNotOffered = 118,
 }
 
@@ -107,7 +107,7 @@ pub enum TreasuryError {
     PayoutsStillPending = 226,
 }
 
-/// `PayoutReceiver` domain errors. Range 300..=399. Order mirrors the 12 validation steps.
+/// `PayoutReceiver` domain errors. Range 300..=399. Order mirrors the validation steps.
 #[contracterror]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -133,11 +133,28 @@ pub enum PayoutError {
     // 318 is the crate-local `payout_receiver::PausedError::ContractPaused`.
     /// `settle_pending_claim` for a policy with no claim awaiting funding.
     NoPendingClaim = 319,
-    /// The policy's coverage type is not one the CROP_DAMAGE methodology settles (only
-    /// `CoverageType::Comprehensive`; see `CoverageType`).
+    /// The policy's coverage type is not one the submitted methodology settles: CROP_DAMAGE
+    /// settles `Comprehensive` only, CROP_DROUGHT settles `Drought` only (see `CoverageType`).
     CoverageNotSettledByMethodology = 320,
     /// The signed `latitude_e6` / `longitude_e6` are not the insured plot's coordinates.
     PlotLocationMismatch = 321,
+    /// The determination's methodology is not enabled (`set_methodology_enabled`). Absent
+    /// means disabled.
+    MethodologyDisabled = 322,
+    /// `drought_damage > 100`.
+    DroughtScoreOutOfRange = 323,
+    /// `damage_percent_bp != drought_damage * 100`, or `drought_damage` is not what the
+    /// rdi-1.0 index gives for the signed rainfall evidence.
+    InvalidDroughtDamage = 324,
+    /// The drought evidence is outside the methodology: `lgp_days != 180`, `cdd_w2_days > 40`,
+    /// a zero reference rainfall, a rainfall value above 1e9 centi-mm, a season start that is
+    /// not 00:00 UTC, or a methodology params hash other than rdi-1.0's.
+    DroughtEvidenceInvalid = 325,
+    /// The measured season is not inside the cover: planting before the UTC day cover
+    /// started, or the W1..W2 window (110 days) ending after `end_date`.
+    EvidenceOutsideCoverWindow = 326,
+    /// `assessed_at` is before the end of the 110-day measurement window.
+    SeasonNotComplete = 327,
 }
 
 /// `PolicyNft` domain errors. Range 400..=499.

@@ -6,10 +6,18 @@ contracts in `microcrop-contracts/microcrop/src/`.
 
 > **Status: preparation build, not a migration.** All four contracts compile to WASM,
 > the full domain logic is implemented, and each crate ships a unit-test suite that
-> passes. This is a clean, building, tested *first version*. It has **not** been
-> deployed, audited on Soroban, or wired to the off-chain stack (Lit PKP signer,
-> backend, indexer). See [`docs/MIGRATION_NOTES.md`](docs/MIGRATION_NOTES.md) for the
-> EVM→Soroban mapping and the honest DEFERRED list.
+> passes. A first testnet deployment exists; the contracts have **not** been audited on
+> Soroban, deployed to mainnet, or wired to the off-chain stack (Lit PKP signer, backend,
+> indexer). See [`docs/MIGRATION_NOTES.md`](docs/MIGRATION_NOTES.md) for the EVM→Soroban
+> mapping and the honest DEFERRED list.
+
+> **2026-10-18 — drought path and rent cap.** PayoutReceiver settles CROP_DROUGHT
+> determinations (`crop-drought-rdi-1.0`, the methodology the production signer signs) via
+> `submit_drought_determination`; `create_policy` sells `Drought` cover only; the retired
+> CROP_DAMAGE path is behind a methodology switch, off by default. Storage rent is capped:
+> ordinary calls no longer prepay months of code rent, and a permissionless keeper
+> (`extend_contract_ttl`) keeps the contracts alive. The Lit drought action still has to sign
+> the Soroban preimage before anything settles (MIGRATION_NOTES §5, §9, §10).
 
 > **Target architecture update (2026-08-21):** This repository faithfully preserves
 > the old per-org USDC custody model so it can be tested and migrated safely, but that
@@ -27,9 +35,9 @@ contracts in `microcrop-contracts/microcrop/src/`.
 | -------------------------- | -------------------------- | ---------------- | ---- |
 | `PolicyManager.sol` v3.1.0 | `crates/policy-manager`    | `PolicyManager`  | Policy lifecycle (create → activate → claim/cancel/expire), per-farmer caps, per-org outstanding-exposure accounting. |
 | `Treasury.sol` v3.1.0      | `crates/treasury`          | `Treasury`       | USDC custody, premium split (per-org fee), **per-org reserves + on-chain solvency**, payouts, fee withdrawal. |
-| `PayoutReceiver.sol` v2.1.0| `crates/payout-receiver`   | `PayoutReceiver` | **Security crux.** Verifies a PKP-signed parametric determination, re-derives payout on-chain, triple replay guard, then dispatches the payout. |
+| `PayoutReceiver.sol` v2.1.0 + v2.2.0 drought path | `crates/payout-receiver`   | `PayoutReceiver` | **Security crux.** Verifies a PKP-signed parametric determination (CROP_DROUGHT; CROP_DAMAGE retired), recomputes the index and re-derives the payout on-chain, triple replay guard, then dispatches the payout. |
 | `PolicyNFT.sol`            | `crates/policy-nft`        | `PolicyNft`      | Soulbound-while-active policy certificate + ownership/distributor registry (`tokenId == policyId`). |
-| shared types/errors/roles  | `crates/shared` (`microcrop_shared`) | — | `#[contracttype]` structs, `#[contracterror]` codes, the `roles` access-control registry, cross-contract `#[contractclient]` traits, and the **frozen** canonical determination byte encoder. |
+| shared types/errors/roles  | `crates/shared` (`microcrop_shared`) | — | `#[contracttype]` structs, `#[contracterror]` codes, the `roles` access-control registry, cross-contract `#[contractclient]` traits, the **frozen** determination byte encoders (crop and drought), the rdi-1.0 index recompute, and the TTL (rent) policy. |
 
 Every contract depends on `microcrop-shared`. The shared crate's `interfaces.rs`,
 `encoding.rs`, `types.rs` and `errors.rs` are the frozen cross-contract contract — the
@@ -84,39 +92,48 @@ cargo test -p microcrop-treasury        # a single contract (note: package name,
 Package names (for `-p`): `microcrop-shared`, `microcrop-policy-manager`,
 `microcrop-treasury`, `microcrop-payout-receiver`, `microcrop-policy-nft`.
 
-## Current build & test status
+## Current build & test status (2026-10-18)
 
 ```
 cargo build --target wasm32v1-none --release   ->  4/4 WASM contracts built
-    microcrop_policy_manager.wasm    ~58 KB
-    microcrop_treasury.wasm          ~73 KB
-    microcrop_payout_receiver.wasm   ~56 KB
-    microcrop_policy_nft.wasm        ~35 KB
+                                     release     after `stellar contract optimize`
+    microcrop_policy_manager.wasm    64,003 B    52,602 B
+    microcrop_treasury.wasm          79,856 B    64,683 B
+    microcrop_payout_receiver.wasm   72,960 B    59,816 B
+    microcrop_policy_nft.wasm        45,714 B    38,481 B
 
-cargo test --workspace                         ->  146/146 passed, 0 failed
-    microcrop-treasury          48 passed   (premium split, per-org solvency, FIFO pending queue, frozen wallet, receiver-switch guard, 7dp)
-    microcrop-policy-manager    38 passed   (lifecycle, caps, claim window, exposure, roles, plot coords, coverage, TTL)
-    microcrop-payout-receiver   31 passed   (real secp256k1 sign→recover round-trip, pending claims, coverage + plot binding)
-    microcrop-policy-nft        12 passed   (mint, soulbound transfer, PM-only status, paging)
-    microcrop-integration-tests 17 passed   (all four real contracts on one Env)
-    microcrop-shared             0 tests    (types/errors/TTL helpers only)
+cargo test --workspace                         ->  220/220 passed, 0 failed
+    microcrop-payout-receiver   78 passed   (crop + 44 drought: every check in order, real secp256k1 round-trip, cross-methodology replay, pending claims, archived-flag safety, rent cap, signatures required without mock auths)
+    microcrop-treasury          49 passed   (premium split, per-org solvency, FIFO pending queue, frozen wallet, receiver-switch guard, 7dp, TTL targets)
+    microcrop-policy-manager    45 passed   (lifecycle, caps, claim window, exposure, roles, plot coords, Drought-only sale with a 117-day floor, TTL targets)
+    microcrop-integration-tests 21 passed   (all four real contracts on one Env, drought path, real 2022 ERA5 season end to end, keepers)
+    microcrop-policy-nft        14 passed   (mint, soulbound transfer, PM-only status, paging, TTL targets)
+    microcrop-shared            13 passed   (drought golden vectors, EVM + JS cross-checks, rdi-1.0 grid, TTL helpers)
+
+cargo clippy --workspace --all-targets         ->  7 warnings (all pre-existing)
+cargo fmt --all -- --check                     ->  clean
 ```
+
+On macOS without an accepted Xcode licence, build with the Command Line Tools:
+`DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test --workspace`.
 
 ## Security-critical invariants (preserved from the Solidity)
 
-1. **Determination signature is the sole payout authority.** `submit_determination`
-   reconstructs the digest on-chain via `shared::encoding::determination_digest`, calls
-   `env.crypto().secp256k1_recover`, and byte-compares the recovered SEC-1 65-byte key to
-   the stored `authorized_signer`. The `Relayer` role is anti-spam only.
+1. **Determination signature is the sole payout authority.** `submit_drought_determination`
+   (and the retired `submit_determination`) reconstructs the digest on-chain via
+   `shared::encoding`, bound to the on-chain policy id, the USDC amounts, this contract and
+   the network domain, calls `env.crypto().secp256k1_recover`, and byte-compares the
+   recovered SEC-1 65-byte key to the stored `authorized_signer`. The `Relayer` role is
+   anti-spam only. Only methodologies the admin enabled are accepted (CROP_DROUGHT).
 2. **Payout math re-derived on-chain.** `payout == sum_insured * damage_bp / 10_000`
-   (overflow-trapping i128), plus the weighted-damage invariant `60*w + 40*s == bp`
-   (satellite-only: `100*s == bp`), threshold `bp ≥ 3000`, freshness `MAX_REPORT_AGE = 3600`.
-   The signed `payout_amount` is verified against the re-derived value, never trusted.
-   The determination must also be about the insured plot (signed `latitude_e6` /
-   `longitude_e6` within 1 micro-degree of the coordinates `create_policy` stored) and the
-   policy must be `CoverageType::Comprehensive`, the only cover the cause-agnostic
-   CROP_DAMAGE index settles. `create_policy` refuses any other coverage type
-   (`CoverageNotOffered`, 118), so cover that could never pay is never sold.
+   (floor, overflow-trapping i128), threshold `bp ≥ 3000`, freshness `MAX_REPORT_AGE =
+   3600`. For CROP_DROUGHT, `bp == drought_damage * 100` and the rdi-1.0 index is
+   recomputed from the signed rainfall evidence; the policy must be `CoverageType::Drought`;
+   the season's 110-day window must lie inside the cover, with planting on or after the day
+   cover started. The determination must also be about the insured plot (signed
+   `latitude_e6` / `longitude_e6` within 1 micro-degree of the coordinates `create_policy`
+   stored). `create_policy` sells `Drought` only (`CoverageNotOffered`, 118), so cover that
+   could never pay is never sold.
 3. **Triple replay guard.** temporary `ConsumedDetermination(digest)` + persistent
    `PolicyPaid(policy_id)` + Treasury `PayoutProcessed(policy_id)`.
 4. **Per-org solvency.** Payouts debit only the policy's org reserve. If it is short, the
@@ -131,18 +148,21 @@ cargo test --workspace                         ->  146/146 passed, 0 failed
    with a 30% ratio floor; withdrawals are surplus-only; the invariant
    `usdc.balance(this) >= Σ org_reserve + accumulated_fees` holds after every op.
    Amounts are USDC base units at **7 decimals** (the Stellar Asset Contract).
-5. **Storage TTL.** Every touch extends long-lived entries to the network maximum
-   (`max_entry_ttl` = 3,110,400 ledgers, ~180 days, on mainnet and testnet as of
-   2026-10-13). A 365-day policy outlives that, so the backend calls the permissionless
-   `PayoutReceiver::extend_policy_ttl(policy_id)` (bumps the policy's entries in all four
-   contracts) at least every ~150 days for every open or pending policy.
+5. **Storage rent is capped.** Ordinary calls extend instance + code only below 3 days, to
+   10 days; data entries live as long as the policy needs them (`end_date + 30 d`, 60 days
+   for pending claims). The backend keeper calls `PayoutReceiver::extend_contract_ttl()`
+   daily (all four contracts to 30 days) and `extend_policy_ttl(policy_id)` for open or
+   pending policies whose shortest TTL is under 30 days. An archived security flag never
+   reads as absent: it fails closed or is restored with its true value.
 6. **Access control.** Every state-changing fn takes an explicit `caller: Address`, calls
    `caller.require_auth()`, and checks the `microcrop_shared::roles` registry (the
    AccessControl replacement).
 
-## Deploying later with the Stellar CLI
+## Deploying with the Stellar CLI
 
-This project is **not deployed yet.** When it is time (testnet first), the flow is:
+Use `scripts/deploy.sh` and `scripts/verify-deployment.sh` (see
+[`docs/DEPLOYMENT_RUNBOOK.md`](docs/DEPLOYMENT_RUNBOOK.md), including *Upgrading to the
+drought path and the rent cap*). The manual flow, for reference:
 
 ```sh
 # 0. Build optimised WASM
@@ -198,6 +218,12 @@ stellar contract invoke --id payout_receiver --source-account admin --network te
   -- set_network_domain --caller <ADMIN_G...> --domain <32-byte hex>
 
 # 5. Grant operational roles (Backend, Oracle, Payout, Relayer, Minter) via grant_role.
+
+# 6. Enable CROP_DROUGHT (MethodologyKind 1) and run the keeper once.
+stellar contract invoke --id payout_receiver --source-account admin --network testnet \
+  -- set_methodology_enabled --caller <ADMIN_G...> --kind 1 --enabled true
+stellar contract invoke --id payout_receiver --source-account admin --network testnet \
+  --send=yes -- extend_contract_ttl   # --send=yes: the CLI never submits a TTL-only call otherwise
 ```
 
 For `upgrade`: publish the new WASM (`stellar contract upload --wasm <new>.wasm` returns a

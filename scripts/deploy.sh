@@ -103,6 +103,12 @@ fi
 WASM_DIR="target/wasm32v1-none/release"
 for w in microcrop_policy_nft microcrop_policy_manager microcrop_treasury microcrop_payout_receiver; do
   [[ -f "$WASM_DIR/$w.wasm" ]] || die "missing $WASM_DIR/$w.wasm — run: cargo build --release --target wasm32v1-none"
+  # Deploy the OPTIMIZED wasm: it is ~16-22% smaller, and code rent is paid per byte for the
+  # contract's whole life. The rent figures in the docs assume these files.
+  if [[ ! -f "$WASM_DIR/$w.optimized.wasm" || "$WASM_DIR/$w.wasm" -nt "$WASM_DIR/$w.optimized.wasm" ]]; then
+    say "optimizing $w.wasm"
+    run stellar contract optimize --wasm "$WASM_DIR/$w.wasm" >&2
+  fi
 done
 
 if [[ "$NETWORK" == "mainnet" && "$DRY_RUN" == "0" ]]; then
@@ -128,7 +134,7 @@ deploy() {                      # deploy <state-key> <wasm-name> [--ctor-args...
 
   local addr
   addr="$(stellar contract deploy \
-      --wasm "$WASM_DIR/$wasm.wasm" \
+      --wasm "$WASM_DIR/$wasm.optimized.wasm" \
       --source "$ADMIN_KEY" --network "$NETWORK" \
       -- "$@" | tail -1)"
   [[ "$addr" =~ ^C[A-Z0-9]{55}$ ]] || die "$key deploy returned an unexpected address: $addr"
@@ -197,6 +203,21 @@ step role_pr_relayer    "$PR"       grant_role --role 4 --who "$RELAYER_ADDR"
 say "--- configuring the payout authority ---"
 step cfg_signer  "$PR" set_authorized_signer --pubkey "${AUTHORIZED_SIGNER_PUBKEY#0x}"
 step cfg_domain  "$PR" set_network_domain    --domain "$NETWORK_DOMAIN"
+# MethodologyKind is a #[repr(u32)] contracttype enum too: CropDualIndex10=0 (CROP_DAMAGE,
+# retired: leave disabled), CropDroughtRdi10=1 (CROP_DROUGHT). Absent means disabled, so
+# nothing settles until this step has run.
+step cfg_drought "$PR" set_methodology_enabled --kind 1 --enabled true
+
+# Rent cap: ordinary calls extend instance + code only below 3 days, to 10 days, and admin
+# calls extend nothing, so a fresh upload sits at the network minimum (7 days on testnet).
+# The permissionless keeper extends all four contracts to 30 days; the backend then runs it
+# daily (a no-op above 23 days). Not recorded as a step: it is meant to be repeated.
+# --send=yes is required: a TTL extension writes no ledger entry, emits no event and needs no
+# auth, so the CLI's default classifies the simulation as read-only and never submits it
+# ("Simulation identified as read-only. Send by rerunning with `--send=yes`.").
+say "--- keeper: extend all four contracts' instance + code to 30 days ---"
+run stellar contract invoke --id "$PR" --source "$ADMIN_KEY" --network "$NETWORK" --send=yes \
+    -- extend_contract_ttl
 
 state_set network_domain "$NETWORK_DOMAIN"
 state_set network "$NETWORK"

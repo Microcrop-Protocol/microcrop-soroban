@@ -9,18 +9,22 @@
 //! Enum ordinals are pinned with explicit discriminants so they match the Solidity
 //! `enum` ordinals and any off-chain system that speaks the same wire values.
 
-use soroban_sdk::{contracttype, Address, String};
+use soroban_sdk::{contracttype, Address, BytesN, String};
 
 /// Coverage kinds — ordinals 0..4 preserved from `PolicyManager.CoverageType` /
 /// `PolicyNFT.CoverageType`.
 ///
-/// Settlement mapping: the only determination kind is CROP_DAMAGE (`crop-dualindex-1.0`), a
-/// cause-agnostic damage index (60% weather, 40% NDVI). It measures how much of the crop was
-/// lost, not which peril caused the loss, so it can only settle cover that pays for loss from
-/// any covered cause: `Comprehensive`. `Drought`, `Flood`, `Both` and `ExcessRain` name a
-/// peril the index cannot attribute, and `submit_determination` rejects them
-/// (`CoverageNotSettledByMethodology`). The EVM backend already creates every on-chain policy
-/// as `Comprehensive` (`policy.writer.js`, `blockchain.worker.js`).
+/// Settlement mapping. The only methodology the authorized signer can sign today is
+/// CROP_DROUGHT (`crop-drought-rdi-1.0`), a rainfall-deficit index that indemnifies drought
+/// and nothing else, so it settles `Drought` cover only. `create_policy` sells `Drought` only
+/// (`CoverageNotOffered` otherwise) and `submit_drought_determination` rejects every other
+/// type (`CoverageNotSettledByMethodology`).
+///
+/// The retired CROP_DAMAGE methodology (`crop-dualindex-1.0`) is cause-agnostic and settles
+/// `Comprehensive` only; it is disabled by default (`MethodologyKind::CropDualIndex10`), and
+/// no new `Comprehensive` policy can be sold. Re-opening `Comprehensive` needs an audited
+/// upgrade once a cause-agnostic methodology is live again. `Flood`, `Both` and `ExcessRain`
+/// are settled by no methodology.
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -98,7 +102,9 @@ pub struct Policy {
     pub org: Address,
 }
 
-/// Stored damage report — mirrors `PayoutReceiver.DamageReport`.
+/// Stored damage report — mirrors `PayoutReceiver.DamageReport`. Unchanged so existing
+/// `Report` entries still decode; a drought report stores `weather_damage = 0` and
+/// `satellite_damage = 0`, as on EVM.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DamageReport {
@@ -150,6 +156,67 @@ pub struct CropDetermination {
     pub weather_humidity: u128,
     /// wind x 1e2, unsigned
     pub weather_wind_e2: u128,
+}
+
+/// Determination methodologies the PayoutReceiver can verify. Each one's methodology string is
+/// a FROZEN constant inside its signed preimage, not a parameter; adding one is an audited
+/// upgrade. Which are accepted is an admin switch (`set_methodology_enabled`); absent means
+/// disabled.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum MethodologyKind {
+    /// CROP_DAMAGE, `crop-dualindex-1.0` (`submit_determination`). Retired: leave disabled.
+    CropDualIndex10 = 0,
+    /// CROP_DROUGHT, `crop-drought-rdi-1.0` (`submit_drought_determination`).
+    CropDroughtRdi10 = 1,
+}
+
+/// CROP_DROUGHT signed determination (methodology `crop-drought-rdi-1.0`). Field order is
+/// the encoding order ([`crate::encoding::encode_drought_inputs`] /
+/// [`crate::encoding::encode_drought_preimage`]); units are FROZEN. Mirrors
+/// `PayoutReceiver.sol` v2.2.0 `DroughtDetermination`, except that `sum_insured` and
+/// `payout_amount` are 7-decimal Stellar USDC.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroughtDetermination {
+    // --- settlement preimage (result / subject) ---
+    /// The Soroban PolicyManager policy id (not the backend's database id).
+    pub on_chain_policy_id: u64,
+    /// Basis points 0..=10000 — the ONLY money-path unit. Must equal `drought_damage * 100`.
+    pub damage_percent_bp: u32,
+    /// Whole percent 0..=100 (the rdi-1.0 index output).
+    pub drought_damage: u32,
+    /// USDC base units, 7dp. Must equal `sum_insured * damage_percent_bp / 10000`.
+    pub payout_amount: i128,
+    /// Unix seconds, chosen once by the orchestrator.
+    pub assessed_at: u64,
+    // --- evidence (inputs hash, 13 words including the policy id) ---
+    /// Degrees x 1e6, signed.
+    pub latitude_e6: i128,
+    /// Degrees x 1e6, signed.
+    pub longitude_e6: i128,
+    /// USDC 7dp; must equal `policy.sum_insured`.
+    pub sum_insured: i128,
+    /// Planting civil date at 00:00 UTC (`plantDays * 86400`).
+    pub season_start_epoch: u64,
+    /// Length of growing period; must be 180.
+    pub lgp_days: u32,
+    /// Rainfall in centi-mm over DAP 1..40 of the insured season.
+    pub rain_w1_e2: u128,
+    /// The pixel's 1991-2020 median of W1 rainfall.
+    pub rain_ref_w1_e2: u128,
+    /// Rainfall in centi-mm over DAP 71..110 of the insured season.
+    pub rain_w2_e2: u128,
+    /// The pixel's 1991-2020 median of W2 rainfall.
+    pub rain_ref_w2_e2: u128,
+    /// Longest dry spell inside W2, days (evidence only, weight 0), 0..=40.
+    pub cdd_w2_days: u32,
+    /// keccak256 of the canonical archive projection.
+    pub source_hash: BytesN<32>,
+    /// keccak256 of `DROUGHT_PARAMS_JSON`; must equal
+    /// [`crate::encoding::DROUGHT_PARAMS_HASH_RDI_1_0`].
+    pub methodology_params_hash: BytesN<32>,
 }
 
 /// On-chain policy certificate — mirrors `PolicyNFT.PolicyCertificate`. The Solidity

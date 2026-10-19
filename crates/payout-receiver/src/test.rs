@@ -24,7 +24,7 @@ use k256::ecdsa::SigningKey;
 use microcrop_shared::{
     encoding::determination_digest,
     errors::{CommonError, PayoutError},
-    types::{CoverageType, CropDetermination, Policy, PolicyStatus, Role},
+    types::{CoverageType, CropDetermination, MethodologyKind, Policy, PolicyStatus, Role},
 };
 
 use crate::{PausedError, PayoutReceiver, PayoutReceiverClient};
@@ -123,6 +123,15 @@ impl MockPolicyManager {
         env.storage()
             .instance()
             .get(&symbol_short!("ttl"))
+            .unwrap_or(false)
+    }
+    pub fn extend_contract_ttl(env: Env) {
+        env.storage().instance().set(&symbol_short!("keep"), &true);
+    }
+    pub fn keep_called(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("keep"))
             .unwrap_or(false)
     }
     pub fn inc_calls(env: Env) -> u32 {
@@ -337,6 +346,8 @@ fn setup() -> Fixture {
 
     let domain = BytesN::from_array(&env, &[0xABu8; 32]);
     client.set_network_domain(&admin, &domain);
+    // The crop methodology is retired and disabled by default; these tests exercise it.
+    client.set_methodology_enabled(&admin, &MethodologyKind::CropDualIndex10, &true);
 
     let treasury = MockTreasuryClient::new(&env, &treasury_id);
 
@@ -669,6 +680,7 @@ fn farmer_over_claim_limit_rejected() {
     client.set_authorized_signer(&admin, &pubkey65(&env, &sk));
     let domain = BytesN::from_array(&env, &[0xABu8; 32]);
     client.set_network_domain(&admin, &domain);
+    client.set_methodology_enabled(&admin, &MethodologyKind::CropDualIndex10, &true);
 
     let d = base_det();
     let (sig, recid) = sign(&env, &sk, &pr_addr, &domain, &d);
@@ -949,13 +961,16 @@ fn one_micro_degree_rounding_difference_is_accepted() {
 
 #[test]
 fn extend_policy_ttl_bumps_own_entries_and_both_siblings() {
-    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
+    use microcrop_shared::ttl::{
+        DAY_LEDGERS, NETWORK_MAX_ENTRY_TTL_LEDGERS, PENDING_TARGET_LEDGERS,
+    };
     use soroban_sdk::testutils::storage::Persistent as _;
 
     let f = setup();
     f.env
         .ledger()
         .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    f.treasury.set_short(&true);
     let d = base_det();
     let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
     f.client.submit_determination(&f.relayer, &d, &sig, &recid);
@@ -964,21 +979,88 @@ fn extend_policy_ttl_bumps_own_entries_and_both_siblings() {
         f.env
             .as_contract(&f.pr_addr, || f.env.storage().persistent().get_ttl(k))
     };
+    // The policy ends 1,000,000 s after NOW: PolicyPaid and Report live end + 30 days.
+    let need = (1_000_000u32 + 30 * 86_400).div_ceil(5);
+    assert_eq!(ttl(&crate::DataKey::PolicyPaid(1)), need);
+    assert_eq!(ttl(&crate::DataKey::Report(1)), need);
+    assert_eq!(
+        ttl(&crate::DataKey::ClaimPending(1)),
+        PENDING_TARGET_LEDGERS
+    );
+
+    // 40 days later (ledger sequence only): the pending marker is below 30 days.
     let seq = f.env.ledger().sequence();
-    f.env.ledger().set_sequence_number(seq + 150 * 17_280);
-    assert!(ttl(&crate::DataKey::PolicyPaid(1)) < NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    f.env.ledger().set_sequence_number(seq + 40 * DAY_LEDGERS);
+    assert_eq!(ttl(&crate::DataKey::ClaimPending(1)), 20 * DAY_LEDGERS);
 
     // Permissionless.
     f.env.set_auths(&[]);
     f.client.extend_policy_ttl(&1);
     assert_eq!(
-        ttl(&crate::DataKey::PolicyPaid(1)),
-        NETWORK_MAX_ENTRY_TTL_LEDGERS
+        ttl(&crate::DataKey::ClaimPending(1)),
+        PENDING_TARGET_LEDGERS
     );
-    assert_eq!(
-        ttl(&crate::DataKey::Report(1)),
-        NETWORK_MAX_ENTRY_TTL_LEDGERS
-    );
+    // Need-based, never the network maximum.
+    assert!(ttl(&crate::DataKey::PolicyPaid(1)) < NETWORK_MAX_ENTRY_TTL_LEDGERS);
     assert!(f.treasury.ttl_called());
     assert!(f.pm.ttl_called());
+}
+
+#[test]
+fn extend_contract_ttl_keeps_all_four_contracts_alive() {
+    use microcrop_shared::ttl::{KEEPER_TARGET_LEDGERS, USER_TARGET_LEDGERS};
+    use soroban_sdk::testutils::storage::Instance as _;
+
+    let f = setup();
+    let inst = |a: &Address| {
+        f.env
+            .as_contract(a, || f.env.storage().instance().get_ttl())
+    };
+    // An ordinary call extends the instance to 10 days, never the network maximum.
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    f.client.submit_determination(&f.relayer, &d, &sig, &recid);
+    assert_eq!(inst(&f.pr_addr), USER_TARGET_LEDGERS);
+
+    f.env.set_auths(&[]);
+    f.client.extend_contract_ttl();
+    assert_eq!(inst(&f.pr_addr), KEEPER_TARGET_LEDGERS);
+    // Treasury through the deployer; PolicyManager (and through it PolicyNft) by its own
+    // keeper.
+    assert_eq!(inst(&f.treasury.address), KEEPER_TARGET_LEDGERS);
+    assert!(f.pm.keep_called());
+}
+
+// ============ Methodology allow-list ============
+
+#[test]
+fn crop_methodology_disabled_is_rejected() {
+    let f = setup();
+    f.client
+        .set_methodology_enabled(&f.admin, &MethodologyKind::CropDualIndex10, &false);
+    assert!(!f
+        .client
+        .is_methodology_enabled(&MethodologyKind::CropDualIndex10));
+    let d = base_det();
+    let (sig, recid) = sign(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
+    assert_eq!(
+        f.client
+            .try_submit_determination(&f.relayer, &d, &sig, &recid),
+        Err(Ok(PayoutError::MethodologyDisabled.into()))
+    );
+    assert_eq!(f.treasury.calls(), 0);
+}
+
+#[test]
+fn only_the_admin_sets_a_methodology() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    assert_eq!(
+        f.client
+            .try_set_methodology_enabled(&stranger, &MethodologyKind::CropDroughtRdi10, &true),
+        Err(Ok(CommonError::Unauthorized.into()))
+    );
+    assert!(!f
+        .client
+        .is_methodology_enabled(&MethodologyKind::CropDroughtRdi10));
 }

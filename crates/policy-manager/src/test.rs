@@ -17,7 +17,8 @@ use microcrop_shared::{
 
 use crate::{
     PolicyManager, PolicyManagerClient, CLAIM_WINDOW_SECS, MAX_ACTIVE_POLICIES_PER_FARMER,
-    MAX_PAGE_SIZE, MAX_SUM_INSURED, MIN_SUM_INSURED, SECONDS_PER_DAY,
+    MAX_PAGE_SIZE, MAX_SUM_INSURED, MIN_DROUGHT_DURATION_DAYS, MIN_DURATION_DAYS, MIN_SUM_INSURED,
+    SECONDS_PER_DAY,
 };
 
 /// Insured plot near Nairobi, degrees x 1e6.
@@ -132,10 +133,10 @@ fn create_default(c: &Ctx) -> u64 {
         &1u64, // plot_id
         &PLOT_LAT_E6,
         &PLOT_LON_E6,
-        &MIN_SUM_INSURED, // sum_insured (100 USDC)
-        &100_000_000i128, // premium (10 USDC)
-        &30u32,           // duration_days
-        &CoverageType::Comprehensive,
+        &MIN_SUM_INSURED,           // sum_insured (100 USDC)
+        &100_000_000i128,           // premium (10 USDC)
+        &MIN_DROUGHT_DURATION_DAYS, // duration_days
+        &CoverageType::Drought,
         &c.org,
     )
 }
@@ -184,7 +185,10 @@ fn create_activate_claim_happy_path() {
     assert_eq!(p.sum_insured, MIN_SUM_INSURED);
     assert_eq!(p.org, c.org);
     // Coverage window: end == start + 30 days.
-    assert_eq!(p.end_date, p.start_date + 30 * SECONDS_PER_DAY);
+    assert_eq!(
+        p.end_date,
+        p.start_date + MIN_DROUGHT_DURATION_DAYS as u64 * SECONDS_PER_DAY
+    );
     // PENDING policy is not yet active, but its org exposure is counted from creation.
     assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
     assert_eq!(
@@ -229,8 +233,8 @@ fn create_rejects_sum_too_low() {
         &PLOT_LON_E6,
         &(MIN_SUM_INSURED - 1),
         &100_000_000i128,
-        &30u32,
-        &CoverageType::Comprehensive,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
         &c.org,
     );
     assert_err(res, PolicyError::SumInsuredTooLow as u32);
@@ -247,8 +251,8 @@ fn create_rejects_sum_too_high() {
         &PLOT_LON_E6,
         &(MAX_SUM_INSURED + 1),
         &100_000_000i128,
-        &30u32,
-        &CoverageType::Comprehensive,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
         &c.org,
     );
     assert_err(res, PolicyError::SumInsuredTooHigh as u32);
@@ -265,8 +269,8 @@ fn create_rejects_zero_premium() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &0i128,
-        &30u32,
-        &CoverageType::Comprehensive,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
         &c.org,
     );
     assert_err(res, PolicyError::ZeroPremium as u32);
@@ -285,7 +289,7 @@ fn create_rejects_bad_duration() {
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &29u32,
-        &CoverageType::Comprehensive,
+        &CoverageType::Drought,
         &c.org,
     );
     assert_err(res, PolicyError::InvalidDuration as u32);
@@ -299,10 +303,51 @@ fn create_rejects_bad_duration() {
         &MIN_SUM_INSURED,
         &100_000_000i128,
         &366u32,
-        &CoverageType::Comprehensive,
+        &CoverageType::Drought,
         &c.org,
     );
     assert_err(res, PolicyError::InvalidDuration as u32);
+}
+
+/// Audit (drought-path review, finding 3): Drought cover shorter than the 110-day season
+/// window plus the 7-day rainfall-archive lag takes a premium and can never settle, so it is
+/// refused at sale even though it is inside the generic 30..=365 day range.
+#[test]
+fn create_rejects_drought_cover_too_short_to_pay() {
+    let c = setup();
+    for days in [MIN_DURATION_DAYS, 110u32, MIN_DROUGHT_DURATION_DAYS - 1] {
+        let res = c.client.try_create_policy(
+            &c.backend,
+            &c.farmer,
+            &1u64,
+            &PLOT_LAT_E6,
+            &PLOT_LON_E6,
+            &MIN_SUM_INSURED,
+            &100_000_000i128,
+            &days,
+            &CoverageType::Drought,
+            &c.org,
+        );
+        assert_err(res, PolicyError::InvalidDuration as u32);
+    }
+    // The floor itself is accepted.
+    let id = c.client.create_policy(
+        &c.backend,
+        &c.farmer,
+        &1u64,
+        &PLOT_LAT_E6,
+        &PLOT_LON_E6,
+        &MIN_SUM_INSURED,
+        &100_000_000i128,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
+        &c.org,
+    );
+    let p = c.client.get_policy(&id);
+    assert_eq!(
+        p.end_date - p.start_date,
+        MIN_DROUGHT_DURATION_DAYS as u64 * SECONDS_PER_DAY
+    );
 }
 
 #[test]
@@ -322,8 +367,8 @@ fn create_enforces_open_policy_cap() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
-        &CoverageType::Comprehensive,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
         &c.org,
     );
     assert_err(res, PolicyError::TooManyActivePolicies as u32);
@@ -341,8 +386,8 @@ fn create_requires_backend_role() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
-        &CoverageType::Comprehensive,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
         &c.org,
     );
     assert_err(res, CommonError::Unauthorized as u32);
@@ -401,8 +446,8 @@ fn cancel_pending_releases_slot() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
-        &CoverageType::Comprehensive,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
         &c.org,
     );
     assert_err(res, PolicyError::TooManyActivePolicies as u32);
@@ -536,8 +581,8 @@ fn create_counts_recent_claims_against_the_open_cap() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
-        &CoverageType::Comprehensive,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
         &c.org,
     );
     assert_err(res, PolicyError::TooManyActivePolicies as u32);
@@ -569,8 +614,8 @@ fn activate_without_nft_set_reverts() {
         &PLOT_LON_E6,
         &MIN_SUM_INSURED,
         &100_000_000i128,
-        &30u32,
-        &CoverageType::Comprehensive,
+        &MIN_DROUGHT_DURATION_DAYS,
+        &CoverageType::Drought,
         &org,
     );
     // PolicyNFT never wired -> activation reverts PolicyNftNotSet.
@@ -601,8 +646,8 @@ fn sum_insured_bounds_are_seven_decimal_usdc() {
             &PLOT_LON_E6,
             &sum,
             &100_000_000i128,
-            &30u32,
-            &CoverageType::Comprehensive,
+            &MIN_DROUGHT_DURATION_DAYS,
+            &CoverageType::Drought,
             &c.org,
         )
     };
@@ -878,8 +923,8 @@ fn stale_pending_policy_expires_and_releases_exposure_once() {
             &PLOT_LON_E6,
             &MIN_SUM_INSURED,
             &100_000_000i128,
-            &30u32,
-            &CoverageType::Comprehensive,
+            &MIN_DROUGHT_DURATION_DAYS,
+            &CoverageType::Drought,
             &c.org,
         ),
         PolicyError::TooManyActivePolicies as u32,
@@ -993,7 +1038,10 @@ fn mark_claim_pending_requires_oracle_and_live_active_cover() {
 
 #[test]
 fn role_grant_ttl_is_set_on_grant_and_extended_on_use() {
-    use microcrop_shared::{roles::RoleKey, ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS};
+    use microcrop_shared::{
+        roles::RoleKey,
+        ttl::{DAY_LEDGERS, NETWORK_MAX_ENTRY_TTL_LEDGERS, ROLE_TARGET_LEDGERS},
+    };
     use soroban_sdk::testutils::storage::Persistent as _;
 
     // Run against the measured mainnet/testnet limit (~180 days), not the test default.
@@ -1007,34 +1055,42 @@ fn role_grant_ttl_is_set_on_grant_and_extended_on_use() {
     let backend = Address::generate(&env);
     client.grant_role(&admin, &Role::Backend, &backend);
 
-    // `get_ttl` counts the current ledger, so an entry at the limit reports max_entry_ttl.
-    let max = NETWORK_MAX_ENTRY_TTL_LEDGERS;
-    let day: u32 = 17_280;
     let key = RoleKey::Role(Role::Backend, backend.clone());
     let ttl = || env.as_contract(&pm_id, || env.storage().persistent().get_ttl(&key));
     assert_eq!(
         ttl(),
-        max,
-        "grant must extend the role TTL to the network maximum"
+        ROLE_TARGET_LEDGERS,
+        "a grant lives 60 days, not the maximum"
     );
 
-    // 70 days later a role-gated call extends it back to the maximum.
-    let seq = env.ledger().sequence();
-    env.ledger().set_sequence_number(seq + 70 * day);
-    assert_eq!(ttl(), max - 70 * day);
-    client.create_policy(
-        &backend,
-        &Address::generate(&env),
-        &1u64,
-        &PLOT_LAT_E6,
-        &PLOT_LON_E6,
-        &MIN_SUM_INSURED,
-        &100_000_000i128,
-        &30u32,
-        &CoverageType::Comprehensive,
-        &Address::generate(&env),
-    );
-    assert_eq!(ttl(), max, "a held role must be extended on use");
+    let create = || {
+        client.create_policy(
+            &backend,
+            &Address::generate(&env),
+            &1u64,
+            &PLOT_LAT_E6,
+            &PLOT_LON_E6,
+            &MIN_SUM_INSURED,
+            &100_000_000i128,
+            &MIN_DROUGHT_DURATION_DAYS,
+            &CoverageType::Drought,
+            &Address::generate(&env),
+        )
+    };
+    // 20 days later (40 days left) a role-gated call does not extend it...
+    let keep = |days: u32| {
+        let seq = env.ledger().sequence();
+        env.ledger().set_sequence_number(seq + days * DAY_LEDGERS);
+        // Keep the instance alive as the keeper would.
+        client.extend_contract_ttl();
+    };
+    keep(20);
+    create();
+    assert_eq!(ttl(), 40 * DAY_LEDGERS);
+    // ...and below 30 days left it is extended back to 60 days.
+    keep(11);
+    create();
+    assert_eq!(ttl(), ROLE_TARGET_LEDGERS, "a held role is extended on use");
 }
 
 // ---------------- Plot coordinates ----------------
@@ -1060,8 +1116,8 @@ fn create_rejects_out_of_range_coordinates() {
             &lon,
             &MIN_SUM_INSURED,
             &100_000_000i128,
-            &30u32,
-            &CoverageType::Comprehensive,
+            &MIN_DROUGHT_DURATION_DAYS,
+            &CoverageType::Drought,
             &c.org,
         )
     };
@@ -1088,52 +1144,231 @@ fn create_rejects_out_of_range_coordinates() {
 
 // ---------------- TTL keep-alive ----------------
 
-#[test]
-fn extend_policy_ttl_restores_the_policy_entry_to_the_network_max() {
-    use crate::DataKey;
-    use microcrop_shared::ttl::NETWORK_MAX_ENTRY_TTL_LEDGERS;
-    use soroban_sdk::testutils::storage::Persistent as _;
+// ---------------- Rent cap (storage TTL) ----------------
 
-    let c = setup();
-    c.env
-        .ledger()
-        .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
-    let id = create_default(&c);
-    let ttl = |k: &DataKey| {
+mod rent {
+    use super::*;
+    use crate::DataKey;
+    use microcrop_shared::ttl::{
+        DAY_LEDGERS, KEEPER_TARGET_LEDGERS, NETWORK_MAX_ENTRY_TTL_LEDGERS, PENDING_TARGET_LEDGERS,
+        USER_TARGET_LEDGERS,
+    };
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+
+    const NOW: u64 = 1_700_000_000;
+
+    fn ctx() -> Ctx {
+        let c = setup();
+        c.env.ledger().set_timestamp(NOW);
+        c.env
+            .ledger()
+            .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
+        c
+    }
+
+    fn create(c: &Ctx, farmer: &Address, days: u32) -> u64 {
+        c.client.create_policy(
+            &c.backend,
+            farmer,
+            &1u64,
+            &PLOT_LAT_E6,
+            &PLOT_LON_E6,
+            &MIN_SUM_INSURED,
+            &100_000_000i128,
+            &days,
+            &CoverageType::Drought,
+            &c.org,
+        )
+    }
+
+    fn ttl(c: &Ctx, k: &DataKey) -> u32 {
         c.env.as_contract(&c.client.address, || {
             c.env.storage().persistent().get_ttl(k)
         })
-    };
-    assert_eq!(ttl(&DataKey::Policy(id)), NETWORK_MAX_ENTRY_TTL_LEDGERS);
+    }
 
-    // ~150 days with no touch: the entry is 150 days closer to archival.
-    let seq = c.env.ledger().sequence();
-    c.env.ledger().set_sequence_number(seq + 150 * 17_280);
-    assert_eq!(
-        ttl(&DataKey::Policy(id)),
-        NETWORK_MAX_ENTRY_TTL_LEDGERS - 150 * 17_280
-    );
+    /// Advance ledger time and sequence together, running the keeper as the backend would.
+    fn advance(c: &Ctx, days: u32) {
+        let seq = c.env.ledger().sequence();
+        c.env.ledger().set_sequence_number(seq + days * DAY_LEDGERS);
+        let ts = c.env.ledger().timestamp();
+        c.env.ledger().set_timestamp(ts + days as u64 * 86_400);
+        c.client.extend_contract_ttl();
+    }
 
-    // Anyone can keep it alive, with no auth.
-    c.env.set_auths(&[]);
-    c.client.extend_policy_ttl(&id);
-    assert_eq!(ttl(&DataKey::Policy(id)), NETWORK_MAX_ENTRY_TTL_LEDGERS);
-    assert_eq!(
-        ttl(&DataKey::PendingCounted(id)),
-        NETWORK_MAX_ENTRY_TTL_LEDGERS
-    );
+    #[test]
+    fn policy_entries_live_until_end_date_plus_grace() {
+        let c = ctx();
+        let id = create(&c, &c.farmer, 120);
+        // Per-policy: 120 days of cover + 30 days of grace.
+        for k in [
+            DataKey::Policy(id),
+            DataKey::PendingCounted(id),
+            DataKey::FarmerPolicyAt(c.farmer.clone(), 0),
+        ] {
+            assert_eq!(ttl(&c, &k), 150 * DAY_LEDGERS);
+        }
+        // Shared per-farmer / per-org: the same need here.
+        for k in [
+            DataKey::FarmerPolicyCount(c.farmer.clone()),
+            DataKey::FarmerPendingCount(c.farmer.clone()),
+            DataKey::OrgOutstanding(c.org.clone()),
+        ] {
+            assert_eq!(ttl(&c, &k), 150 * DAY_LEDGERS);
+        }
+        // A 365-day policy's need (395 days) clamps to the network maximum.
+        let long = create(&c, &Address::generate(&c.env), 365);
+        assert_eq!(
+            ttl(&c, &DataKey::Policy(long)),
+            NETWORK_MAX_ENTRY_TTL_LEDGERS
+        );
+    }
 
-    assert_err(
-        c.client.try_extend_policy_ttl(&999),
-        PolicyError::PolicyDoesNotExist as u32,
-    );
+    #[test]
+    fn activation_re_extends_to_the_new_end_date() {
+        let c = ctx();
+        let id = create(&c, &c.farmer, 120);
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), 150 * DAY_LEDGERS);
+        advance(&c, 20);
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), 130 * DAY_LEDGERS);
+        // Activation moves end_date to now + 120 d: the entry needs 150 days again.
+        activate_default(&c, id);
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), 150 * DAY_LEDGERS);
+        // The shared per-farmer / per-org entries follow the new end, the index count too.
+        for k in [
+            DataKey::FarmerActiveCount(c.farmer.clone()),
+            DataKey::FarmerPolicyCount(c.farmer.clone()),
+            DataKey::OrgOutstanding(c.org.clone()),
+        ] {
+            assert_eq!(ttl(&c, &k), 150 * DAY_LEDGERS);
+        }
+        // The index item keeps its create-time need (the policy does not record its index
+        // position): short by the 20 days the policy spent PENDING.
+        assert_eq!(
+            ttl(&c, &DataKey::FarmerPolicyAt(c.farmer.clone(), 0)),
+            130 * DAY_LEDGERS
+        );
+    }
+
+    #[test]
+    fn shared_entries_keep_the_longest_need() {
+        let c = ctx();
+        create(&c, &c.farmer, 140);
+        let k = DataKey::OrgOutstanding(c.org.clone());
+        assert_eq!(ttl(&c, &k), 170 * DAY_LEDGERS);
+        // A shorter policy of the same org and farmer never shortens it.
+        create(&c, &c.farmer, MIN_DROUGHT_DURATION_DAYS);
+        assert_eq!(ttl(&c, &k), 170 * DAY_LEDGERS);
+        assert_eq!(
+            ttl(&c, &DataKey::FarmerPolicyCount(c.farmer.clone())),
+            170 * DAY_LEDGERS
+        );
+    }
+
+    #[test]
+    fn a_closed_policy_keeps_its_ttl_and_a_pending_claim_gets_sixty_days() {
+        let c = ctx();
+        let id = create(&c, &c.farmer, 140);
+        activate_default(&c, id);
+        advance(&c, 10);
+        c.client.mark_claim_pending(&c.oracle, &id);
+        // CLAIM_PENDING with more than 30 days left: left as it is.
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), 160 * DAY_LEDGERS);
+        let short = create(&c, &Address::generate(&c.env), MIN_DROUGHT_DURATION_DAYS);
+        activate_default(&c, short);
+        for _ in 0..5 {
+            advance(&c, 20);
+        }
+        advance(&c, 16);
+        // One day before the end: end + 30 d is 31 days away.
+        c.client.mark_claim_pending(&c.oracle, &short);
+        assert_eq!(ttl(&c, &DataKey::Policy(short)), 31 * DAY_LEDGERS);
+        // While it waits past the end, the keeper gives it the pending target.
+        advance(&c, 2);
+        c.client.extend_policy_ttl(&short);
+        assert_eq!(ttl(&c, &DataKey::Policy(short)), PENDING_TARGET_LEDGERS);
+        // Claimed: left as it is.
+        let before = ttl(&c, &DataKey::Policy(short));
+        advance(&c, 5);
+        c.client.mark_as_claimed(&c.oracle, &short);
+        assert_eq!(ttl(&c, &DataKey::Policy(short)), before - 5 * DAY_LEDGERS);
+    }
+
+    #[test]
+    fn extend_policy_ttl_extends_to_need_not_the_maximum() {
+        let c = ctx();
+        // 365-day policy: the need is past the network maximum.
+        let id = create(&c, &c.farmer, 365);
+        activate_default(&c, id);
+        for _ in 0..6 {
+            advance(&c, 25);
+        }
+        assert_eq!(
+            ttl(&c, &DataKey::Policy(id)),
+            NETWORK_MAX_ENTRY_TTL_LEDGERS - 150 * DAY_LEDGERS
+        );
+        c.env.set_auths(&[]);
+        c.client.extend_policy_ttl(&id);
+        // 215 days of cover left + 30 of grace = 245 days: clamped to the maximum.
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), NETWORK_MAX_ENTRY_TTL_LEDGERS);
+        assert_eq!(
+            ttl(&c, &DataKey::OrgOutstanding(c.org.clone())),
+            NETWORK_MAX_ENTRY_TTL_LEDGERS
+        );
+
+        // A 117-day policy: extend_policy_ttl gives it end + 30 d, not the maximum.
+        c.env.mock_all_auths();
+        let short = create(&c, &Address::generate(&c.env), MIN_DROUGHT_DURATION_DAYS);
+        advance(&c, 20);
+        c.client.extend_policy_ttl(&short);
+        assert_eq!(ttl(&c, &DataKey::Policy(short)), 127 * DAY_LEDGERS);
+
+        assert_err(
+            c.client.try_extend_policy_ttl(&999),
+            PolicyError::PolicyDoesNotExist as u32,
+        );
+    }
+
+    #[test]
+    fn calls_no_longer_extend_the_instance_above_the_threshold() {
+        let c = ctx();
+        let inst = |a: &Address| {
+            c.env
+                .as_contract(a, || c.env.storage().instance().get_ttl())
+        };
+        let nft: Address = c.env.as_contract(&c.client.address, || {
+            c.env.storage().instance().get(&DataKey::PolicyNft).unwrap()
+        });
+        assert_eq!(inst(&c.client.address), USER_TARGET_LEDGERS);
+        // The keeper extends PolicyManager and PolicyNft to 30 days.
+        c.env.set_auths(&[]);
+        c.client.extend_contract_ttl();
+        assert_eq!(inst(&c.client.address), KEEPER_TARGET_LEDGERS);
+        assert_eq!(inst(&nft), KEEPER_TARGET_LEDGERS);
+        c.env.mock_all_auths();
+        // User calls leave a 30-day TTL alone.
+        let id = create(&c, &c.farmer, MIN_DROUGHT_DURATION_DAYS);
+        activate_default(&c, id);
+        assert_eq!(inst(&c.client.address), KEEPER_TARGET_LEDGERS);
+        // The keeper is a no-op above 23 days.
+        let seq = c.env.ledger().sequence();
+        c.env.ledger().set_sequence_number(seq + 6 * DAY_LEDGERS);
+        c.client.extend_contract_ttl();
+        assert_eq!(inst(&c.client.address), 24 * DAY_LEDGERS);
+        // Below 3 days a user call tops it up to 10 days, no more.
+        c.env.ledger().set_sequence_number(seq + 28 * DAY_LEDGERS);
+        c.client.extend_policy_ttl(&id);
+        assert_eq!(inst(&c.client.address), USER_TARGET_LEDGERS);
+    }
 }
 
 #[test]
 fn create_rejects_cover_the_methodology_cannot_settle() {
+    // Only drought cover is sold: the one signable methodology (crop-drought-rdi-1.0) cannot
+    // settle anything else. Comprehensive is closed until a cause-agnostic methodology is live.
     let c = setup();
     for coverage in [
-        CoverageType::Drought,
+        CoverageType::Comprehensive,
         CoverageType::Flood,
         CoverageType::Both,
         CoverageType::ExcessRain,
@@ -1146,7 +1381,7 @@ fn create_rejects_cover_the_methodology_cannot_settle() {
             &PLOT_LON_E6,
             &MIN_SUM_INSURED,
             &100_000_000i128,
-            &30u32,
+            &MIN_DROUGHT_DURATION_DAYS,
             &coverage,
             &c.org,
         );
@@ -1154,4 +1389,15 @@ fn create_rejects_cover_the_methodology_cannot_settle() {
     }
     // Nothing was written: the counter did not move.
     assert_eq!(c.client.get_total_policies(), 0);
+}
+
+#[test]
+fn drought_cover_is_sold() {
+    let c = setup();
+    let id = create_default(&c);
+    assert_eq!(
+        c.client.get_policy(&id).coverage_type,
+        CoverageType::Drought
+    );
+    assert_eq!(c.client.get_total_policies(), 1);
 }

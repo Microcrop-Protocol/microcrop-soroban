@@ -110,10 +110,10 @@
                   "i128": "100000000"
                 },
                 {
-                  "u32": 30
+                  "u32": 117
                 },
                 {
-                  "u32": 4
+                  "u32": 0
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
@@ -156,10 +156,10 @@
                   "i128": "100000000"
                 },
                 {
-                  "u32": 30
+                  "u32": 117
                 },
                 {
-                  "u32": 4
+                  "u32": 0
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
@@ -325,7 +325,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 2540160
       },
       {
         "entry": {
@@ -352,7 +352,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 2540160
       },
       {
         "entry": {
@@ -382,7 +382,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 2540160
       },
       {
         "entry": {
@@ -412,7 +412,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 2540160
       },
       {
         "entry": {
@@ -439,7 +439,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 2540160
       },
       {
         "entry": {
@@ -466,7 +466,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 2540160
       },
       {
         "entry": {
@@ -493,7 +493,7 @@
                       "symbol": "coverage_type"
                     },
                     "val": {
-                      "u32": 4
+                      "u32": 0
                     }
                   },
                   {
@@ -509,7 +509,7 @@
                       "symbol": "end_date"
                     },
                     "val": {
-                      "u64": "2592000"
+                      "u64": "10108800"
                     }
                   },
                   {
@@ -598,7 +598,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 2540160
       },
       {
         "entry": {
@@ -625,7 +625,7 @@
                       "symbol": "coverage_type"
                     },
                     "val": {
-                      "u32": 4
+                      "u32": 0
                     }
                   },
                   {
@@ -641,7 +641,7 @@
                       "symbol": "end_date"
                     },
                     "val": {
-                      "u64": "2592000"
+                      "u64": "10108800"
                     }
                   },
                   {
@@ -730,7 +730,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 2540160
       },
       {
         "entry": {
@@ -760,7 +760,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 1036800
       },
       {
         "entry": {
@@ -790,7 +790,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 1036800
       },
       {
         "entry": {
@@ -820,7 +820,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 1036800
       },
       {
         "entry": {
@@ -850,7 +850,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 1036800
       },
       {
         "entry": {
@@ -898,7 +898,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 172800
       },
       {
         "entry": {
@@ -1042,7 +1042,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 172800
       }
     ]
   },
