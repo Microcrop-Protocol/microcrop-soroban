@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! PolicyManager unit tests (Soroban test env).
 //!
 //! Covers: constructor wiring, the create -> activate -> claim happy path, every create-time

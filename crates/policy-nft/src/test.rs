@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Unit tests for the PolicyNft port: mint happy-path + registry views, soulbound transfer
 //! blocked while active / allowed after deactivation, and the access guards
 //! (MINTER_ROLE on mint, NotPolicyManager on status update, InvalidPolicyId,

@@ -307,7 +307,7 @@ impl PolicyManager {
         }
 
         // Validate duration.
-        if duration_days < MIN_DURATION_DAYS || duration_days > MAX_DURATION_DAYS {
+        if !(MIN_DURATION_DAYS..=MAX_DURATION_DAYS).contains(&duration_days) {
             panic_with_error!(&env, PolicyError::InvalidDuration);
         }
 

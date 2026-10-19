@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Security suite for `PayoutReceiver::submit_determination`.
 //!
 //! The signature is the SOLE payout authority, so the crux is a real secp256k1 round-trip:
