@@ -7,3 +7,7 @@ target/
 # Deployment state written by scripts/deploy.sh. Contains live contract addresses and is
 # environment-specific; record addresses in the runbook/PR instead of committing state.
 deployments/
+
+# Written by the #[ignore]d real-WASM lane (CI runs it). Its wasm hashes depend on the
+# build environment, so it is not a stable snapshot to commit.
+crates/integration-tests/test_snapshots/wasm_lane_full_flow.1.json
