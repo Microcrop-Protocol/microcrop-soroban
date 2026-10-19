@@ -245,7 +245,7 @@ The sale and the payout determination are on two different PolicyManagers, for t
 4. **A real M-Pesa receipt behind `mark_settled`.**
    - The reference hashes here are sha256 of evidence labels, not of a real payout.
    - "Settled" is an attestation by the Funder; the chain cannot prove the off-chain payment happened.
-5. **Backend integration (spec §8).** Not started. No backend job drove these transactions; the CLI did.
+5. **Backend integration (spec §8).** Built in [microcrop-core PR #97](https://github.com/Microcrop-Protocol/microcrop-core/pull/97) (open, not merged), but not used for this run: the CLI drove these transactions, not a backend job.
 6. **The host-side refusal of a forged PayoutReceiver authorization.**
    - On testnet the CLI cannot even build that transaction, because no key exists for a contract address.
    - The host's own refusal is proven only in the unit test `record_needs_the_receivers_own_authorization`.
