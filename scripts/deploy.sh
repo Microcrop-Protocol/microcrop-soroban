@@ -19,11 +19,26 @@
 # problem, a dropped connection) is resumed by running the same command again — never by
 # starting over, which would orphan the contracts already paid for.
 #
+# WHICH WASM. Two sources:
+#   --release vX.Y.Z  the SEP-55 verified build: the four assets .github/workflows/release.yml
+#                     attached to the per-contract releases of git tag vX.Y.Z. Each is
+#                     downloaded to <state-dir>/releases/vX.Y.Z/, its GitHub build attestation
+#                     is verified (signer workflow, pinned digest, source ref = the tag, this
+#                     repo) and its contractmetav0 source_repo checked, and THOSE files are
+#                     deployed, byte for byte. MAINNET ACCEPTS NOTHING ELSE.
+#   (no --release)    the local build in target/wasm32v1-none/release, optimized here.
+#                     Testnet only: nothing ties a local build to a commit.
+#
 # Usage:
 #   ./scripts/deploy.sh --network testnet
 #   ./scripts/deploy.sh --network testnet --dry-run
-#   ./scripts/deploy.sh --network mainnet          # requires typing the confirmation phrase
+#   ./scripts/deploy.sh --network testnet --release v0.2.0
+#   ./scripts/deploy.sh --network mainnet --release v0.2.0   # + the confirmation phrase
 #   ./scripts/deploy.sh --network testnet --state-dir <dir>   # a fresh deployment elsewhere
+#   ./scripts/deploy.sh ... --release v0.2.0 --release-dir <dir>
+#                     use assets already in <dir> (one <crate>_v*.wasm each) instead of
+#                     downloading; they are still verified. Test hook: with --dry-run only,
+#                     DRY_RUN_SKIP_ATTESTATION=1 skips verification (fake assets).
 #
 # Environment: ADMIN_KEY, BACKEND_ADDR, RELAYER_ADDR, AUTHORIZED_SIGNER_PUBKEY (required);
 # FUNDER_ADDR (optional, default BACKEND_ADDR: who may mark obligations funded/settled);
@@ -34,13 +49,17 @@ set -euo pipefail
 NETWORK="testnet"
 DRY_RUN=0
 STATE_DIR="deployments"
+RELEASE=""
+RELEASE_DIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --network) NETWORK="${2:?--network needs a value}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --state-dir) STATE_DIR="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
+    --release) RELEASE="${2:?--release needs a tag, e.g. v0.2.0}"; shift 2 ;;
+    --release-dir) RELEASE_DIR="${2:?--release-dir needs a directory}"; shift 2 ;;
+    -h|--help) sed -n '2,46p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -112,24 +131,79 @@ else
   say "NETWORK_DOMAIN (explicit) = $NETWORK_DOMAIN"
 fi
 
-WASM_DIR="target/wasm32v1-none/release"
-for w in microcrop_policy_nft microcrop_policy_manager microcrop_settlement_adapter microcrop_payout_receiver; do
-  [[ -f "$WASM_DIR/$w.wasm" ]] || die "missing $WASM_DIR/$w.wasm — run: cargo build --release --target wasm32v1-none"
-  # Deploy the OPTIMIZED wasm: it is ~16-22% smaller, and code rent is paid per byte for the
-  # contract's whole life. The rent figures in the docs assume these files.
-  if [[ ! -f "$WASM_DIR/$w.optimized.wasm" || "$WASM_DIR/$w.wasm" -nt "$WASM_DIR/$w.optimized.wasm" ]]; then
-    say "optimizing $w.wasm"
-    run stellar contract optimize --wasm "$WASM_DIR/$w.wasm" >&2
+# ---------------------------------------------------------------------------
+# The WASM to deploy: the attested release assets, or (testnet only) the local build
+# ---------------------------------------------------------------------------
+[[ -z "$RELEASE_DIR" || -n "$RELEASE" ]] || die "--release-dir needs --release <tag> (the tag the assets must be attested to)"
+if [[ "${DRY_RUN_SKIP_ATTESTATION:-0}" == "1" && "$DRY_RUN" != "1" ]]; then
+  die "DRY_RUN_SKIP_ATTESTATION is a --dry-run test hook; refusing to deploy unverified WASM"
+fi
+if [[ "$NETWORK" == "mainnet" && -z "$RELEASE" ]]; then
+  die "mainnet deploys only the attested release WASM: pass --release vX.Y.Z (see DEPLOYMENT_RUNBOOK, Cutting a release). A local build is refused on mainnet."
+fi
+
+# A deployment is one build. Never resume a state file with a different one.
+recorded="$(state_get release)"
+started="$(jq -r '[.policy_nft, .policy_manager, .settlement_adapter, .payout_receiver] | map(select(. != null)) | length' "$STATE")"
+if [[ -n "$RELEASE" ]]; then
+  [[ -z "$recorded" || "$recorded" == "$RELEASE" ]] \
+    || die "state file records release $recorded; resuming with $RELEASE would mix builds. Use --state-dir for a new deployment."
+  [[ -n "$recorded" || "$started" == "0" ]] \
+    || die "state file holds contracts deployed from a LOCAL build; resuming with --release would mix builds. Use --state-dir for a new deployment."
+else
+  [[ -z "$recorded" ]] \
+    || die "state file records release $recorded; resume it with --release $recorded, not a local build"
+fi
+
+# deploy() looks the file up by state key: WASM_<key>.
+if [[ -n "$RELEASE" ]]; then
+  # shellcheck source=scripts/lib/release.sh
+  source "$(dirname "$0")/lib/release.sh"
+  release_check_tag "$RELEASE"
+  if [[ -n "$RELEASE_DIR" ]]; then
+    [[ -d "$RELEASE_DIR" ]] || die "--release-dir $RELEASE_DIR does not exist"
+  else
+    command -v gh >/dev/null || die "gh CLI not found (brew install gh): --release downloads and verifies with it"
+    RELEASE_DIR="${STATE_DIR}/releases/${RELEASE}"
+    release_download "$RELEASE" "$RELEASE_DIR"
   fi
-done
+  [[ "${DRY_RUN_SKIP_ATTESTATION:-0}" == "1" ]] && RELEASE_SKIP_VERIFY=1
+  commits=()
+  for pair in "${RELEASE_CONTRACTS[@]}"; do
+    key="${pair%%:*}"; crate="${pair#*:}"
+    file="$(release_asset "$RELEASE_DIR" "$crate")"
+    commit="$(release_verify_asset "$RELEASE" "$file")"
+    commits+=("$commit")
+    printf -v "WASM_${key}" '%s' "$file"
+    say "$crate: $(basename "$file")  sha256 $(sha256_of "$file")  built from $commit"
+  done
+  # All four from one commit, and the commit the tag points at now. Fatal otherwise.
+  REL_COMMIT="$(release_check_commits "$RELEASE" "${commits[@]}")"
+  say "release $RELEASE: all four assets built from $REL_COMMIT"
+else
+  WASM_DIR="target/wasm32v1-none/release"
+  for pair in policy_nft:microcrop_policy_nft policy_manager:microcrop_policy_manager \
+              settlement_adapter:microcrop_settlement_adapter payout_receiver:microcrop_payout_receiver; do
+    key="${pair%%:*}"; w="${pair#*:}"
+    [[ -f "$WASM_DIR/$w.wasm" ]] || die "missing $WASM_DIR/$w.wasm — run: cargo build --release --target wasm32v1-none"
+    # Deploy the OPTIMIZED wasm: it is ~16-22% smaller, and code rent is paid per byte for the
+    # contract's whole life. The rent figures in the docs assume these files.
+    if [[ ! -f "$WASM_DIR/$w.optimized.wasm" || "$WASM_DIR/$w.wasm" -nt "$WASM_DIR/$w.optimized.wasm" ]]; then
+      say "optimizing $w.wasm"
+      run stellar contract optimize --wasm "$WASM_DIR/$w.wasm" >&2
+    fi
+    printf -v "WASM_${key}" '%s' "$WASM_DIR/$w.optimized.wasm"
+  done
+  warn "deploying a LOCAL build: no attestation ties it to a commit (testnet only)"
+fi
 
 if [[ "$NETWORK" == "mainnet" && "$DRY_RUN" == "0" ]]; then
-  warn "MAINNET deploy. These contracts have had NO Soroban security audit."
+  warn "MAINNET deploy of release $RELEASE. These contracts have had NO Soroban security audit."
   read -r -p "Type 'deploy to mainnet' to continue: " confirm
   [[ "$confirm" == "deploy to mainnet" ]] || die "aborted"
 fi
 
-say "network=$NETWORK  state=$STATE  dry-run=$DRY_RUN"
+say "network=$NETWORK  state=$STATE  dry-run=$DRY_RUN  wasm=${RELEASE:-local build}"
 
 # A state file from a Treasury-era deployment cannot be resumed into Option B: its
 # PayoutReceiver was constructed with a Treasury and has no adapter. Deploy fresh elsewhere.
@@ -140,8 +214,10 @@ fi
 # ---------------------------------------------------------------------------
 # 1. Deploy — order matters: PayoutReceiver's constructor consumes two addresses
 # ---------------------------------------------------------------------------
-deploy() {                      # deploy <state-key> <wasm-name> [--ctor-args...]
-  local key="$1" wasm="$2"; shift 2
+deploy() {                      # deploy <state-key> [--ctor-args...]
+  local key="$1"; shift
+  local wasm_var="WASM_${key}" wasm
+  wasm="${!wasm_var:?no WASM resolved for $key}"
   local existing; existing="$(state_get "$key")"
   if [[ -n "$existing" ]]; then say "$key already deployed: $existing (skipping)"; echo "$existing"; return; fi
 
@@ -152,11 +228,12 @@ deploy() {                      # deploy <state-key> <wasm-name> [--ctor-args...
 
   local addr
   addr="$(stellar contract deploy \
-      --wasm "$WASM_DIR/$wasm.optimized.wasm" \
+      --wasm "$wasm" \
       --source "$ADMIN_KEY" --network "$NETWORK" \
       -- "$@" | tail -1)"
   [[ "$addr" =~ ^C[A-Z0-9]{55}$ ]] || die "$key deploy returned an unexpected address: $addr"
   state_set "$key" "$addr"
+  state_set "wasm_sha256_${key}" "$(shasum -a 256 "$wasm" | cut -d' ' -f1)"
   say "$key deployed: $addr"
   echo "$addr"
 }
@@ -164,13 +241,16 @@ deploy() {                      # deploy <state-key> <wasm-name> [--ctor-args...
 ADMIN_ADDR="$(stellar keys address "$ADMIN_KEY" 2>/dev/null || echo "G_DRYRUN_ADMIN")"
 say "admin address: $ADMIN_ADDR"
 
-NFT="$(deploy policy_nft microcrop_policy_nft \
+# Recorded before the first deploy, so a resumed run cannot switch builds midway.
+[[ -n "$RELEASE" && "$DRY_RUN" == "0" ]] && state_set release "$RELEASE"
+
+NFT="$(deploy policy_nft \
         --admin "$ADMIN_ADDR" --name "MicroCrop Policy" --symbol "MCP")"
-PM="$(deploy policy_manager microcrop_policy_manager \
+PM="$(deploy policy_manager \
         --admin "$ADMIN_ADDR")"
-ADAPTER="$(deploy settlement_adapter microcrop_settlement_adapter \
+ADAPTER="$(deploy settlement_adapter \
         --admin "$ADMIN_ADDR")"
-PR="$(deploy payout_receiver microcrop_payout_receiver \
+PR="$(deploy payout_receiver \
         --settlement_adapter "$ADAPTER" --policy_manager "$PM" --admin "$ADMIN_ADDR")"
 
 # ---------------------------------------------------------------------------
@@ -253,5 +333,5 @@ EOF
 if [[ "$DRY_RUN" == "1" ]]; then
   say "dry run only — nothing was deployed"
 else
-  say "next: run ./scripts/verify-deployment.sh --network $NETWORK"
+  say "next: run ./scripts/verify-deployment.sh --network $NETWORK${RELEASE:+ --release $RELEASE}"
 fi

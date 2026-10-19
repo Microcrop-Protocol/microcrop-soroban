@@ -1,0 +1,151 @@
+# CI for every pull request and every push to master.
+#
+# Three jobs, run in parallel:
+#   lint  - rustfmt and clippy (warnings are errors)
+#   test  - the whole workspace test suite
+#   wasm  - builds every contract crate with `stellar contract build`, the same CLI version
+#           the release workflow uses, checks the SEP-55 source_repo metadata, reports sizes,
+#           then runs the #[ignore]d real-WASM lane against those binaries.
+#
+# This workflow publishes nothing. Its WASM is never a deploy input: mainnet deploys take the
+# attested release assets only (release.yml, scripts/deploy.sh --release).
+#
+# Third-party actions are pinned to full commit SHAs, version in the comment. Bump by resolving
+# the new tag to its SHA (gh api repos/<owner>/<repo>/commits/<tag> --jq .sha), never by
+# editing the comment alone.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain comes from rust-toolchain.toml. The CLI matches the one the pinned
+  # soroban-build-workflow release uses (release.yml), so CI builds what a release builds.
+  STELLAR_CLI_VERSION: "25.1.0"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustc --version && cargo clippy --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  wasm:
+    name: stellar contract build + real-WASM lane
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The action downloads the release binary and checks its GitHub attestation. `version` is
+      # required here: pinned by SHA, the action cannot infer the version from its own ref.
+      - uses: stellar/stellar-cli@a048a57a75762458b487052e0021ea704a926bee # v25.1.0
+        with:
+          version: ${{ env.STELLAR_CLI_VERSION }}
+
+      # stellar-cli 25.1.0 has no --locked. Fail here instead if Cargo.lock is stale, so the
+      # build below resolves exactly the committed lockfile, as the release build will.
+      - name: Cargo.lock is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # --optimize as release.yml passes it: stellar-cli 25.1.0 does not optimize by default.
+      - name: Build the four release contracts (default-members)
+        run: |
+          stellar contract build --optimize --out-dir dist \
+            --meta "source_repo=github:${GITHUB_REPOSITORY}"
+
+      # Built so CI proves it compiles. It is testnet evidence only and is never released:
+      # release.yml has no job for it.
+      - name: Build the testnet fixture (not released)
+        run: |
+          stellar contract build --optimize --package microcrop-testnet-policy-fixture \
+            --out-dir dist-testnet-only
+
+      - name: Check the SEP-55 source_repo metadata
+        run: |
+          set -euo pipefail
+          want="github:${GITHUB_REPOSITORY}"
+          for f in dist/*.wasm; do
+            got="$(stellar contract info meta --wasm "$f" --output json \
+                   | jq -r '.[] | .sc_meta_v0 | select(.key == "source_repo") | .val')"
+            if [[ "$got" != "$want" ]]; then
+              echo "::error file=$f::source_repo is '${got}', expected '${want}'"
+              exit 1
+            fi
+            echo "$f source_repo=$got"
+          done
+
+      - name: Size report
+        run: |
+          set -euo pipefail
+          # Code rent is paid per byte for a contract's whole life, so size drift matters.
+          # 131072 B is the per-contract WASM cap at the time of writing (a network setting:
+          # re-check with stellar network settings before relying on it).
+          limit=131072
+          {
+            echo "### Contract WASM (stellar-cli ${STELLAR_CLI_VERSION}, optimized)"
+            echo
+            echo "| contract | bytes | % of ${limit} | sha256 |"
+            echo "|---|---:|---:|---|"
+            for f in dist/*.wasm dist-testnet-only/*.wasm; do
+              size="$(stat -c %s "$f")"
+              hash="$(sha256sum "$f" | cut -d' ' -f1)"
+              name="$(basename "$f" .wasm)"
+              [[ "$f" == dist-testnet-only/* ]] && name="${name} (testnet only, not released)"
+              echo "| ${name} | ${size} | $(( size * 100 / limit ))% | \`${hash}\` |"
+              if (( size > limit )); then
+                echo "::warning file=$f::${size} bytes exceeds ${limit}"
+              fi
+            done
+            echo
+            echo "CI binaries are NOT deploy inputs. Deploy the attested release assets."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      # The lane reads target/wasm32v1-none/release/<name>.optimized.wasm (falls back to the
+      # plain .wasm) and upgrades to the plain .wasm as a different hash, so it needs both.
+      - name: Real-WASM lane (cargo test -- --ignored)
+        run: |
+          set -euo pipefail
+          for f in dist/*.wasm; do
+            cp "$f" "target/wasm32v1-none/release/$(basename "$f" .wasm).optimized.wasm"
+          done
+          cargo test --locked -p microcrop-integration-tests -- --ignored

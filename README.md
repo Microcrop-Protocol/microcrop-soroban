@@ -59,12 +59,18 @@ byte layout in `encoding.rs` in particular MUST match the off-chain Lit PKP sign
 
 - **soroban-sdk `=27.0.2`** — current stable on crates.io, published 2026-07-23
   (confirmed: <https://crates.io/crates/soroban-sdk>, <https://docs.rs/soroban-sdk/27.0.2/>).
-- **Rust 1.91.0** — the SDK MSRV; pinned in `rust-toolchain.toml` (auto-installed by rustup).
+- **Rust 1.91.1** — pinned in `rust-toolchain.toml` (auto-installed by rustup, with rustfmt
+  and clippy). The SDK MSRV is 1.91.0, but 1.91.0 has a known wasm miscompile and
+  `stellar contract build` refuses it, so the release workflow could not build with it.
+- **`Cargo.lock` is committed** so a verified build in CI resolves the same dependencies as
+  every other build of that commit.
 - **Target `wasm32v1-none`** — the current Soroban WASM target. `wasm32-unknown-unknown`
   is **rejected** by soroban-sdk 27.x on Rust ≥ 1.82 (it enables `reference-types` /
   `multi-value` the Soroban host does not support). Use `wasm32v1-none`.
 - **Stellar CLI ≥ 22** for `stellar contract build|optimize|deploy|invoke`
-  (install: `cargo install --locked stellar-cli` or `brew install stellar-cli`).
+  (install: `cargo install --locked stellar-cli` or `brew install stellar-cli`). CI and the
+  release build use **25.1.0**, the version the pinned release workflow installs. CLI
+  versions stamp different metadata, so the same source gives a different hash per CLI.
 
 ## Build
 
@@ -111,26 +117,56 @@ Package names (for `-p`): `microcrop-shared`, `microcrop-policy-manager`,
 ## Current build & test status (2026-10-19)
 
 ```
-cargo build --target wasm32v1-none --release   ->  4/4 WASM contracts built
-                                       release     after `stellar contract optimize`
-    microcrop_policy_manager.wasm      63,047 B    51,898 B
-    microcrop_settlement_adapter.wasm  50,178 B    41,873 B
-    microcrop_payout_receiver.wasm     75,483 B    62,217 B
-    microcrop_policy_nft.wasm          47,098 B    39,865 B
-  (testnet only) microcrop_testnet_policy_fixture.wasm  23,222 B  22,244 B
+stellar contract build --optimize (stellar-cli 25.1.0, Rust 1.91.1)  ->  4/4 contracts
+                                       built      optimized
+    microcrop_policy_manager.wasm      41,859 B   38,786 B
+    microcrop_settlement_adapter.wasm  34,248 B   32,090 B
+    microcrop_payout_receiver.wasm     51,876 B   47,503 B
+    microcrop_policy_nft.wasm          31,903 B   30,221 B
+  (testnet only, never released) microcrop_testnet_policy_fixture.wasm  23,447 B  22,469 B
+  (plain `cargo build --target wasm32v1-none --release` gives larger files, 47-76 KB.
+   Deploy the CLI-built release assets; the sizes above are those.)
 
 cargo test --workspace                         ->  202 passed, 0 failed, 1 ignored
     microcrop-payout-receiver     80 passed   (crop + drought: every check in order, nothing recorded on any rejection, extreme coordinates -> 321 not a trap, real secp256k1 round-trip, obligation fields + return-value check (329), unbound adapter, set_settlement_adapter handshake (328), replay after an adapter swap, keeper resilience, archived-flag safety, rent cap, upgrade gate)
     microcrop-policy-manager      45 passed   (lifecycle, ACTIVE-only claim, caps, claim window, exposure, roles, plot coords, Drought-only sale with a 117-day floor, TTL targets, upgrade gate)
     microcrop-settlement-adapter  25 passed   (Funder-only marks (the org is refused), exact auth trees, to_xdr events incl. role grants, idempotent/conflicting records, receiver rotation, state machine, pagination, TTL, archived entries, no-custody structural check, proptest)
     microcrop-shared              19 passed   (drought golden vectors, EVM + JS cross-checks, rdi-1.0 grid, TTL helpers, ABI pin of every error code and ordinal)
-    microcrop-integration-tests   16 passed, 1 ignored   (four real contracts on one Env, no token: determination -> Owed -> Funded -> Settled, replay incl. after an adapter swap, real 2022 ERA5 season, keepers; ignored: the real-WASM lane incl. a happy-path upgrade of adapter, PayoutReceiver and PolicyManager, passes with --ignored after a wasm build)
+    microcrop-integration-tests   16 passed, 1 ignored   (four real contracts on one Env, no token: determination -> Owed -> Funded -> Settled, replay incl. after an adapter swap, real 2022 ERA5 season, keepers; ignored: the real-WASM lane incl. a happy-path upgrade of adapter, PayoutReceiver and PolicyManager, passes with --ignored after a wasm build, and runs in CI)
     microcrop-policy-nft          14 passed   (mint, soulbound transfer, PM-only status, paging, TTL targets)
     microcrop-testnet-policy-fixture 3 passed (mainnet refusal, Oracle-gated writes)
 
-cargo clippy --workspace --all-targets         ->  4 warnings (all pre-existing)
+cargo clippy --workspace --all-targets -- -D warnings  ->  clean (0 warnings)
 cargo fmt --all -- --check                     ->  clean
 ```
+
+## CI and verified builds
+
+- **`.github/workflows/ci.yml`** (every PR, every push to `master`, read-only token): fmt,
+  clippy with `-D warnings`, `cargo test --workspace`, `stellar contract build --optimize` of
+  every contract crate with the release CLI, a check that each WASM carries
+  `source_repo=github:Microcrop-Protocol/microcrop-soroban`, a size report in the job
+  summary, and the `#[ignore]`d real-WASM lane against those binaries. CI binaries are never
+  deploy inputs.
+- **`.github/workflows/release.yml`** (on a `vX.Y.Z` tag of a commit on `master`): a
+  [SEP-55](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0055.md)
+  verified build of each of the four contracts through
+  `stellar-expert/soroban-build-workflow`, pinned to a reviewed commit. Each contract gets
+  a GitHub release with its WASM and a build attestation over it; stellar.expert and Stellar
+  Lab show the source commit for the deployed hash.
+- **Deploy the release, not a local build:** `./scripts/deploy.sh --network mainnet
+  --release vX.Y.Z` verifies every asset's attestation, and that all four come from the
+  one commit the tag points at, before deploying it; mainnet refuses anything else.
+  `./scripts/verify-release.sh vX.Y.Z` runs the same checks on their own (use it before an
+  `upgrade`).
+
+A verified build proves which commit a workflow run built the binary from. It does not prove
+the code is safe; these contracts are unaudited. The pin covers the reusable workflow file,
+not the actions it calls, which are on mutable tags. That workflow creates each release
+before attesting it and tags it at `master`'s head, so the attestation's source commit, not
+the release's tag or archive, is the authoritative one. Tag and `master` rulesets are not set
+yet (runbook, *Protect the tags and master*). Steps, verification commands and the
+residual risk: [`docs/DEPLOYMENT_RUNBOOK.md`](docs/DEPLOYMENT_RUNBOOK.md), *Cutting a release*.
 
 On macOS without an accepted Xcode licence, build with the Command Line Tools:
 `DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test --workspace`.
@@ -180,7 +216,9 @@ On macOS without an accepted Xcode licence, build with the Command Line Tools:
 Use `scripts/deploy.sh` and `scripts/verify-deployment.sh` (see
 [`docs/DEPLOYMENT_RUNBOOK.md`](docs/DEPLOYMENT_RUNBOOK.md)); `scripts/testnet-evidence.sh`
 produces the testnet evidence (MIGRATION_NOTES §11). A Treasury-era deployment cannot be
-upgraded in place: deploy fresh. The manual flow, for reference:
+upgraded in place: deploy fresh. Mainnet takes only the attested release WASM
+(`deploy.sh --release vX.Y.Z`, see *CI and verified builds*). The manual flow, for testnet
+reference:
 
 ```sh
 # 0. Build optimised WASM
