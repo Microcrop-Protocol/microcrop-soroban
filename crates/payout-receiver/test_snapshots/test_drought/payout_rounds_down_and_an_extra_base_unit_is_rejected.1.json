@@ -8,6 +8,7 @@
     [],
     [],
     [],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
@@ -102,6 +103,7 @@
         }
       ]
     ],
+    [],
     [],
     [],
     [],
@@ -409,15 +411,54 @@
                     },
                     {
                       "key": {
+                        "symbol": "dig"
+                      },
+                      "val": {
+                        "bytes": "dd9736a29475af723c8986fef25813fd9f51271dcce9dcd64de8f3b2ade29792"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "n"
                       },
                       "val": {
-                        "u32": 1
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                       }
                     },
                     {
                       "key": {
                         "symbol": "pid"
+                      },
+                      "val": {
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "pr"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "of"
+                          },
+                          {
+                            "u64": "1"
+                          }
+                        ]
                       },
                       "val": {
                         "u64": "1"
@@ -895,7 +936,7 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "Treasury"
+                            "symbol": "SettlementAdapter"
                           }
                         ]
                       },

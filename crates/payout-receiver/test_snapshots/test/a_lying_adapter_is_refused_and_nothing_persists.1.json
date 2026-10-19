@@ -103,155 +103,9 @@
       ]
     ],
     [],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-              "function_name": "submit_determination",
-              "args": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                },
-                {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "assessed_at"
-                      },
-                      "val": {
-                        "u64": "1700000000"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "damage_percent_bp"
-                      },
-                      "val": {
-                        "u32": 5000
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "latitude_e6"
-                      },
-                      "val": {
-                        "i128": "-1286389"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "longitude_e6"
-                      },
-                      "val": {
-                        "i128": "36817223"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "ndvi_scaled"
-                      },
-                      "val": {
-                        "i128": "4200"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "on_chain_policy_id"
-                      },
-                      "val": {
-                        "u64": "1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "payout_amount"
-                      },
-                      "val": {
-                        "i128": "5000000000"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "satellite_damage"
-                      },
-                      "val": {
-                        "u32": 50
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "sum_insured"
-                      },
-                      "val": {
-                        "i128": "10000000000"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "weather_damage"
-                      },
-                      "val": {
-                        "u32": 50
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "weather_humidity"
-                      },
-                      "val": {
-                        "u128": "80"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "weather_precip_e2"
-                      },
-                      "val": {
-                        "u128": "15"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "weather_present"
-                      },
-                      "val": {
-                        "u32": 1
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "weather_temp_c_e2"
-                      },
-                      "val": {
-                        "i128": "2750"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "weather_wind_e2"
-                      },
-                      "val": {
-                        "u128": "350"
-                      }
-                    }
-                  ]
-                },
-                {
-                  "bytes": "8aa9bc216b1d5125483a447f748d72388bd75debae1254d640dd9eea2e78b9a926784bfa9d2e96abe7620f30f0b2012b55ee890a19005b2a27dfdb112a14460d"
-                },
-                {
-                  "u32": 0
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
+    [],
+    [],
+    [],
     [],
     [],
     [],
@@ -353,26 +207,6 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "key": {
-                "ledger_key_nonce": {
-                  "nonce": "2032731177588607455"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
               "key": "ledger_key_contract_instance",
               "durability": "persistent",
@@ -384,42 +218,18 @@
                   "storage": [
                     {
                       "key": {
-                        "symbol": "amt"
-                      },
-                      "val": {
-                        "i128": "5000000000"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "n"
-                      },
-                      "val": {
-                        "u32": 1
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "pamt"
-                      },
-                      "val": {
-                        "i128": "5000000000"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "pid"
-                      },
-                      "val": {
-                        "u64": "1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "short"
+                        "symbol": "liar"
                       },
                       "val": {
                         "bool": true
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "pr"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
                       }
                     }
                   ]
@@ -452,22 +262,6 @@
                       },
                       "val": {
                         "bool": true
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "inc"
-                      },
-                      "val": {
-                        "u32": 1
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "pending"
-                      },
-                      "val": {
-                        "u32": 1
                       }
                     },
                     {
@@ -591,163 +385,6 @@
           "ext": "v0"
         },
         "live_until": 4095
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "ClaimPending"
-                  },
-                  {
-                    "u64": "1"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "bool": true
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 1036800
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "ConsumedDetermination"
-                  },
-                  {
-                    "bytes": "8cca6b11c04a8dcb0ef991a81ac7a4b052d64bd4eae56786f2c9a4853ca51b43"
-                  }
-                ]
-              },
-              "durability": "temporary",
-              "val": {
-                "bool": true
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 120960
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "PolicyPaid"
-                  },
-                  {
-                    "u64": "1"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "bool": true
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 718400
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "Report"
-                  },
-                  {
-                    "u64": "1"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "map": [
-                  {
-                    "key": {
-                      "symbol": "assessed_at"
-                    },
-                    "val": {
-                      "u64": "1700000000"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "damage_percentage"
-                    },
-                    "val": {
-                      "u32": 5000
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "payout_amount"
-                    },
-                    "val": {
-                      "i128": "5000000000"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "policy_id"
-                    },
-                    "val": {
-                      "u64": "1"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "satellite_damage"
-                    },
-                    "val": {
-                      "u32": 50
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "weather_damage"
-                    },
-                    "val": {
-                      "u32": 50
-                    }
-                  }
-                ]
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 718400
       },
       {
         "entry": {
@@ -921,7 +558,7 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "Treasury"
+                            "symbol": "SettlementAdapter"
                           }
                         ]
                       },
@@ -936,7 +573,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 172800
+        "live_until": 4095
       },
       {
         "entry": {
@@ -950,7 +587,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 172800
+        "live_until": 4095
       }
     ]
   },

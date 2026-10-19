@@ -535,7 +535,7 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "Treasury"
+                            "symbol": "SettlementAdapter"
                           }
                         ]
                       },

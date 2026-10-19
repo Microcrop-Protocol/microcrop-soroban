@@ -102,6 +102,7 @@
         }
       ]
     ],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
@@ -390,15 +391,54 @@
                     },
                     {
                       "key": {
+                        "symbol": "dig"
+                      },
+                      "val": {
+                        "bytes": "8cca6b11c04a8dcb0ef991a81ac7a4b052d64bd4eae56786f2c9a4853ca51b43"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "n"
                       },
                       "val": {
-                        "u32": 1
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                       }
                     },
                     {
                       "key": {
                         "symbol": "pid"
+                      },
+                      "val": {
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "pr"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "of"
+                          },
+                          {
+                            "u64": "1"
+                          }
+                        ]
                       },
                       "val": {
                         "u64": "1"
@@ -876,7 +916,7 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "Treasury"
+                            "symbol": "SettlementAdapter"
                           }
                         ]
                       },

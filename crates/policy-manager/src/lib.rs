@@ -1,8 +1,10 @@
 #![no_std]
 //! # PolicyManager
 //!
-//! Soroban port of `microcrop-contracts/microcrop/src/PolicyManager.sol` (v3.1.0:
-//! per-org treasury + audit batch 1-2).
+//! Soroban port of `microcrop-contracts/microcrop/src/PolicyManager.sol` (v3.1.0, audit
+//! batch 1-2). It never depended on Treasury code; under Option B (SettlementAdapter) it no
+//! longer has a custodial pending-claim state either: a verified claim goes straight from
+//! ACTIVE to CLAIMED, and what is owed lives in the SettlementAdapter.
 //!
 //! ## EVM -> Soroban mapping
 //! - `AccessControl` roles -> [`microcrop_shared::roles`] registry + explicit `caller` +
@@ -28,7 +30,7 @@
 //!   does not record its index position. The new end is later by the time the policy spent
 //!   PENDING, so the item can archive up to that long before the policy's new need; paging
 //!   it then needs a restore (it fails closed, never reads as absent). A closed policy keeps the TTL
-//!   it has. `Policy` lives 60 days past every touch while CLAIM_PENDING.
+//!   it has.
 //! - Shared per-farmer / per-org entries take the longest need of any policy that touches
 //!   them, and at least 60 days; `FarmerClaimTimes` lives 365 days past the last claim.
 //! - `extend_policy_ttl(policy_id)` is the permissionless keep-alive for one policy.
@@ -106,9 +108,9 @@ pub enum DataKey {
     /// policy_id -> whether it was counted in the pending counter at creation.
     PendingCounted(u64),
     /// org -> outstanding (PENDING + ACTIVE, unpaid) sum insured aggregated across products.
-    /// Counted from `create_policy` so a premium paid on a PENDING policy is reserve, not
-    /// withdrawable surplus (audit finding 4); released exactly once when the policy leaves
-    /// PENDING/ACTIVE (cancel, expire, claim).
+    /// Counted from `create_policy` (audit finding 4); released exactly once when the policy
+    /// leaves PENDING/ACTIVE (cancel, expire, claim). A view for the org's exposure; nothing
+    /// on-chain draws on it.
     OrgOutstanding(Address),
 }
 
@@ -147,15 +149,6 @@ pub struct PolicyClaimed {
     #[topic]
     pub policy_id: u64,
     pub claimed_at: u64,
-}
-
-/// A verified claim is waiting for the org reserve (ACTIVE -> CLAIM_PENDING).
-#[contractevent]
-#[derive(Clone)]
-pub struct PolicyClaimPending {
-    #[topic]
-    pub policy_id: u64,
-    pub recorded_at: u64,
 }
 
 /// `PolicyCancelled(policyId, cancelledAt)`.
@@ -390,9 +383,8 @@ impl PolicyManager {
         ttl::extend_for_policy(&env, &item_key, end_date);
         ttl::extend_shared(&env, &count_key, Some(end_date));
 
-        // The org's exposure starts now, not at activation: the premium can arrive while the
-        // policy is PENDING, and until it is counted here the org could withdraw it as surplus
-        // and the policy would activate with no reserve behind it (audit finding 4).
+        // The org's exposure starts now, not at activation (audit finding 4): a PENDING policy
+        // is already cover the org has written.
         let outstanding = Self::org_outstanding(&env, &org);
         Self::set_org_outstanding(&env, &org, outstanding + sum_insured, end_date);
 
@@ -518,57 +510,11 @@ impl PolicyManager {
         .publish(&env);
     }
 
-    /// Port of `markAsClaimed` (ORACLE = PayoutReceiver). ACTIVE or CLAIM_PENDING -> CLAIMED,
-    /// deactivates NFT (best-effort). From ACTIVE it also decrements the active count and
-    /// releases the org exposure; from CLAIM_PENDING those were already released by
-    /// `mark_claim_pending`, so they are not released twice.
-    ///
-    /// An ACTIVE policy must still be within its coverage window. A CLAIM_PENDING policy is
-    /// not checked against `end_date`: its determination was verified inside the window and
-    /// the claim is only waiting for the org reserve, so it must not lapse.
+    /// Port of `markAsClaimed` (ORACLE = PayoutReceiver). ACTIVE -> CLAIMED: decrements the
+    /// active count, releases the org exposure and deactivates the NFT (best-effort). The
+    /// policy must still be within its coverage window. Any other status is refused
+    /// (`InvalidPolicyStatus`).
     pub fn mark_as_claimed(env: Env, caller: Address, policy_id: u64) {
-        roles::require_role(&env, &caller, Role::Oracle);
-
-        let mut policy = Self::load_policy(&env, policy_id);
-
-        let was_active = match policy.status {
-            PolicyStatus::Active => {
-                if env.ledger().timestamp() > policy.end_date {
-                    panic_with_error!(&env, PolicyError::PolicyExpired);
-                }
-                true
-            }
-            PolicyStatus::ClaimPending => false,
-            _ => panic_with_error!(&env, PolicyError::InvalidPolicyStatus),
-        };
-
-        policy.status = PolicyStatus::Claimed;
-        Self::save_policy(&env, &policy);
-
-        if was_active {
-            Self::decrement_active(&env, &policy.farmer, policy.end_date);
-            Self::release_org_exposure(&env, &policy.org, policy.sum_insured, policy.end_date);
-        }
-        Self::deactivate_policy_nft(&env, policy_id);
-
-        Self::bump_instance(&env);
-        PolicyClaimed {
-            policy_id,
-            claimed_at: env.ledger().timestamp(),
-        }
-        .publish(&env);
-    }
-
-    /// ORACLE (PayoutReceiver). ACTIVE -> CLAIM_PENDING: a valid determination was verified
-    /// but the org reserve cannot pay it yet. The policy keeps its soulbound certificate until
-    /// `mark_as_claimed` settles it, and it cannot be expired or cancelled meanwhile. No port
-    /// equivalent in Solidity (audit findings 9/11).
-    ///
-    /// The active slot and the org exposure are released HERE, not at settlement. The claim
-    /// itself already counts against the farmer's cap (as a claim in the window) and against
-    /// the org's required reserve (as a pending payout of the full amount, in Treasury), so
-    /// keeping the slot and the exposure too would count the same policy twice.
-    pub fn mark_claim_pending(env: Env, caller: Address, policy_id: u64) {
         roles::require_role(&env, &caller, Role::Oracle);
 
         let mut policy = Self::load_policy(&env, policy_id);
@@ -579,16 +525,17 @@ impl PolicyManager {
             panic_with_error!(&env, PolicyError::PolicyExpired);
         }
 
-        policy.status = PolicyStatus::ClaimPending;
+        policy.status = PolicyStatus::Claimed;
         Self::save_policy(&env, &policy);
 
         Self::decrement_active(&env, &policy.farmer, policy.end_date);
         Self::release_org_exposure(&env, &policy.org, policy.sum_insured, policy.end_date);
+        Self::deactivate_policy_nft(&env, policy_id);
 
         Self::bump_instance(&env);
-        PolicyClaimPending {
+        PolicyClaimed {
             policy_id,
-            recorded_at: env.ledger().timestamp(),
+            claimed_at: env.ledger().timestamp(),
         }
         .publish(&env);
     }
@@ -668,7 +615,7 @@ impl PolicyManager {
 
     /// Port of `expirePolicy`. ACTIVE or PENDING -> EXPIRED once past end date.
     ///
-    /// Permissionless: the `now > end_date` check is the only gate, so the org's reserve and
+    /// Permissionless: the `now > end_date` check is the only gate, so the org's exposure and
     /// the farmer's slot are not held hostage to the backend acting (audit finding 7).
     /// A PENDING policy's `end_date` is its creation time plus its duration, so one that was
     /// never activated also lapses: its org exposure (counted at `create_policy`) and its
@@ -709,20 +656,15 @@ impl PolicyManager {
 
     /// PERMISSIONLESS keep-alive: extend every PolicyManager entry of `policy_id` to its
     /// need — `Policy` and `PendingCounted` to `end_date + 30 d` (clamped to the network
-    /// maximum), or `Policy` 60 days while CLAIM_PENDING — plus the farmer and org entries the
-    /// policy depends on, then, best effort, the policy's certificate in PolicyNft. A policy
-    /// whose need is past the ~180-day network maximum (or a pending claim) needs this call
-    /// again before its entries' TTL runs out; the backend keeper calls it (through
-    /// `PayoutReceiver::extend_policy_ttl`) for open or pending policies whose shortest TTL is
-    /// under 30 days. Reverts `PolicyDoesNotExist` for an unknown policy.
+    /// maximum) — plus the farmer and org entries the policy depends on, then, best effort,
+    /// the policy's certificate in PolicyNft. A policy whose need is past the ~180-day network
+    /// maximum needs this call again before its entries' TTL runs out; the backend keeper
+    /// calls it (through `PayoutReceiver::extend_policy_ttl`) for open policies whose shortest
+    /// TTL is under 30 days. Reverts `PolicyDoesNotExist` for an unknown policy.
     pub fn extend_policy_ttl(env: Env, policy_id: u64) {
         let policy = Self::load_policy(&env, policy_id);
         let key = DataKey::Policy(policy_id);
-        if policy.status == PolicyStatus::ClaimPending {
-            ttl::extend_pending(&env, &key);
-        } else {
-            ttl::extend_for_policy(&env, &key, policy.end_date);
-        }
+        ttl::extend_for_policy(&env, &key, policy.end_date);
         let p = env.storage().persistent();
         if p.has(&DataKey::PendingCounted(policy_id)) {
             ttl::extend_for_policy(&env, &DataKey::PendingCounted(policy_id), policy.end_date);
@@ -875,14 +817,13 @@ impl PolicyManager {
     }
 
     /// The `Policy` entry's TTL rule: open (PENDING / ACTIVE) -> `end_date + 30 d`;
-    /// CLAIM_PENDING -> below 30 d to 60 d; closed -> left as it is.
+    /// closed -> left as it is.
     fn bump_policy(env: &Env, policy: &Policy) {
         let key = DataKey::Policy(policy.id);
         match policy.status {
             PolicyStatus::Pending | PolicyStatus::Active => {
                 ttl::extend_for_policy(env, &key, policy.end_date)
             }
-            PolicyStatus::ClaimPending => ttl::extend_pending(env, &key),
             PolicyStatus::Expired | PolicyStatus::Cancelled | PolicyStatus::Claimed => {}
         }
     }

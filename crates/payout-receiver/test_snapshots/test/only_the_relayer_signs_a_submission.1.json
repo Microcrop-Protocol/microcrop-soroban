@@ -251,12 +251,7 @@
           "sub_invocations": []
         }
       ]
-    ],
-    [],
-    [],
-    [],
-    [],
-    []
+    ]
   ],
   "ledger": {
     "protocol_version": 27,
@@ -393,10 +388,26 @@
                     },
                     {
                       "key": {
+                        "symbol": "dig"
+                      },
+                      "val": {
+                        "bytes": "8cca6b11c04a8dcb0ef991a81ac7a4b052d64bd4eae56786f2c9a4853ca51b43"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "n"
                       },
                       "val": {
-                        "u32": 1
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                       }
                     },
                     {
@@ -409,18 +420,25 @@
                     },
                     {
                       "key": {
-                        "symbol": "settled"
+                        "symbol": "pr"
                       },
                       "val": {
-                        "u32": 1
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
                       }
                     },
                     {
                       "key": {
-                        "symbol": "short"
+                        "vec": [
+                          {
+                            "symbol": "of"
+                          },
+                          {
+                            "u64": "1"
+                          }
+                        ]
                       },
                       "val": {
-                        "bool": false
+                        "u64": "1"
                       }
                     }
                   ]
@@ -466,14 +484,6 @@
                     {
                       "key": {
                         "symbol": "inc"
-                      },
-                      "val": {
-                        "u32": 1
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "pending"
                       },
                       "val": {
                         "u32": 1
@@ -903,7 +913,7 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "Treasury"
+                            "symbol": "SettlementAdapter"
                           }
                         ]
                       },
@@ -936,5 +946,129 @@
       }
     ]
   },
-  "events": []
+  "events": [
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "determination_verified"
+              },
+              {
+                "u64": "1"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "preimage_hash"
+                  },
+                  "val": {
+                    "bytes": "8cca6b11c04a8dcb0ef991a81ac7a4b052d64bd4eae56786f2c9a4853ca51b43"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "damage_report_received"
+              },
+              {
+                "u64": "1"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "damage_percentage"
+                  },
+                  "val": {
+                    "u32": 5000
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "payout_amount"
+                  },
+                  "val": {
+                    "i128": "5000000000"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "obligation_requested"
+              },
+              {
+                "u64": "1"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "adapter"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "amount"
+                  },
+                  "val": {
+                    "i128": "5000000000"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "obligation_id"
+                  },
+                  "val": {
+                    "u64": "1"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    }
+  ]
 }

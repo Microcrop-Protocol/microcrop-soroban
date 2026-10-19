@@ -255,10 +255,6 @@
     [],
     [],
     [],
-    [],
-    [],
-    [],
-    [],
     []
   ],
   "ledger": {
@@ -396,18 +392,26 @@
                     },
                     {
                       "key": {
-                        "symbol": "n"
+                        "symbol": "dig"
                       },
                       "val": {
-                        "u32": 1
+                        "bytes": "8cca6b11c04a8dcb0ef991a81ac7a4b052d64bd4eae56786f2c9a4853ca51b43"
                       }
                     },
                     {
                       "key": {
-                        "symbol": "pamt"
+                        "symbol": "n"
                       },
                       "val": {
-                        "i128": "5000000000"
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "org"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                       }
                     },
                     {
@@ -420,10 +424,33 @@
                     },
                     {
                       "key": {
-                        "symbol": "short"
+                        "symbol": "pr"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "trap"
                       },
                       "val": {
                         "bool": true
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "of"
+                          },
+                          {
+                            "u64": "1"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "1"
                       }
                     }
                   ]
@@ -460,7 +487,7 @@
                     },
                     {
                       "key": {
-                        "symbol": "inc"
+                        "symbol": "claimed"
                       },
                       "val": {
                         "u32": 1
@@ -468,7 +495,7 @@
                     },
                     {
                       "key": {
-                        "symbol": "pending"
+                        "symbol": "inc"
                       },
                       "val": {
                         "u32": 1
@@ -586,6 +613,14 @@
                           }
                         ]
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "ttl"
+                      },
+                      "val": {
+                        "bool": true
+                      }
                     }
                   ]
                 }
@@ -595,33 +630,6 @@
           "ext": "v0"
         },
         "live_until": 4095
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "ClaimPending"
-                  },
-                  {
-                    "u64": "1"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "bool": true
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 1036800
       },
       {
         "entry": {
@@ -925,7 +933,7 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "Treasury"
+                            "symbol": "SettlementAdapter"
                           }
                         ]
                       },

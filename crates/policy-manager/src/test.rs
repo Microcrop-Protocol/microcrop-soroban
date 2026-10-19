@@ -960,78 +960,59 @@ fn lapsed_pending_policy_cannot_be_activated() {
     assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Pending);
 }
 
-// ---------------- Findings 9/11: CLAIM_PENDING ----------------
+// ---------------- Claims (Option B: ACTIVE -> CLAIMED only) ----------------
 
 #[test]
-fn claim_pending_policy_cannot_lapse_or_be_cancelled_and_settles_after_end_date() {
+fn mark_as_claimed_requires_oracle_and_live_active_cover() {
     let c = setup();
     let id = create_default(&c);
+    // PENDING (not activated) cannot be claimed.
+    assert_err(
+        c.client.try_mark_as_claimed(&c.oracle, &id),
+        PolicyError::InvalidPolicyStatus as u32,
+    );
     activate_default(&c, id);
+    assert_err(
+        c.client.try_mark_as_claimed(&c.backend, &id),
+        CommonError::Unauthorized as u32,
+    );
     let p = c.client.get_policy(&id);
-
-    c.client.mark_claim_pending(&c.oracle, &id);
-    assert_eq!(c.client.get_policy(&id).status, PolicyStatus::ClaimPending);
-    // The active slot and the exposure are released now: the claim already counts against
-    // the farmer (claim window) and the org (pending payout in Treasury), so keeping them
-    // would count the same policy twice.
-    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
-    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
-
-    // Past end_date: cannot be expired, cannot be cancelled (not even by Admin).
-    c.env.ledger().set_timestamp(p.end_date + 1_000);
+    c.env.ledger().set_timestamp(p.end_date + 1);
     assert_err(
-        c.client.try_expire_policy(&id),
-        PolicyError::InvalidPolicyStatus as u32,
+        c.client.try_mark_as_claimed(&c.oracle, &id),
+        PolicyError::PolicyExpired as u32,
     );
-    assert_err(
-        c.client.try_cancel_policy(&c.admin, &id),
-        PolicyError::InvalidPolicyStatus as u32,
-    );
-    // A second mark_claim_pending is refused.
-    assert_err(
-        c.client.try_mark_claim_pending(&c.oracle, &id),
-        PolicyError::InvalidPolicyStatus as u32,
-    );
-
-    // Settlement after end_date still works and releases nothing a second time: another
-    // ACTIVE policy's slot and exposure are untouched.
-    c.env.ledger().set_timestamp(p.created_at);
-    let other = create_default(&c);
-    activate_default(&c, other);
-    c.env.ledger().set_timestamp(p.end_date + 1_000);
+    // Within cover it moves ACTIVE -> CLAIMED once, releasing the slot and the exposure.
+    c.env.ledger().set_timestamp(p.end_date);
     c.client.mark_as_claimed(&c.oracle, &id);
     assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Claimed);
-    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 1);
-    assert_eq!(
-        c.client.org_outstanding_sum_insured(&c.org),
-        MIN_SUM_INSURED
-    );
+    assert_eq!(c.client.get_farmer_active_count(&c.farmer), 0);
+    assert_eq!(c.client.org_outstanding_sum_insured(&c.org), 0);
     assert_err(
         c.client.try_mark_as_claimed(&c.oracle, &id),
         PolicyError::InvalidPolicyStatus as u32,
     );
 }
 
+// ---------------- Upgrade gate ----------------
+
 #[test]
-fn mark_claim_pending_requires_oracle_and_live_active_cover() {
+fn upgrade_is_refused_to_non_upgraders_and_without_a_signature() {
     let c = setup();
-    let id = create_default(&c);
-    // PENDING (not activated) cannot become claim-pending.
+    let hash = soroban_sdk::BytesN::from_array(&c.env, &[7u8; 32]);
     assert_err(
-        c.client.try_mark_claim_pending(&c.oracle, &id),
-        PolicyError::InvalidPolicyStatus as u32,
-    );
-    activate_default(&c, id);
-    assert_err(
-        c.client.try_mark_claim_pending(&c.backend, &id),
+        c.client.try_upgrade(&c.backend, &hash),
         CommonError::Unauthorized as u32,
     );
-    let p = c.client.get_policy(&id);
-    c.env.ledger().set_timestamp(p.end_date + 1);
-    assert_err(
-        c.client.try_mark_claim_pending(&c.oracle, &id),
-        PolicyError::PolicyExpired as u32,
-    );
+    c.env.set_auths(&[]);
+    match c.client.try_upgrade(&c.admin, &hash) {
+        Err(Ok(e)) => assert!(
+            !e.is_type(soroban_sdk::xdr::ScErrorType::Contract),
+            "expected a missing-auth host error, got {:?}",
+            e
+        ),
+        other => panic!("expected a missing-auth host error, got {:?}", other),
+    }
 }
 
 // ---------------- Role grants keep their TTL ----------------
@@ -1150,8 +1131,7 @@ mod rent {
     use super::*;
     use crate::DataKey;
     use microcrop_shared::ttl::{
-        DAY_LEDGERS, KEEPER_TARGET_LEDGERS, NETWORK_MAX_ENTRY_TTL_LEDGERS, PENDING_TARGET_LEDGERS,
-        USER_TARGET_LEDGERS,
+        DAY_LEDGERS, KEEPER_TARGET_LEDGERS, NETWORK_MAX_ENTRY_TTL_LEDGERS, USER_TARGET_LEDGERS,
     };
     use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
 
@@ -1266,32 +1246,19 @@ mod rent {
     }
 
     #[test]
-    fn a_closed_policy_keeps_its_ttl_and_a_pending_claim_gets_sixty_days() {
+    fn a_closed_policy_keeps_its_ttl() {
         let c = ctx();
         let id = create(&c, &c.farmer, 140);
         activate_default(&c, id);
         advance(&c, 10);
-        c.client.mark_claim_pending(&c.oracle, &id);
-        // CLAIM_PENDING with more than 30 days left: left as it is.
+        c.client.mark_as_claimed(&c.oracle, &id);
+        assert_eq!(c.client.get_policy(&id).status, PolicyStatus::Claimed);
+        // Claimed: left as it is (end + 30 d is 160 days away), never extended further.
         assert_eq!(ttl(&c, &DataKey::Policy(id)), 160 * DAY_LEDGERS);
-        let short = create(&c, &Address::generate(&c.env), MIN_DROUGHT_DURATION_DAYS);
-        activate_default(&c, short);
-        for _ in 0..5 {
-            advance(&c, 20);
-        }
-        advance(&c, 16);
-        // One day before the end: end + 30 d is 31 days away.
-        c.client.mark_claim_pending(&c.oracle, &short);
-        assert_eq!(ttl(&c, &DataKey::Policy(short)), 31 * DAY_LEDGERS);
-        // While it waits past the end, the keeper gives it the pending target.
-        advance(&c, 2);
-        c.client.extend_policy_ttl(&short);
-        assert_eq!(ttl(&c, &DataKey::Policy(short)), PENDING_TARGET_LEDGERS);
-        // Claimed: left as it is.
-        let before = ttl(&c, &DataKey::Policy(short));
         advance(&c, 5);
-        c.client.mark_as_claimed(&c.oracle, &short);
-        assert_eq!(ttl(&c, &DataKey::Policy(short)), before - 5 * DAY_LEDGERS);
+        c.env.set_auths(&[]);
+        c.client.extend_policy_ttl(&id);
+        assert_eq!(ttl(&c, &DataKey::Policy(id)), 155 * DAY_LEDGERS);
     }
 
     #[test]

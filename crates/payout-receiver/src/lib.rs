@@ -3,8 +3,16 @@
 //!
 //! Soroban port of `microcrop-contracts/microcrop/src/PayoutReceiver.sol` (v2.1.0, plus the
 //! v2.2.0 drought path). This is the crux contract: it verifies a PKP-signed determination
-//! and, iff valid, triggers the payout. The **signature is the sole payout authority**;
-//! `Role::Relayer` is an anti-spam gate on WHO may relay and does NOT authorize a payout.
+//! and, iff valid, records the payout obligation in the SettlementAdapter. The **signature is
+//! the sole payout authority**; `Role::Relayer` is an anti-spam gate on WHO may relay and does
+//! NOT authorize a payout.
+//!
+//! ## Option B: no custody (2026-10-19)
+//! No token moves here or anywhere on-chain. A verified determination becomes an
+//! `Obligation` (status `Owed`) in the SettlementAdapter; the org, or the `Funder` role acting
+//! for it, later attests off-chain funding and settlement there. The adapter is admin-settable
+//! (`set_settlement_adapter`, bound by a handshake), so the stub can be swapped for a real
+//! FundingFacility without redeploying this contract.
 //!
 //! Two methodologies, each behind an admin switch (`set_methodology_enabled`; absent means
 //! disabled):
@@ -22,8 +30,9 @@
 //!   byte-compared to the recovered key.
 //! - `block.chainid` -> configured `DataKey::NetworkDomain` (`BytesN<32>`), see `set_network_domain`.
 //! - `address(this)` -> `env.current_contract_address()`.
-//! - Cross-contract effects via [`microcrop_shared::interfaces`] clients: `TreasuryClient::request_payout`,
-//!   `PolicyManagerClient::mark_as_claimed` + `increment_claim_count`.
+//! - Cross-contract effects via [`microcrop_shared::interfaces`] clients:
+//!   `SettlementAdapterClient::record_obligation`, `PolicyManagerClient::mark_as_claimed` +
+//!   `increment_claim_count`.
 //! - `nonReentrant` dropped (Soroban is single-frame re-entrancy safe); CEI ordering preserved.
 //!
 //! ## submit_determination (CROP_DAMAGE) — validation order (ALL must pass)
@@ -41,23 +50,20 @@
 //!  9. farmer within yearly claim limit
 //! 10. reconstruct inputs_hash + preimage on-chain (never trust a passed-in hash)
 //! 11. replay: preimage not consumed (temporary `ConsumedDetermination` + persistent `PolicyPaid`
-//!     + Treasury `payout_processed` = triple guard)
+//!     + the adapter's one obligation per (PayoutReceiver, policy) = triple guard)
 //! 12. signature: `secp256k1_recover(digest, sig, recovery_id) == authorized_signer`
 //!
 //! Both paths share their effects (`settle_verified`) and their replay guards: `PolicyPaid`
 //! is one flag per policy, so a policy settles at most once across both methodologies.
 //! Effects before interactions (CEI): mark consumed + paid + store report, THEN
-//! `treasury.request_payout`, then `pm.mark_as_claimed` (paid now) or `pm.mark_claim_pending`
-//! (org reserve short: Treasury recorded a pending payout), then `pm.increment_claim_count`.
+//! `adapter.record_obligation` (its return value is checked field by field, 329), then
+//! `pm.mark_as_claimed` and `pm.increment_claim_count`. The whole call is atomic: an adapter
+//! error (unbound 500, conflict 502, unconfigured 3) reverts the effects too.
 //!
-//! ## Pending claims (audit findings 9 and 11)
-//! A valid determination is never lost to a short org reserve. Treasury records the full
-//! amount as a pending payout (counted in the org's `reserve_required`, so the org cannot
-//! withdraw it), the policy becomes CLAIM_PENDING, and the permissionless
-//! [`PayoutReceiver::settle_pending_claim`] pays it once the reserve is topped up. Pending
-//! claims of one org settle strictly first-in-first-out (Treasury keeps a per-org queue). A
-//! failed USDC transfer to the backend wallet (issuer-deauthorized or missing trustline) is
-//! recorded the same way instead of reverting the determination.
+//! ## Replay across an adapter swap
+//! `PolicyPaid` lives HERE, not in the adapter, so swapping the adapter can never let a second
+//! determination settle a paid policy (310), and the old adapter's obligations stay where they
+//! are.
 //!
 //! ## One determination per policy (signer-side rule)
 //! Two different determinations signed for the same policy are both valid for
@@ -76,11 +82,11 @@ use microcrop_shared::{
     drought,
     encoding::{determination_digest, drought_determination_digest, DROUGHT_PARAMS_HASH_RDI_1_0},
     errors::{CommonError, PayoutError},
-    interfaces::{PolicyManagerClient, TreasuryClient},
+    interfaces::{PolicyManagerClient, SettlementAdapterClient},
     roles, ttl,
     types::{
         CoverageType, CropDetermination, DamageReport, DroughtDetermination, MethodologyKind,
-        Policy, PolicyStatus, Role,
+        ObligationStatus, Policy, PolicyStatus, Role,
     },
 };
 
@@ -105,10 +111,11 @@ pub const PLOT_COORD_TOLERANCE_E6: i128 = 1;
 
 // ---- Storage TTL (rent cap, `microcrop_shared::ttl`) ----
 // Instance + code: every call extends below 3 days to 10 days; `extend_contract_ttl()` (the
-// keeper) extends all four contracts below 23 days to 30 days. `PolicyPaid` and `Report` live
-// until the policy's `end_date + 30 d`; `ClaimPending` below 30 days to 60 days. The replay
-// marker is temporary and only has to outlive the 1-hour freshness window; `PolicyPaid` is
-// the durable guard.
+// keeper) extends all four contracts (this one, the SettlementAdapter, PolicyManager and
+// PolicyNft) below 23 days to 30 days. `PolicyPaid` and `Report` live until the policy's
+// `end_date + 30 d`. The replay marker is temporary and only has to outlive the 1-hour
+// freshness window; `PolicyPaid` is the durable guard. Open obligations live in the adapter
+// (below 30 days to 60 days, see `extend_policy_ttl`).
 const DAY_IN_LEDGERS: u32 = 17_280;
 const TEMP_BUMP: u32 = 7 * DAY_IN_LEDGERS;
 const TEMP_THRESHOLD: u32 = TEMP_BUMP - DAY_IN_LEDGERS;
@@ -155,23 +162,25 @@ pub struct DamageReportReceived {
     pub payout_amount: i128,
 }
 
-/// Emitted when a payout is initiated (Solidity `PayoutInitiated`).
+/// A verified determination was recorded as an obligation in the SettlementAdapter. No
+/// payout is initiated on-chain: the org (or the Funder acting for it) settles off-chain and
+/// attests it in the adapter.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PayoutInitiated {
+pub struct ObligationRequested {
     #[topic]
     pub policy_id: u64,
+    pub obligation_id: u64,
+    pub adapter: Address,
     pub amount: i128,
 }
 
-/// A verified claim could not be paid from the org reserve; it is recorded and settles via
-/// `settle_pending_claim` once the reserve covers it.
+/// The SettlementAdapter was replaced (`set_settlement_adapter`).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClaimAwaitingFunding {
-    #[topic]
-    pub policy_id: u64,
-    pub amount: i128,
+pub struct SettlementAdapterUpdated {
+    pub previous: Address,
+    pub adapter: Address,
 }
 
 /// The rainfall evidence behind a verified CROP_DROUGHT determination.
@@ -194,22 +203,13 @@ pub struct MethodologyEnabledSet {
     pub enabled: bool,
 }
 
-/// A pending claim was paid in full.
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingClaimSettled {
-    #[topic]
-    pub policy_id: u64,
-    pub amount: i128,
-}
-
 /// Storage keys. Config + signer + domain + paused are instance; report/paid persistent;
 /// the replay guard is temporary (freshness window makes long-lived persistence unnecessary).
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    /// Treasury contract address.
-    Treasury,
+    /// SettlementAdapter contract address (admin-settable, bound by handshake).
+    SettlementAdapter,
     /// PolicyManager contract address.
     PolicyManager,
     /// Authorized PKP signer as a 65-byte SEC-1 uncompressed pubkey.
@@ -220,12 +220,11 @@ pub enum DataKey {
     Paused,
     /// policy_id -> DamageReport.
     Report(u64),
-    /// policy_id -> settled? Set when a determination is accepted, whether the payout went
-    /// out at once or was recorded as pending, so no second determination can settle the
-    /// policy. (`is_policy_paid` reads this; `is_claim_pending` tells the two apart.)
+    /// policy_id -> settled? Set when a determination is accepted and its obligation recorded,
+    /// so no second determination can settle the policy, whichever adapter is bound.
     PolicyPaid(u64),
-    /// policy_id -> verified claim waiting for the org reserve (see `settle_pending_claim`).
-    ClaimPending(u64),
+    // `ClaimPending(u64)` was removed with the Treasury (Option B). Enum variants are encoded
+    // by name, so the removal renumbers nothing.
     /// reconstructed preimage hash -> consumed? (temporary storage; guards distinct-preimage
     /// replay within the unpaid freshness window).
     ConsumedDetermination(BytesN<32>),
@@ -238,15 +237,24 @@ pub struct PayoutReceiver;
 
 #[contractimpl]
 impl PayoutReceiver {
-    /// Port of `initialize(treasury, policyManager, admin)`. Grants ADMIN + UPGRADER, stores
-    /// the two contract references, unpaused. NOTE: `authorized_signer` and `network_domain`
-    /// must be configured post-deploy via `set_authorized_signer` / `set_network_domain`
-    /// before any determination can verify.
-    pub fn __constructor(env: Env, treasury: Address, policy_manager: Address, admin: Address) {
+    /// Port of `initialize(treasury, policyManager, admin)`, with the SettlementAdapter in the
+    /// Treasury's place. Grants ADMIN + UPGRADER, stores the two contract references, unpaused.
+    ///
+    /// No handshake here: the adapter cannot be bound to this contract before it exists. Until
+    /// the admin calls `adapter.set_payout_receiver(this)`, every submission fails
+    /// `NotPayoutReceiver` (500) in the adapter and reverts whole (fail closed); deploy.sh and
+    /// verify-deployment.sh enforce the binding. `authorized_signer` and `network_domain` must
+    /// also be configured post-deploy before any determination can verify.
+    pub fn __constructor(
+        env: Env,
+        settlement_adapter: Address,
+        policy_manager: Address,
+        admin: Address,
+    ) {
         roles::grant_role(&env, Role::Admin, &admin);
         roles::grant_role(&env, Role::Upgrader, &admin);
         let s = env.storage().instance();
-        s.set(&DataKey::Treasury, &treasury);
+        s.set(&DataKey::SettlementAdapter, &settlement_adapter);
         s.set(&DataKey::PolicyManager, &policy_manager);
         s.set(&DataKey::Paused, &false);
     }
@@ -271,6 +279,41 @@ impl PayoutReceiver {
             .set(&DataKey::NetworkDomain, &domain);
     }
 
+    /// Replace the SettlementAdapter (ADMIN). The new adapter must already be bound to this
+    /// contract (`adapter.payout_receiver() == this`), which also rejects any contract that is
+    /// not an adapter and this contract itself (328). Obligations recorded by the previous
+    /// adapter stay there; `PolicyPaid` stays here, so no policy can settle twice. Not
+    /// paused-gated, so an incident can swap the adapter while submissions are paused.
+    ///
+    /// Governance: this redirects every future obligation, a power equivalent to `upgrade`.
+    /// On mainnet hold Admin in a multisig and consider a timelock (MIGRATION_NOTES §11).
+    pub fn set_settlement_adapter(env: Env, caller: Address, adapter: Address) {
+        roles::require_role(&env, &caller, Role::Admin);
+        ttl::touch_contract(&env);
+        let this = env.current_contract_address();
+        if adapter == this {
+            panic_with_error!(&env, PayoutError::SettlementAdapterNotBound);
+        }
+        // Handshake (security.md class 4): only an adapter that names this contract as its
+        // PayoutReceiver is accepted. `try_` so a non-adapter contract (no such function, a
+        // different return type) is refused with 328 instead of an opaque host error.
+        match SettlementAdapterClient::new(&env, &adapter).try_payout_receiver() {
+            Ok(Ok(Some(pr))) if pr == this => {}
+            _ => panic_with_error!(&env, PayoutError::SettlementAdapterNotBound),
+        }
+        let s = env.storage().instance();
+        let previous: Address = s
+            .get(&DataKey::SettlementAdapter)
+            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
+        s.set(&DataKey::SettlementAdapter, &adapter);
+        SettlementAdapterUpdated { previous, adapter }.publish(&env);
+    }
+
+    /// The SettlementAdapter this contract records obligations in.
+    pub fn settlement_adapter(env: Env) -> Address {
+        Self::siblings(&env).0
+    }
+
     /// Grant a role (ADMIN only) — e.g. `Role::Relayer` to the relayer wallet.
     pub fn grant_role(env: Env, caller: Address, role: Role, who: Address) {
         roles::require_role(&env, &caller, Role::Admin);
@@ -288,7 +331,7 @@ impl PayoutReceiver {
     /// Role membership is not a secret: every grant is already a public persistent-storage
     /// entry on a public ledger. What was missing was a way to ASK. Without this, a deployment
     /// could not be verified through the interface — a missed cross-contract grant (the ones
-    /// that make PolicyManager a Minter, or PayoutReceiver a Payout drawer) produces a
+    /// that make PolicyManager a Minter, or PayoutReceiver an Oracle on PolicyManager) produces a
     /// deployment that looks complete and is dead on the money path, and the failure surfaces
     /// on the first real claim rather than at deploy time.
     pub fn has_role(env: Env, role: Role, who: Address) -> bool {
@@ -317,8 +360,8 @@ impl PayoutReceiver {
 
     /// Enable or disable a determination methodology (ADMIN). Absent means disabled, so a
     /// fresh deployment or an upgrade accepts nothing until the admin enables a methodology.
-    /// CROP_DAMAGE (`CropDualIndex10`) is retired: leave it disabled. A claim already recorded
-    /// as pending still settles, because `settle_pending_claim` does not re-verify.
+    /// CROP_DAMAGE (`CropDualIndex10`) is retired: leave it disabled. Disabling a methodology
+    /// never touches obligations already recorded in the adapter.
     pub fn set_methodology_enabled(
         env: Env,
         caller: Address,
@@ -394,7 +437,7 @@ impl PayoutReceiver {
         }
 
         // 6. policy state: exists, ACTIVE, not expired, not already paid.
-        let (pm, treasury) = Self::clients(&env);
+        let (pm, adapter) = Self::clients(&env);
         let policy = Self::open_policy(&env, &pm, d.on_chain_policy_id);
 
         // 6b. evidence must bind the real policy's sum insured.
@@ -444,11 +487,11 @@ impl PayoutReceiver {
             payout_amount: d.payout_amount,
             assessed_at: d.assessed_at,
         };
-        Self::settle_verified(&env, &pm, &treasury, &policy, report, digest.to_bytes());
+        Self::settle_verified(&env, &pm, &adapter, &policy, report, digest.to_bytes());
     }
 
     /// Verify a PKP-signed CROP_DROUGHT determination (`crop-drought-rdi-1.0`) and, iff
-    /// valid, pay it (RELAYER, when-not-paused). The signature is the sole payout authority;
+    /// valid, record its obligation (RELAYER, when-not-paused). The signature is the sole payout authority;
     /// it is over [`microcrop_shared::encoding::drought_determination_digest`], which binds
     /// the on-chain policy id, the USDC amounts, this contract and the network domain.
     ///
@@ -526,7 +569,7 @@ impl PayoutReceiver {
         }
 
         // 7. policy: exists, ACTIVE, not expired, not already paid.
-        let (pm, treasury) = Self::clients(&env);
+        let (pm, adapter) = Self::clients(&env);
         let policy = Self::open_policy(&env, &pm, d.on_chain_policy_id);
 
         // 8. drought cover only (the index indemnifies drought and nothing else).
@@ -596,7 +639,7 @@ impl PayoutReceiver {
             source_hash: d.source_hash.clone(),
         }
         .publish(&env);
-        Self::settle_verified(&env, &pm, &treasury, &policy, report, digest.to_bytes());
+        Self::settle_verified(&env, &pm, &adapter, &policy, report, digest.to_bytes());
     }
 
     /// The digest `submit_drought_determination` would verify for `d` on this contract and
@@ -648,11 +691,11 @@ impl PayoutReceiver {
             .unwrap_or(false)
     }
 
-    fn clients(env: &Env) -> (PolicyManagerClient<'_>, TreasuryClient<'_>) {
-        let (treasury, policy_manager) = Self::siblings(env);
+    fn clients(env: &Env) -> (PolicyManagerClient<'_>, SettlementAdapterClient<'_>) {
+        let (adapter, policy_manager) = Self::siblings(env);
         (
             PolicyManagerClient::new(env, &policy_manager),
-            TreasuryClient::new(env, &treasury),
+            SettlementAdapterClient::new(env, &adapter),
         )
     }
 
@@ -745,13 +788,12 @@ impl PayoutReceiver {
     }
 
     /// Effects then interactions for a verified determination, identical for both
-    /// methodologies: consumed marker, `PolicyPaid`, `Report`; `Treasury::request_payout`;
-    /// `mark_as_claimed`, or on a short reserve `mark_claim_pending` + `ClaimPending`;
-    /// `increment_claim_count`; events.
+    /// methodologies: consumed marker, `PolicyPaid`, `Report`; `adapter.record_obligation`
+    /// (return value checked); `mark_as_claimed`; `increment_claim_count`; events.
     fn settle_verified(
         env: &Env,
         pm: &PolicyManagerClient,
-        treasury: &TreasuryClient,
+        adapter: &SettlementAdapterClient,
         policy: &Policy,
         report: DamageReport,
         preimage_hash: BytesN<32>,
@@ -775,29 +817,34 @@ impl PayoutReceiver {
         s.persistent().set(&DataKey::Report(policy_id), &report);
         ttl::extend_for_policy(env, &DataKey::Report(policy_id), policy.end_date);
 
-        // Interactions. `this` is passed as the acting caller so Treasury/PolicyManager can
-        // enforce `caller == payout_receiver` / role checks; a contract auto-authorizes calls
-        // it makes under its own address. Treasury.request_payout is the third replay layer
-        // (its `PayoutProcessed(policy_id)` guard).
-        //
-        // A short org reserve does not revert the determination (audit findings 9/11):
-        // Treasury records a pending payout for the full amount and returns false, the policy
-        // moves to CLAIM_PENDING (so it cannot expire, be cancelled, or be settled by another
-        // determination), and `settle_pending_claim` pays it once the reserve covers it. The
-        // replay guards above are already set, so the determination is consumed either way.
+        // Interactions. `this` is passed as the acting caller: the adapter checks it equals its
+        // bound PayoutReceiver and `require_auth`s it, which a direct call from this contract
+        // satisfies; PolicyManager checks the Oracle role the same way. The adapter's
+        // one-obligation-per-(PayoutReceiver, policy) rule is the third replay layer.
         let this = env.current_contract_address();
-        let paid_now = treasury.request_payout(&this, &policy_id, &report.payout_amount);
-        if paid_now {
-            pm.mark_as_claimed(&this, &policy_id);
-        } else {
-            pm.mark_claim_pending(&this, &policy_id);
-            s.persistent().set(&DataKey::ClaimPending(policy_id), &true);
-            ttl::extend_pending(env, &DataKey::ClaimPending(policy_id));
+        let ob = adapter.record_obligation(
+            &this,
+            &policy_id,
+            &policy.org,
+            &report.payout_amount,
+            &preimage_hash,
+        );
+        // Never trust a cross-contract return value (security.md class 9): the adapter must
+        // have recorded exactly this obligation, fresh.
+        if ob.payout_receiver != this
+            || ob.policy_id != policy_id
+            || ob.org != policy.org
+            || ob.amount != report.payout_amount
+            || ob.determination_digest != preimage_hash
+            || ob.status != ObligationStatus::Owed
+        {
+            panic_with_error!(env, PayoutError::ObligationNotRecorded);
         }
-        // The claim counts against the farmer's window when it is approved, paid or not.
+        pm.mark_as_claimed(&this, &policy_id);
+        // The claim counts against the farmer's window when it is approved.
         pm.increment_claim_count(&this, &policy.farmer);
 
-        // Events (mirror Solidity DeterminationVerified / DamageReportReceived / PayoutInitiated).
+        // Events (mirror Solidity DeterminationVerified / DamageReportReceived).
         DeterminationVerified {
             policy_id,
             preimage_hash,
@@ -810,84 +857,29 @@ impl PayoutReceiver {
             payout_amount: report.payout_amount,
         }
         .publish(env);
-        if paid_now {
-            PayoutInitiated {
-                policy_id,
-                amount: report.payout_amount,
-            }
-            .publish(env);
-        } else {
-            ClaimAwaitingFunding {
-                policy_id,
-                amount: report.payout_amount,
-            }
-            .publish(env);
+        ObligationRequested {
+            policy_id,
+            obligation_id: ob.id,
+            adapter: adapter.address.clone(),
+            amount: report.payout_amount,
         }
-    }
-
-    /// Settle a claim that `submit_determination` verified but the org reserve could not pay.
-    /// PERMISSIONLESS: anyone (the org, a keeper, the farmer's agent) may call it once the org
-    /// reserve covers the claim. Pays the FULL recorded amount through
-    /// `Treasury::settle_pending_payout`, then marks the policy CLAIMED exactly as the normal
-    /// path does. Not re-verified: the signature, freshness and coverage window were checked
-    /// when the claim was recorded, so neither `MAX_REPORT_AGE` nor `end_date` can lapse it.
-    ///
-    /// Pending claims of one org settle strictly first-in-first-out: only the org's oldest
-    /// unsettled claim (`Treasury::pending_payout_head(org)`) is accepted.
-    ///
-    /// Reverts `NoPendingClaim` if nothing is pending for `policy_id` (never recorded, or
-    /// already settled), `ContractPaused` while paused, and Treasury's `NotPendingQueueHead`
-    /// (an older claim of the same org is still unsettled), `InsufficientOrgReserve` (the
-    /// reserve is still short) or `PayoutTransferFailed` (the backend wallet cannot receive
-    /// USDC; rotate it). Every revert leaves the claim recorded.
-    pub fn settle_pending_claim(env: Env, policy_id: u64) {
-        if env
-            .storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-        {
-            panic_with_error!(&env, PausedError::ContractPaused);
-        }
-        let s = env.storage();
-        ttl::touch_contract(&env);
-
-        let key = DataKey::ClaimPending(policy_id);
-        if !s.persistent().get(&key).unwrap_or(false) {
-            panic_with_error!(&env, PayoutError::NoPendingClaim);
-        }
-        // Effects before interactions: clear the marker first.
-        s.persistent().remove(&key);
-
-        let policy_manager: Address = s
-            .instance()
-            .get(&DataKey::PolicyManager)
-            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
-        let treasury: Address = s
-            .instance()
-            .get(&DataKey::Treasury)
-            .unwrap_or_else(|| panic_with_error!(&env, CommonError::NotConfigured));
-        let this = env.current_contract_address();
-
-        let amount = TreasuryClient::new(&env, &treasury).settle_pending_payout(&this, &policy_id);
-        PolicyManagerClient::new(&env, &policy_manager).mark_as_claimed(&this, &policy_id);
-
-        PendingClaimSettled { policy_id, amount }.publish(&env);
-        PayoutInitiated { policy_id, amount }.publish(&env);
+        .publish(env);
     }
 
     /// PERMISSIONLESS keep-alive for one policy across all four contracts: extends this
-    /// contract's entries for `policy_id` to their need (`PolicyPaid` / `Report` to the
-    /// policy's `end_date + 30 d`, `ClaimPending` below 30 days to 60 days), then calls
-    /// `Treasury::extend_policy_ttl` and `PolicyManager::extend_policy_ttl` (which extends the
-    /// PolicyNft certificate, best effort). Uses the keeper targets, never the network
-    /// maximum. The backend keeper calls it for every open or pending policy whose shortest
-    /// TTL is under 30 days (see `docs/DEPLOYMENT_RUNBOOK.md`). Not paused-gated: keeping state
-    /// alive is always safe. Reverts `PolicyDoesNotExist` (PolicyManager) for an unknown
-    /// policy.
+    /// contract's entries for `policy_id` (`PolicyPaid` / `Report`) to the policy's
+    /// `end_date + 30 d`, then, best effort, the policy's obligation in the SettlementAdapter
+    /// (below 30 days to 60 days while it is not Settled), then
+    /// `PolicyManager::extend_policy_ttl` (which extends the PolicyNft certificate, best
+    /// effort). Uses the keeper targets, never the network maximum. The backend keeper calls it
+    /// for every open policy and every policy with an Owed or Funded obligation whose shortest
+    /// TTL is under 30 days (see `docs/DEPLOYMENT_RUNBOOK.md`). The adapter calls go through
+    /// `try_`, so a swapped or broken adapter can never break the keeper. Not paused-gated:
+    /// keeping state alive is always safe. Reverts `PolicyDoesNotExist` (PolicyManager) for an
+    /// unknown policy.
     pub fn extend_policy_ttl(env: Env, policy_id: u64) {
         ttl::touch_contract(&env);
-        let (treasury, policy_manager) = Self::siblings(&env);
+        let (adapter, policy_manager) = Self::siblings(&env);
         let pm = PolicyManagerClient::new(&env, &policy_manager);
         let policy = pm.get_policy(&policy_id);
         let p = env.storage().persistent();
@@ -896,47 +888,41 @@ impl PayoutReceiver {
                 ttl::extend_for_policy(&env, &key, policy.end_date);
             }
         }
-        if p.has(&DataKey::ClaimPending(policy_id)) {
-            ttl::extend_pending(&env, &DataKey::ClaimPending(policy_id));
+        let ad = SettlementAdapterClient::new(&env, &adapter);
+        if let Ok(Ok(Some(id))) =
+            ad.try_find_obligation(&env.current_contract_address(), &policy_id)
+        {
+            let _ = ad.try_extend_obligation_ttl(&id);
         }
-        TreasuryClient::new(&env, &treasury).extend_policy_ttl(&policy_id);
         pm.extend_policy_ttl(&policy_id);
     }
 
     /// PERMISSIONLESS keeper for all four contracts: extends the instance and code of this
-    /// contract and of Treasury below 23 days to 30 days, then calls
+    /// contract and of the SettlementAdapter below 23 days to 30 days, then calls
     /// `PolicyManager::extend_contract_ttl`, which does the same for PolicyManager and
     /// PolicyNft. A no-op above 23 days, so the backend calls it daily. Ordinary calls extend
     /// only below 3 days to 10 days; this keeper, not user traffic, pays for keeping the code
     /// alive. Not paused-gated.
     pub fn extend_contract_ttl(env: Env) {
         ttl::keep_contract_alive(&env);
-        let (treasury, policy_manager) = Self::siblings(&env);
-        ttl::keep_other_contract_alive(&env, &treasury);
+        let (adapter, policy_manager) = Self::siblings(&env);
+        ttl::keep_other_contract_alive(&env, &adapter);
         PolicyManagerClient::new(&env, &policy_manager).extend_contract_ttl();
     }
 
-    /// The Treasury and PolicyManager addresses (set in the constructor).
+    /// The SettlementAdapter and PolicyManager addresses.
     fn siblings(env: &Env) -> (Address, Address) {
         let s = env.storage().instance();
-        let treasury: Address = s
-            .get(&DataKey::Treasury)
+        let adapter: Address = s
+            .get(&DataKey::SettlementAdapter)
             .unwrap_or_else(|| panic_with_error!(env, CommonError::NotConfigured));
         let policy_manager: Address = s
             .get(&DataKey::PolicyManager)
             .unwrap_or_else(|| panic_with_error!(env, CommonError::NotConfigured));
-        (treasury, policy_manager)
+        (adapter, policy_manager)
     }
 
     // ---- views ----
-
-    /// True while a verified claim for `policy_id` is waiting for the org reserve.
-    pub fn is_claim_pending(env: Env, policy_id: u64) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ClaimPending(policy_id))
-            .unwrap_or(false)
-    }
 
     /// Port of `getReport`. Returns a zeroed report for an unknown policy (Solidity mapping
     /// default-value semantics).

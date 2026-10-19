@@ -1,6 +1,6 @@
 //! Security suite for `PayoutReceiver::submit_drought_determination` (CROP_DROUGHT,
 //! `crop-drought-rdi-1.0`): one test per check, in the order the contract runs them, plus
-//! replay across both methodologies, the pending path, archived-entry safety and the view.
+//! replay across both methodologies, the obligation, archived-entry safety and the view.
 //!
 //! The signature is a real secp256k1 round-trip: `k256` signs the digest the contract
 //! rebuilds and the host's `secp256k1_recover` recovers it.
@@ -23,7 +23,9 @@ use microcrop_shared::{
     },
 };
 
-use crate::test::{MockPolicyManager, MockPolicyManagerClient, MockTreasury, MockTreasuryClient};
+use crate::test::{
+    MockPolicyManager, MockPolicyManagerClient, MockSettlementAdapter, MockSettlementAdapterClient,
+};
 use crate::{PausedError, PayoutReceiver, PayoutReceiverClient};
 
 // ============ Season fixture ============
@@ -49,7 +51,7 @@ struct F {
     pr_addr: Address,
     admin: Address,
     pm: MockPolicyManagerClient<'static>,
-    treasury: MockTreasuryClient<'static>,
+    adapter: MockSettlementAdapterClient<'static>,
     relayer: Address,
     sk: SigningKey,
     domain: BytesN<32>,
@@ -92,13 +94,15 @@ fn deploy(drought_on: bool, signer: bool) -> F {
     let admin = Address::generate(&env);
     let relayer = Address::generate(&env);
     let p = policy(&env);
-    let treasury_id = env.register(MockTreasury, ());
+    let adapter_id = env.register(MockSettlementAdapter, ());
     let pm_id = env.register(MockPolicyManager, (p,));
     let pr_addr = env.register(
         PayoutReceiver,
-        (treasury_id.clone(), pm_id.clone(), admin.clone()),
+        (adapter_id.clone(), pm_id.clone(), admin.clone()),
     );
     let client = PayoutReceiverClient::new(&env, &pr_addr);
+    let adapter = MockSettlementAdapterClient::new(&env, &adapter_id);
+    adapter.set_pr(&Some(pr_addr.clone()));
     client.grant_role(&admin, &Role::Relayer, &relayer);
     let sk = sk_from(0x11);
     if signer {
@@ -111,7 +115,7 @@ fn deploy(drought_on: bool, signer: bool) -> F {
     }
     F {
         pm: MockPolicyManagerClient::new(&env, &pm_id),
-        treasury: MockTreasuryClient::new(&env, &treasury_id),
+        adapter,
         env,
         client,
         pr_addr,
@@ -199,7 +203,13 @@ impl F {
 
     fn expect(&self, d: &DroughtDetermination, e: PayoutError) {
         assert_eq!(self.submit(d), Err(e));
-        assert_eq!(self.treasury.calls(), 0, "nothing may be paid on {:?}", e);
+        assert_eq!(self.adapter.calls(), 0, "nothing may be owed on {:?}", e);
+        assert_eq!(
+            self.pm.claimed_calls(),
+            0,
+            "nothing may be claimed on {:?}",
+            e
+        );
         assert!(!self.client.is_policy_paid(&1));
     }
 
@@ -223,12 +233,18 @@ fn with_w2(w2: u128, dd: u32) -> DroughtDetermination {
 // ============ Happy path ============
 
 #[test]
-fn happy_path_verifies_and_pays_out() {
+fn happy_path_verifies_and_records_the_obligation() {
     let f = setup();
     f.submit(&det()).unwrap();
-    assert_eq!(f.treasury.calls(), 1);
-    assert_eq!(f.treasury.last_pid(), 1);
-    assert_eq!(f.treasury.last_amt(), 4_500_000_000);
+    assert_eq!(f.adapter.calls(), 1);
+    assert_eq!(f.adapter.last_pid(), 1);
+    assert_eq!(f.adapter.last_amt(), 4_500_000_000);
+    // The obligation names the policy's org and the exact on-chain digest.
+    assert_eq!(f.adapter.last_org(), Some(f.pm.get_policy(&1).org));
+    assert_eq!(
+        f.adapter.last_digest(),
+        Some(f.client.drought_determination_digest(&on(&f.env, &det())))
+    );
     assert_eq!(f.pm.claimed_calls(), 1);
     assert_eq!(f.pm.inc_calls(), 1);
     assert!(f.client.is_policy_paid(&1));
@@ -417,7 +433,7 @@ fn threshold_is_inclusive() {
     let f = setup();
     // W2 at 80% of normal: d2 = 20, g2 = 30 -> exactly 3,000 bp.
     f.submit(&with_w2(14_400, 30)).unwrap();
-    assert_eq!(f.treasury.last_amt(), SUM_INSURED * 3_000 / 10_000);
+    assert_eq!(f.adapter.last_amt(), SUM_INSURED * 3_000 / 10_000);
 }
 
 // ============ 7: policy state ============
@@ -437,7 +453,6 @@ fn policy_not_active_rejected() {
         PolicyStatus::Expired,
         PolicyStatus::Cancelled,
         PolicyStatus::Claimed,
-        PolicyStatus::ClaimPending,
     ] {
         let f = setup();
         f.set_policy(|p| p.status = st);
@@ -462,7 +477,7 @@ fn policy_already_paid_rejected() {
     let mut d = with_w2(0, 100);
     d.assessed_at = NOW + 100;
     assert_eq!(f.submit(&d), Err(PayoutError::PolicyAlreadyPaid));
-    assert_eq!(f.treasury.calls(), 1);
+    assert_eq!(f.adapter.calls(), 1);
 }
 
 // ============ 8: coverage ============
@@ -604,7 +619,7 @@ fn payout_rounds_down_and_an_extra_base_unit_is_rejected() {
     let mut d = base();
     d.payout_amount = 330_000_000;
     f.submit(&d).unwrap();
-    assert_eq!(f.treasury.last_amt(), 330_000_000);
+    assert_eq!(f.adapter.last_amt(), 330_000_000);
 }
 
 // ============ 13: freshness ============
@@ -659,7 +674,7 @@ fn wrong_signer_domain_or_contract_rejected() {
         f.raw(&moved, &sig, recid),
         Err(PayoutError::InvalidSignature)
     );
-    assert_eq!(f.treasury.calls(), 0);
+    assert_eq!(f.adapter.calls(), 0);
 }
 
 #[test]
@@ -692,7 +707,7 @@ fn high_s_and_bad_recovery_id_never_pay() {
         &2u32,
     );
     assert!(res.is_err(), "recovery id 2 must not verify");
-    assert_eq!(f.treasury.calls(), 0);
+    assert_eq!(f.adapter.calls(), 0);
     assert!(!f.client.is_policy_paid(&1));
 }
 
@@ -703,7 +718,7 @@ fn replay_of_the_same_determination_rejected() {
     let (sig, recid) = sign_with(&f.env, &f.sk, &f.pr_addr, &f.domain, &d);
     assert_eq!(f.raw(&d, &sig, recid), Ok(()));
     assert_eq!(f.raw(&d, &sig, recid), Err(PayoutError::PolicyAlreadyPaid));
-    assert_eq!(f.treasury.calls(), 1);
+    assert_eq!(f.adapter.calls(), 1);
 }
 
 fn crop_det(env: &Env) -> CropDetermination {
@@ -747,7 +762,7 @@ fn a_policy_settles_at_most_once_across_both_methodologies() {
     f.client.submit_determination(&f.relayer, &c, &sig, &recid);
     f.set_policy(|p| p.coverage_type = CoverageType::Drought);
     assert_eq!(f.submit(&det()), Err(PayoutError::PolicyAlreadyPaid));
-    assert_eq!(f.treasury.calls(), 1);
+    assert_eq!(f.adapter.calls(), 1);
 
     // Drought first, then crop.
     let f = setup();
@@ -762,7 +777,7 @@ fn a_policy_settles_at_most_once_across_both_methodologies() {
             .try_submit_determination(&f.relayer, &c, &sig, &recid),
         Err(Ok(PayoutError::PolicyAlreadyPaid.into()))
     );
-    assert_eq!(f.treasury.calls(), 1);
+    assert_eq!(f.adapter.calls(), 1);
 }
 
 #[test]
@@ -772,34 +787,6 @@ fn a_crop_signature_does_not_verify_on_the_drought_path() {
     // A valid CROP_DAMAGE signature from the same key, contract and domain.
     let (sig, recid) = sign_crop(&f, &crop_det(&f.env));
     assert_eq!(f.raw(&d, &sig, recid), Err(PayoutError::InvalidSignature));
-}
-
-// ============ Pending path ============
-
-#[test]
-fn short_reserve_records_then_settles_and_blocks_other_determinations() {
-    let f = setup();
-    f.treasury.set_short(&true);
-    f.submit(&det()).unwrap();
-    assert_eq!(f.pm.pending_calls(), 1);
-    assert_eq!(f.pm.claimed_calls(), 0);
-    assert!(f.client.is_claim_pending(&1));
-    assert!(f.client.is_policy_paid(&1));
-
-    // Another valid determination cannot settle it.
-    f.env.ledger().set_timestamp(NOW + 120);
-    let mut d2 = with_w2(0, 100);
-    d2.assessed_at = NOW + 100;
-    assert_eq!(f.submit(&d2), Err(PayoutError::PolicyAlreadyPaid));
-
-    // Topped up long after the policy ended: settles in full, no re-verification.
-    f.env.ledger().set_timestamp(END + 30 * DAY);
-    f.treasury.set_short(&false);
-    f.env.set_auths(&[]);
-    f.client.settle_pending_claim(&1);
-    assert_eq!(f.treasury.settled_calls(), 1);
-    assert_eq!(f.pm.claimed_calls(), 1);
-    assert!(!f.client.is_claim_pending(&1));
 }
 
 // ============ Archived-entry safety ============
@@ -842,7 +829,7 @@ fn an_archived_policy_paid_flag_never_pays_out() {
     // with its true value, `true`, and the call reverts PolicyAlreadyPaid. On the network a
     // transaction that does not restore it fails on the archived read instead.
     assert_eq!(res, Err(Ok(PayoutError::PolicyAlreadyPaid.into())));
-    assert_eq!(f.treasury.calls(), 1, "paid exactly once");
+    assert_eq!(f.adapter.calls(), 1, "owed exactly once");
 }
 
 // ============ Rent cap on the drought path ============
@@ -858,14 +845,13 @@ fn the_drought_path_never_extends_the_instance_above_three_days() {
     };
     f.client.extend_contract_ttl();
     assert_eq!(inst(), KEEPER_TARGET_LEDGERS);
-    f.treasury.set_short(&true);
     f.submit(&det()).unwrap();
     assert_eq!(inst(), KEEPER_TARGET_LEDGERS);
-    // Below 3 days, a settlement attempt tops it up to 10 days only.
+    // Below 3 days, a user-path call (here the per-policy keep-alive) tops it up to 10 days
+    // only.
     let seq = f.env.ledger().sequence();
     f.env.ledger().set_sequence_number(seq + 28 * DAY_LEDGERS);
-    f.treasury.set_short(&false);
-    f.client.settle_pending_claim(&1);
+    f.client.extend_policy_ttl(&1);
     assert_eq!(inst(), USER_TARGET_LEDGERS);
 }
 
@@ -899,7 +885,7 @@ fn submit_drought_determination_requires_relayer_signature() {
         .client
         .try_submit_drought_determination(&f.relayer, &d, &sig, &recid);
     assert!(r.is_err(), "relayer without auth must fail: {r:?}");
-    assert_eq!(f.treasury.calls(), 0);
+    assert_eq!(f.adapter.calls(), 0);
 }
 
 /// The keeper and the digest view are permissionless by design.
