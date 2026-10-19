@@ -2,7 +2,7 @@
 
 **Honest framing:** this workspace is a **preparation port**, not a completed migration.
 The four contracts are faithfully re-implemented in Rust, compile to `wasm32v1-none`
-WASM, and pass their unit and integration suites (200 tests, plus 1 ignored real-WASM
+WASM, and pass their unit and integration suites (202 tests, plus 1 ignored real-WASM
 lane that passes after a wasm build). Treasury-era testnet deployments exist (2026-10,
 `deploy-v2`); Option B has not been deployed yet. The contracts are not integrated with the
 off-chain stack and have no mainnet deployment. An AI-assisted Soroban review (2026-10) found 11
@@ -94,9 +94,11 @@ was at `ed52203` and applies only to Treasury-era deployments. Its error range 2
 
 ### SettlementAdapter (`crates/settlement-adapter`) — new, no Solidity source
 Non-custodial obligation ledger (§11). `record_obligation` only by the bound PayoutReceiver
-(address check + its auth); `mark_funded` / `mark_settled` by the obligation's stored org or
-`Role::Funder` (7); `set_payout_receiver`, `grant_role`, `revoke_role` = `Admin`; `upgrade`
-= `Upgrader`. Holds no tokens, makes no cross-contract calls, no pause. Errors 500..=507.
+(address check + its auth); `mark_funded` / `mark_settled` by `Role::Funder` (7) only (the
+org that owes the obligation cannot mark it); `set_payout_receiver`, `grant_role`,
+`revoke_role` = `Admin` (grants and revocations emit `RoleGranted` / `RoleRevoked`);
+`upgrade` = `Upgrader`. Holds no tokens, makes no cross-contract calls, no pause. Errors
+500..=508.
 
 <details><summary>Treasury port as it was (Treasury-era deployments only)</summary>
 
@@ -319,8 +321,8 @@ preparation build into a real migration.
       each file is the contract spec section (doc comments of every shared type and error are
       embedded in all four contracts); PolicyNft's code section grew ~4.4 KB from the need-based
       TTL helpers, not investigated further. Trimming spec docs and the helpers are rent levers.
-      Option B (2026-10-19, optimized): PayoutReceiver 62,527 B, PolicyManager 51,758,
-      SettlementAdapter 41,033 (the Treasury's 64,683 is gone), PolicyNft 39,725.
+      Option B (2026-10-19, optimized): PayoutReceiver 62,217 B, PolicyManager 51,898,
+      SettlementAdapter 41,873 (the Treasury's 64,683 is gone), PolicyNft 39,865.
 - [ ] **Shared paused-code fragmentation** (§3.9): recommend adding one shared paused error
       to `microcrop_shared::errors` so all contracts share a code, instead of three local
       enums. Deferred to avoid touching the frozen shared crate mid-port.
@@ -580,13 +582,13 @@ on testnet yet.
 | `activate_policy` | 2.52 XLM | ≈ 0.31 XLM |
 | `submit_drought_determination` (Treasury era, pending path) | 662.6 → 1.05 XLM | ≈ 0.13 XLM |
 | Code rent per day: PayoutReceiver / Treasury / PolicyManager / PolicyNft | ≈ 5.0 / 5.2 / 4.1 / 2.8 XLM | ≈ 0.62 / 0.64 / 0.50 / 0.34 XLM |
-
-The table predates Option B and is not re-measured. Scaling by optimized size, the
-SettlementAdapter's code rent (41,033 B) should be about 0.63× the Treasury's (64,683 B),
-roughly 3.3 XLM/day on testnet; the keeper and lapse rows shrink accordingly. Measure on
-testnet before relying on these.
 | Keeper, all four contracts | ≈ 17 XLM/day, ≈ 119 XLM/week | ≈ 2.1 XLM/day, ≈ 14.7 XLM/week |
 | Worst-case user call after a keeper lapse | up to ~10 days of code rent for **each** contract the call touches: a determination touches all four, ≈ 150–170 XLM | ≈ 19–21 XLM |
+
+The table predates Option B and is not re-measured. Scaling by optimized size, the
+SettlementAdapter's code rent (41,873 B) should be about 0.65× the Treasury's (64,683 B),
+roughly 3.4 XLM/day on testnet; the keeper and lapse rows shrink accordingly. Measure on
+testnet before relying on these.
 
 The lapse row: each contract a call touches tops up separately (below 3 days to 10 days),
 so one call can pay for all four. An `extend_policy_ttl` after a lapse was measured on the
@@ -617,7 +619,7 @@ submit_drought_determination  (all checks of §9, unchanged)
   -> events DeterminationVerified, DamageReportReceived, ObligationRequested
 off-chain: the backend off-ramps the payout (M-Pesa) as paying agent
   -> adapter.mark_funded(funder, id, sha256(order reference))     when the order is accepted
-  -> adapter.mark_settled(funder|org, id, sha256(receipt ref))    when the receipt arrives
+  -> adapter.mark_settled(funder, id, sha256(receipt ref))        when the receipt arrives
 ```
 
 The transaction is atomic: an adapter error (500 unbound, 502 conflict, 3 not configured)
@@ -633,8 +635,10 @@ enum variants later is forward-compatible.
 
 **Attestation, not proof (read this before citing a `Settled`).** Organisation addresses are
 keyless: the backend derives them as `sha256("microcrop:org:stellar:v1:" + orgId)`, so nobody
-holds the key and the "org signs `mark_settled`" path cannot be used for backend-onboarded
-orgs. In practice every transition is made by `Role::Funder`, held by the backend account.
+holds their key. Even so, the adapter does not let an org mark its own obligation (#1): the
+org is the party that owes the money, so an org-signed `Settled` would be a self-waive, and
+once an org held a real key it could race the Funder's real settlement into a 505. Every
+transition is made by `Role::Funder`, held by the backend account.
 `Funded` and `Settled` are therefore the paying agent's attestations, identified by a
 reference hash of the off-chain record (no phone number or name ever goes on-chain). The
 events, the reference hashes and the revocable role are the audit trail; nothing on-chain
@@ -676,7 +680,8 @@ premium proof stays off-chain, the M-Pesa reference); the USDC SAC everywhere.
 included), `NoPendingClaim` 319 (variant kept, never raised), `PolicyStatus` ordinal 5
 (`ClaimPending`; the backend keeps it for decoding legacy deployments), `Role` 3 (`Payout`;
 variant kept). New: `Role::Funder = 7`, `ObligationStatus {Owed 0, Funded 1, Settled 2}`,
-`PayoutError` 328/329, `AdapterError` 500..=507. All pinned by `shared/src/abi_tests.rs`.
+`PayoutError` 328/329, `AdapterError` 500..=508 (508 `CounterOverflow`, unreachable, replaces
+two bare panics). All pinned by `shared/src/abi_tests.rs`.
 
 **Testnet-only fixture.** `crates/testnet-policy-fixture` (`TestnetPolicyFixture`) implements
 the `IPolicyManager` methods the PayoutReceiver calls; its admin injects policy state with
@@ -701,7 +706,7 @@ production-lane proof may need mainnet with a tiny sum insured. A real M-Pesa re
 `testing.md`). Satisfied by this design:
 
 - privileged functions authorised against storage: `record_obligation` = stored
-  PayoutReceiver + `require_auth`; marks = stored `ob.org` or the stored Funder grant;
+  PayoutReceiver + `require_auth`; marks = the stored Funder grant only;
   `set_payout_receiver`, `grant_role`, `revoke_role`, `set_settlement_adapter` = Admin;
   `upgrade` = Upgrader;
 - re-auth at every layer: the PayoutReceiver passes its own address and the adapter
@@ -728,22 +733,35 @@ production-lane proof may need mainnet with a tiny sum insured. A real M-Pesa re
    build, the skill says to deploy the release artifact. The repo is public, so the
    attestation workflow is available. `verify-deployment.sh` step 7 (on-chain wasm hash ==
    local optimized build) is a stand-in.
-2. Auditable state changes without events in every contract: `grant_role`, `revoke_role`,
+2. Auditable state changes without events: the adapter's `grant_role` / `revoke_role` now
+   emit `RoleGranted` / `RoleRevoked` (Funder is its most powerful grant). Still silent in
+   PolicyManager, PayoutReceiver and PolicyNft: `grant_role`, `revoke_role`,
    `set_network_domain`, `pause`, `unpause`, `upgrade`. Fix in `shared/roles.rs` plus the
    setters, as a follow-up.
-3. `upgrade` refusal tests now exist for PolicyManager, PayoutReceiver and the adapter; no
-   crate has a happy-path upgrade test (needs a second WASM).
+3. `upgrade` refusal tests exist for PolicyManager, PayoutReceiver and the adapter. The
+   happy path is covered only by the `#[ignore]`d `wasm_lane_full_flow`: the Upgrader swaps
+   each of the three to a different WASM hash (the unoptimized build of the same code) and
+   all state survives. A schema-changing upgrade (a real v2) is not tested.
 4. One key (`alice` on testnet) holds Admin and Upgrader everywhere. With a settable adapter,
    Admin can redirect obligations, which equals Upgrader power. Mainnet should use a multisig
    or custom account and a timelock on `set_settlement_adapter` (D-B3).
-5. `require_plot` uses an unchecked `(i128 - i128).abs()`; it traps instead of returning 321.
-   Low severity; prefer `checked_sub` plus the error (class 5, "fails cleaner").
-6. Attestation centralisation: the Funder can mark any obligation settled. Mitigated by the
-   reference-hash trail, revocable roles and events; documented, not solved.
+5. (Fixed) `require_plot` used an unchecked `(i128 - i128).abs()` and trapped on an extreme
+   coordinate; it now uses `checked_sub` / `checked_abs` and returns 321 (tested with
+   `i128::MIN` / `i128::MAX`).
+6. Attestation centralisation: the Funder, and only the Funder, can mark any obligation
+   settled. Mitigated by the reference-hash trail, revocable (and now evented) role grants
+   and the transition events; documented, not solved. §8 backend requirement: treat only a
+   `Settled` whose `settled_by` is the backend's Funder account as payment completion, and
+   alert on anything else (defence in depth if a second Funder is ever granted).
 7. Integration tests register native rlib contracts; the `#[ignore]`d `wasm_lane_full_flow`
    covers the compiled WASM and must be run explicitly.
 8. Optional hardening: the PayoutReceiver could require `NetworkDomain ==
    env.ledger().network_id()`, removing an admin misconfiguration class.
+9. Adapter swap and rent: after `set_settlement_adapter`, the PayoutReceiver's keeper calls
+   reach only the new adapter. The §8 keeper (`passPolicyTtl` / `passObligations`) must also
+   call `extend_contract_ttl()` daily on every previous adapter that still has an obligation
+   not Settled, and `extend_obligation_ttl(id)` directly on `claim.adapterContractId`
+   (runbook, keeper step 3).
 
 **Open decisions (product owner).**
 

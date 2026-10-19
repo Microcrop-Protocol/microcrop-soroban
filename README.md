@@ -7,7 +7,7 @@ non-custodial **SettlementAdapter** (Option B).
 
 > **2026-10-19 — Option B: no custody.** The per-org USDC Treasury is gone. After the
 > PayoutReceiver verifies a signed determination it records an **obligation** in the
-> `SettlementAdapter` (`Owed`); the org, or the backend holding the `Funder` role, then
+> `SettlementAdapter` (`Owed`); the backend, holding the `Funder` role, then
 > attests off-chain funding and settlement (`Funded`, `Settled`) with a reference hash.
 > No contract holds tokens or receives premiums; premium proof stays off-chain (the M-Pesa
 > reference). `Funded` / `Settled` are attestations, not proof of payment. This is
@@ -42,7 +42,7 @@ non-custodial **SettlementAdapter** (Option B).
 | Solidity source (v)        | Soroban crate              | Contract struct  | Role |
 | -------------------------- | -------------------------- | ---------------- | ---- |
 | `PolicyManager.sol` v3.1.0 | `crates/policy-manager`    | `PolicyManager`  | Policy lifecycle (create → activate → claim/cancel/expire), per-farmer caps, per-org outstanding-exposure accounting. |
-| (new, Option B)            | `crates/settlement-adapter` | `SettlementAdapter` | **Non-custodial obligation ledger.** One obligation per (PayoutReceiver, policy), recorded only by the bound PayoutReceiver; `Owed → Funded → Settled` attestations by the org or the `Funder` role, each with a reference hash. Holds no tokens, makes no calls. |
+| (new, Option B)            | `crates/settlement-adapter` | `SettlementAdapter` | **Non-custodial obligation ledger.** One obligation per (PayoutReceiver, policy), recorded only by the bound PayoutReceiver; `Owed → Funded → Settled` attestations by the `Funder` role only (never the org that owes it), each with a reference hash; role grants emit events. Holds no tokens, makes no calls. |
 | `PayoutReceiver.sol` v2.1.0 + v2.2.0 drought path | `crates/payout-receiver`   | `PayoutReceiver` | **Security crux.** Verifies a PKP-signed parametric determination (CROP_DROUGHT; CROP_DAMAGE retired), recomputes the index and re-derives the payout on-chain, triple replay guard, then records the obligation in the SettlementAdapter (return value checked). |
 | `PolicyNFT.sol`            | `crates/policy-nft`        | `PolicyNft`      | Soulbound-while-active policy certificate + ownership/distributor registry (`tokenId == policyId`). |
 | shared types/errors/roles  | `crates/shared` (`microcrop_shared`) | — | `#[contracttype]` structs, `#[contracterror]` codes, the `roles` access-control registry, cross-contract `#[contractclient]` traits, the **frozen** determination byte encoders (crop and drought), the rdi-1.0 index recompute, and the TTL (rent) policy. |
@@ -113,18 +113,18 @@ Package names (for `-p`): `microcrop-shared`, `microcrop-policy-manager`,
 ```
 cargo build --target wasm32v1-none --release   ->  4/4 WASM contracts built
                                        release     after `stellar contract optimize`
-    microcrop_policy_manager.wasm      62,907 B    51,758 B
-    microcrop_settlement_adapter.wasm  48,991 B    41,033 B
-    microcrop_payout_receiver.wasm     75,841 B    62,527 B
-    microcrop_policy_nft.wasm          46,958 B    39,725 B
+    microcrop_policy_manager.wasm      63,047 B    51,898 B
+    microcrop_settlement_adapter.wasm  50,178 B    41,873 B
+    microcrop_payout_receiver.wasm     75,483 B    62,217 B
+    microcrop_policy_nft.wasm          47,098 B    39,865 B
   (testnet only) microcrop_testnet_policy_fixture.wasm  23,222 B  22,244 B
 
-cargo test --workspace                         ->  200 passed, 0 failed, 1 ignored
-    microcrop-payout-receiver     79 passed   (crop + drought: every check in order, real secp256k1 round-trip, obligation fields + return-value check (329), unbound adapter, set_settlement_adapter handshake (328), replay after an adapter swap, keeper resilience, archived-flag safety, rent cap, upgrade gate)
+cargo test --workspace                         ->  202 passed, 0 failed, 1 ignored
+    microcrop-payout-receiver     80 passed   (crop + drought: every check in order, nothing recorded on any rejection, extreme coordinates -> 321 not a trap, real secp256k1 round-trip, obligation fields + return-value check (329), unbound adapter, set_settlement_adapter handshake (328), replay after an adapter swap, keeper resilience, archived-flag safety, rent cap, upgrade gate)
     microcrop-policy-manager      45 passed   (lifecycle, ACTIVE-only claim, caps, claim window, exposure, roles, plot coords, Drought-only sale with a 117-day floor, TTL targets, upgrade gate)
-    microcrop-settlement-adapter  24 passed   (exact auth trees, to_xdr events, idempotent/conflicting records, receiver rotation, state machine, pagination, TTL, archived entries, no-custody structural check, proptest)
+    microcrop-settlement-adapter  25 passed   (Funder-only marks (the org is refused), exact auth trees, to_xdr events incl. role grants, idempotent/conflicting records, receiver rotation, state machine, pagination, TTL, archived entries, no-custody structural check, proptest)
     microcrop-shared              19 passed   (drought golden vectors, EVM + JS cross-checks, rdi-1.0 grid, TTL helpers, ABI pin of every error code and ordinal)
-    microcrop-integration-tests   16 passed, 1 ignored   (four real contracts on one Env, no token: determination -> Owed -> Funded -> Settled, replay incl. after an adapter swap, real 2022 ERA5 season, keepers; ignored: the real-WASM lane, passes with --ignored after a wasm build)
+    microcrop-integration-tests   16 passed, 1 ignored   (four real contracts on one Env, no token: determination -> Owed -> Funded -> Settled, replay incl. after an adapter swap, real 2022 ERA5 season, keepers; ignored: the real-WASM lane incl. a happy-path upgrade of adapter, PayoutReceiver and PolicyManager, passes with --ignored after a wasm build)
     microcrop-policy-nft          14 passed   (mint, soulbound transfer, PM-only status, paging, TTL targets)
     microcrop-testnet-policy-fixture 3 passed (mainnet refusal, Oracle-gated writes)
 
@@ -160,7 +160,7 @@ On macOS without an accepted Xcode licence, build with the Command Line Tools:
    reads its source to keep it so). Only the bound PayoutReceiver, with its own
    authorization, can record an obligation; an identical repeat is a no-op, anything else
    for the same (PayoutReceiver, policy) is refused (502). Status only moves forward
-   (`Owed → Funded → Settled`), each mark by the obligation's stored org or a `Funder`, with a
+   (`Owed → Funded → Settled`), each mark by a `Funder` only (the org owes the money, so it cannot mark its own), with a
    non-zero reference hash that cannot be overwritten. The PayoutReceiver checks the
    returned obligation field by field (329). Amounts are USDC base units at **7 decimals**,
    as a unit of account.

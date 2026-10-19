@@ -52,8 +52,9 @@ export FUNDER_ADDR=G...                # optional, default BACKEND_ADDR: may mar
 Treasury-era deployment; `deploy.sh` refuses it (`--state-dir` for a fresh one).
 
 > **`FUNDER_ADDR` attests, it does not pay.** The Funder can mark any org's obligation
-> `Funded` or `Settled`. Backend-onboarded orgs have keyless addresses (derived from the org
-> id), so in practice the Funder makes every transition. Those marks are attestations backed
+> `Funded` or `Settled`, and it is the only one who can: the org owes the obligation, so a
+> mark by the org would be a self-waive and the adapter refuses it (#1). Grants and
+> revocations of the role emit `RoleGranted` / `RoleRevoked`. Those marks are attestations backed
 > by a reference hash of the off-chain payment record, not proof that money moved
 > (MIGRATION_NOTES §11).
 
@@ -229,7 +230,8 @@ its mobile-money off-ramp accepts the order (`mark_funded`) and when the M-Pesa 
 arrives (`mark_settled`), each with a 32-byte reference hash of the off-chain record (never a
 phone number or name). `Owed → Settled` directly is allowed. Repeating a mark with the same
 reference is a no-op (webhooks arrive twice); a different reference is refused (504 / 505);
-an all-zero reference is refused (506); a stranger is refused (1).
+an all-zero reference is refused (506); anyone without `Role::Funder`, the obligation's own
+org included, is refused (1).
 
 ```bash
 stellar contract invoke --id "$ADAPTER" --network testnet --source backend \
@@ -242,7 +244,9 @@ stellar contract invoke --id "$ADAPTER" --network testnet --source backend \
 accepts only an adapter already bound back to this PayoutReceiver
 (`adapter.payout_receiver() == PR`), otherwise `SettlementAdapterNotBound` (328). So: deploy
 the new adapter, `set_payout_receiver(PR)` on it, then switch. It works while paused (an
-incident swap). Obligations already recorded stay in the old adapter and stay markable there.
+incident swap). Obligations already recorded stay in the old adapter and stay markable there
+**only while the keeper keeps them alive**: after the swap the PayoutReceiver's keeper calls
+reach the new adapter only (see *Storage rent: the keeper*, step 3).
 A swap never reopens a paid policy: `PolicyPaid` lives in the PayoutReceiver, so a replay
 after a swap is still `PolicyAlreadyPaid` (310).
 
@@ -280,6 +284,15 @@ So **the backend must run a keeper**, as a repeatable job:
    (`find_obligation` + `extend_obligation_ttl`: the obligation, its lookup, its org index
    item and the org's count). An adapter that traps never breaks the keeper. The adapter's
    `extend_obligation_ttl(obligation_id)` is also permissionless and callable directly.
+3. **After an adapter swap, for every PREVIOUS adapter that still has an obligation not
+   Settled:** both calls above reach only the CURRENT adapter, so nothing else keeps the old
+   one alive and its code, instance and open obligations would archive (every later mark then
+   pays a restore). Until each of its obligations is Settled, the keeper must call
+   `extend_contract_ttl()` on that old adapter daily, and `extend_obligation_ttl(id)`
+   directly on the adapter recorded with the claim (`claim.adapterContractId` in the
+   backend), not via `PayoutReceiver.extend_policy_ttl`. A keeper that selects policies by
+   obligation TTL and only calls `extend_policy_ttl` would pick those policies on every pass
+   and never extend them.
 
 **The keeper must always submit.** Both calls only extend TTLs: simulation shows no ledger
 write, no event and no auth, so a client that sends only "state-changing" simulations never
@@ -453,8 +466,10 @@ fixture contract refuses a mainnet network id), with its own state file:
   compared with Lane P's) wired to `TestnetPolicyFixture`, a PolicyManager stand-in whose
   admin injects a policy (not a sale). A real 2022 ERA5 long-rains season, signed by a
   throwaway key only this lane trusts, runs end to end: `ObligationRecorded` (Owed),
-  `mark_funded` by the Funder, `mark_settled` signed by the org; then the negative cases
-  (#1 stranger, auth error on a direct `record_obligation`, #310 replay, #506 zero reference,
+  `mark_funded` and `mark_settled` by the Funder (after the org's own `mark_settled` is
+  refused with #1); then the negative cases (#1 stranger, a direct `record_obligation` that no
+  key can authorize (the PayoutReceiver is a contract address; the host-side refusal is
+  proven by the unit test `record_needs_the_receivers_own_authorization`), #310 replay, #506 zero reference,
   #328 unbound adapter, a bound adapter swap followed by #310).
 
 ```bash

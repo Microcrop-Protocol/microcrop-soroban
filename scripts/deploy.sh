@@ -78,7 +78,8 @@ command -v jq      >/dev/null || die "jq not found (brew install jq)"
 : "${ADMIN_KEY:?ADMIN_KEY is required — the stellar CLI identity that will hold Admin+Upgrader on all four contracts}"
 : "${BACKEND_ADDR:?BACKEND_ADDR is required — G... address the backend signs policy calls with}"
 : "${RELAYER_ADDR:?RELAYER_ADDR is required — G... address allowed to submit determinations}"
-# The Funder may mark ANY org's obligation funded / settled in the SettlementAdapter. These are
+# The Funder (and only the Funder: never the org that owes it) may mark ANY org's obligation
+# funded / settled in the SettlementAdapter. These are
 # attestations by the paying agent (the backend's mobile-money off-ramp), not proof of payment.
 FUNDER_ADDR="${FUNDER_ADDR:-$BACKEND_ADDR}"
 

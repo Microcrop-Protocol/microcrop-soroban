@@ -15,8 +15,9 @@
 #     compared with Lane P's) wired to TestnetPolicyFixture, a PolicyManager stand-in whose
 #     admin INJECTS a policy (not a sale). A real historical season (2022 ERA5 long rains,
 #     1.0167 N / 35.0062 E) is signed by a THROWAWAY key that only this lane's PayoutReceiver
-#     trusts, and runs end to end: ObligationRecorded (Owed) -> mark_funded by the backend
-#     (Funder) -> mark_settled signed by the org, plus the negative cases.
+#     trusts, and runs end to end: ObligationRecorded (Owed) -> mark_funded and mark_settled
+#     by the backend (Funder), plus the negative cases (including the org refused when it
+#     tries to mark its own obligation settled).
 #
 # Never uses the production PKP or the Lit account. Refuses --network mainnet.
 #
@@ -28,7 +29,7 @@
 #   ADMIN_KEY    holds Admin on the Lane P contracts (deploy.sh's ADMIN_KEY); admin of Lane E
 #   BACKEND_KEY  holds Backend on Lane P's PolicyManager; Funder on Lane E's adapter
 #   RELAYER_KEY  holds Relayer on Lane P's PayoutReceiver; Relayer on Lane E's
-#   ORG_KEY      the org that signs mark_settled (default: evidence-org)
+#   ORG_KEY      the org; it signs a mark_settled that must be refused (default: evidence-org)
 #   STRANGER_KEY an account with no role (default: evidence-stranger)
 #   EVIDENCE_SIGNER_SK  optional 32-byte hex throwaway secp256k1 key (generated if unset)
 #
@@ -150,7 +151,7 @@ expect_auth_err() {              # the host refuses a missing signature: not a c
   if grep -q "Error(Contract" "$LOGS/$label.log"; then
     tail -5 "$LOGS/$label.log" >&2; die "$label failed with a contract error, expected an auth failure"
   fi
-  report "| $label | refused (missing authorization) | (simulation) |"
+  report "| $label | ${AUTH_ERR_NOTE:-refused (missing authorization)} | (simulation) |"
   say "$label refused: missing authorization ✓"
 }
 value() { printf '%s' "$LAST_OUT" | tail -1 | tr -d '"'; }
@@ -301,7 +302,10 @@ lane_e() {
     state_set e_funded "$LAST_HASH"
   fi
   if [[ -z "$(state_get e_settled)" ]]; then
-    ok_inv e_mark_settled_by_org "$ORG_KEY" "$AD" -- mark_settled --caller "$ORG" \
+    # The org owes the obligation: signing its own mark_settled is refused (#1 Unauthorized).
+    expect_err 1 e_neg_org_marks_own_settled "$ORG_KEY" "$AD" -- mark_settled --caller "$ORG" \
+        --obligation_id 1 --reference_hash "$rs"
+    ok_inv e_mark_settled_by_funder "$BACKEND_KEY" "$AD" -- mark_settled --caller "$BACKEND" \
         --obligation_id 1 --reference_hash "$rs"
     state_set e_settled "$LAST_HASH"
   fi
@@ -311,6 +315,10 @@ lane_e() {
   # ---- negative cases ----
   expect_err 1   e_neg_stranger_mark "$STRANGER_KEY" "$AD" -- mark_funded --caller "$STRANGER" \
       --obligation_id 1 --reference_hash "$rf"
+  # CLI simulation RECORDS auth rather than enforcing it, so this fails client-side: no key can
+  # sign for a contract address. The host-side refusal is proven by the unit test
+  # record_needs_the_receivers_own_authorization; the report says exactly that.
+  AUTH_ERR_NOTE="no key can produce PayoutReceiver authorization (contract address); host refusal proven by unit test record_needs_the_receivers_own_authorization" \
   expect_auth_err e_neg_record_without_pr_auth "$ADMIN_KEY" "$AD" -- record_obligation --caller "$PR" \
       --policy_id 2 --org "$ORG" --amount 1 --determination_digest "$rf"
   expect_err 506 e_neg_zero_reference "$BACKEND_KEY" "$AD" -- mark_funded --caller "$BACKEND" \
