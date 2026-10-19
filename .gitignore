@@ -1,6 +1,7 @@
 target/
 *.wasm
-Cargo.lock
+# Cargo.lock IS committed: the SEP-55 release builds from source in CI, and without the
+# lockfile every build re-resolves transitive dependencies, so two builds of one tag can differ.
 .DS_Store
 
 # Deployment state written by scripts/deploy.sh. Contains live contract addresses and is

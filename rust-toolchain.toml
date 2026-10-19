@@ -1,6 +1,14 @@
 # soroban-sdk 27.0.2 requires Rust >= 1.91.0 (MSRV). Soroban contracts compile to the
 # `wasm32v1-none` target (NOT the legacy `wasm32-unknown-unknown`), which requires Rust >= 1.84.
+#
+# 1.91.1, not 1.91.0: Rust 1.91.0 has a known wasm miscompile (fixed in 1.91.1, see
+# https://blog.rust-lang.org/2025/11/10/Rust-1.91.1/), and `stellar contract build` refuses it
+# outright ("use a rust version other than 1.81, 1.82, 1.83 or 1.91.0"). The SEP-55 release
+# workflow builds with `stellar contract build`, so 1.91.0 cannot produce a release at all.
+#
+# rustfmt + clippy are listed so CI and local runs get the same lint toolchain as the build.
 [toolchain]
-channel = "1.91.0"
+channel = "1.91.1"
 targets = ["wasm32v1-none"]
+components = ["rustfmt", "clippy"]
 profile = "minimal"
