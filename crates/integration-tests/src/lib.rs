@@ -3,72 +3,62 @@
 //!
 //! Every other test crate in this workspace exercises ONE contract with in-file `#[contract]`
 //! mocks standing in for its siblings. This crate does the opposite: it registers all FOUR
-//! **real** contracts — [`PolicyManager`], [`Treasury`], [`PayoutReceiver`], [`PolicyNft`] — on a
-//! single shared [`Env`], wires them the way a real deployment would, and runs the entire money
-//! flow end-to-end:
+//! **real** contracts — [`PolicyManager`], [`SettlementAdapter`], [`PayoutReceiver`],
+//! [`PolicyNft`] — on a single shared [`Env`], wires them the way `scripts/deploy.sh` does, and
+//! runs the whole Option B flow end-to-end:
 //!
 //! ```text
-//!   create_policy ─▶ activate_policy (mints the real NFT)
-//!                 ─▶ mint USDC + receive_premium (real SAC token transfer, fee split)
+//!   create_policy ─▶ activate_policy (mints the real NFT)       (no premium on-chain)
 //!                 ─▶ sign a DroughtDetermination with a real k256 key
 //!                 ─▶ submit_drought_determination (real secp256k1_recover)
-//!                 ─▶ Treasury.request_payout (real USDC leaves the Treasury)
+//!                 ─▶ SettlementAdapter.record_obligation  (Owed; no token anywhere)
+//!                 ─▶ mark_funded (Funder) ─▶ mark_settled (org)  (attestations)
 //! ```
 //!
-//! The payout authority is a genuine secp256k1 signature: we sign the exact digest the
-//! `PayoutReceiver` reconstructs on-chain (via [`microcrop_shared::encoding::determination_digest`],
-//! bound to the PayoutReceiver's own address + the configured network domain) and let the contract
-//! recover it with `env.crypto().secp256k1_recover`. No assertion is weakened and no contract is
-//! stubbed.
+//! The payout authority is a genuine secp256k1 signature over the exact digest the
+//! `PayoutReceiver` rebuilds on-chain. No assertion is weakened and no contract is stubbed.
+//! There is no USDC Stellar Asset Contract in this world: nothing on-chain holds money.
 //!
-//! ## Cross-contract role wiring discovered from the sources (the whole point of this test)
-//! | grant / setter                                   | on contract     | so that…                                          |
-//! |--------------------------------------------------|-----------------|---------------------------------------------------|
-//! | `grant_role(Backend, backend)`                   | PolicyManager   | backend may `create_policy` / `activate_policy`   |
-//! | `grant_role(Oracle,  payout_receiver_addr)`      | PolicyManager   | PR (as itself) may `mark_as_claimed` + `increment_claim_count` |
-//! | `set_policy_nft(nft_addr)`                        | PolicyManager   | activation can mint the certificate               |
-//! | `grant_role(Minter, policy_manager_addr)`        | PolicyNft       | PM (as itself) may `mint_policy` on activation    |
-//! | `set_policy_manager(policy_manager_addr)`        | PolicyNft       | PM may flip the cert active-flag on claim         |
-//! | `set_policy_manager(policy_manager_addr)`        | Treasury        | Treasury can resolve a policy's backing org       |
-//! | `set_payout_receiver(payout_receiver_addr)`      | Treasury        | `request_payout` restricts caller == PR           |
-//! | `grant_role(Backend, backend)`                   | Treasury        | backend may `receive_premium`                     |
-//! | `grant_role(Payout,  payout_receiver_addr)`      | Treasury        | PR (as itself) may `request_payout`               |
-//! | `grant_role(Relayer, relayer)`                   | PayoutReceiver  | relayer may submit determinations (anti-spam)     |
-//! | `set_authorized_signer(pubkey65)`                | PayoutReceiver  | the sole payout authority (the signature)         |
-//! | `set_network_domain(domain)`                     | PayoutReceiver  | binds the signed digest to this network           |
-//! | `set_methodology_enabled(CropDroughtRdi10)`       | PayoutReceiver  | drought determinations are accepted at all        |
+//! The `#[ignore]`d [`wasm_lane_full_flow`] repeats the core flow against the optimized WASM
+//! files in `target/` (testing.md: "cross-contract interactions tested against real WASM").
 //!
-//! ### Payout recipient note
-//! In this v3 port `Treasury::request_payout` transfers USDC to the **backend offramp wallet**
-//! (M-Pesa cash-out), NOT directly to the farmer's on-chain address — the farmer is paid off-chain.
-//! So the REAL on-chain balance movement asserted here is `Treasury -> backend_wallet` for exactly
-//! `sum_insured * damage_bp / 10000`, while the farmer is verified as the on-chain NFT owner and the
-//! subject of the claimed policy. (Documented rather than hacked around.)
+//! ## Cross-contract wiring (what deploy.sh does and verify-deployment.sh checks)
+//! | grant / setter                                   | on contract       | so that…                                          |
+//! |--------------------------------------------------|-------------------|---------------------------------------------------|
+//! | `grant_role(Backend, backend)`                   | PolicyManager     | backend may `create_policy` / `activate_policy`   |
+//! | `grant_role(Oracle,  payout_receiver_addr)`      | PolicyManager     | PR (as itself) may `mark_as_claimed` + `increment_claim_count` |
+//! | `set_policy_nft(nft_addr)`                        | PolicyManager     | activation can mint the certificate               |
+//! | `grant_role(Minter, policy_manager_addr)`        | PolicyNft         | PM (as itself) may `mint_policy` on activation    |
+//! | `set_policy_manager(policy_manager_addr)`        | PolicyNft         | PM may flip the cert active-flag on claim         |
+//! | `set_payout_receiver(payout_receiver_addr)`      | SettlementAdapter | only the PR may `record_obligation`               |
+//! | `grant_role(Funder, backend)`                    | SettlementAdapter | backend may mark any obligation funded / settled  |
+//! | `grant_role(Relayer, relayer)`                   | PayoutReceiver    | relayer may submit determinations (anti-spam)     |
+//! | `set_authorized_signer(pubkey65)`                | PayoutReceiver    | the sole payout authority (the signature)         |
+//! | `set_network_domain(domain)`                     | PayoutReceiver    | binds the signed digest to this network           |
+//! | `set_methodology_enabled(CropDroughtRdi10)`       | PayoutReceiver    | drought determinations are accepted at all        |
 
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    token::{StellarAssetClient, TokenClient},
-    Address, BytesN, Env, String,
+    testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
+    Address, BytesN, Env, IntoVal, String,
 };
 
 use k256::ecdsa::SigningKey;
 
 use microcrop_shared::{
     encoding::{determination_digest, drought_determination_digest, DROUGHT_PARAMS_HASH_RDI_1_0},
-    errors::{PayoutError, PolicyError, TreasuryError},
+    errors::{AdapterError, PayoutError, PolicyError},
     types::{
-        CoverageType, CropDetermination, DroughtDetermination, MethodologyKind, PolicyStatus, Role,
+        CoverageType, CropDetermination, DroughtDetermination, MethodologyKind, ObligationStatus,
+        PolicyStatus, Role,
     },
 };
 
-use microcrop_payout_receiver::{
-    PausedError as PrPausedError, PayoutReceiver, PayoutReceiverClient,
-};
+use microcrop_payout_receiver::{PayoutReceiver, PayoutReceiverClient};
 use microcrop_policy_manager::{PolicyManager, PolicyManagerClient};
 use microcrop_policy_nft::{PolicyNft, PolicyNftClient};
-use microcrop_treasury::{PausedError as TreasuryPausedError, Treasury, TreasuryClient};
+use microcrop_settlement_adapter::{SettlementAdapter, SettlementAdapterClient};
 
 // ============ Fixed test parameters ============
 
@@ -76,8 +66,10 @@ use microcrop_treasury::{PausedError as TreasuryPausedError, Treasury, TreasuryC
 const PLANT: u64 = 1_743_465_600;
 /// Sale and activation: 06:00 UTC on planting day (the cover must start by planting).
 const NOW: u64 = PLANT + 6 * 3_600;
-/// 1,000 USDC (7dp, Stellar SAC) — within PolicyManager's [MIN_SUM_INSURED, MAX_SUM_INSURED].
+/// 1,000 USDC (7dp) — within PolicyManager's [MIN_SUM_INSURED, MAX_SUM_INSURED].
 const SUM_INSURED: i128 = 10_000_000_000;
+/// 100 USDC. Recorded on the policy; paid off-chain (M-Pesa), never on-chain.
+const PREMIUM: i128 = 1_000_000_000;
 /// 50% drought damage => 5000 bp (W1 at half its normal, W2 at 75% of its normal).
 const DAMAGE_BP: u32 = 5_000;
 /// SUM_INSURED * 5000 / 10000.
@@ -160,19 +152,13 @@ struct World<'a> {
     env: Env,
     // the deploying admin — holds Admin + Upgrader on all four contracts
     admin: Address,
-    // clients
     pm: PolicyManagerClient<'a>,
     nft: PolicyNftClient<'a>,
-    treasury: TreasuryClient<'a>,
+    adapter: SettlementAdapterClient<'a>,
     pr: PayoutReceiverClient<'a>,
-    token: TokenClient<'a>,
-    token_admin: StellarAssetClient<'a>,
-    // addresses
-    treasury_id: Address,
     pr_addr: Address,
     // actors
     backend: Address,
-    backend_wallet: Address,
     farmer: Address,
     distributor: Address,
     org: Address,
@@ -180,32 +166,28 @@ struct World<'a> {
     // signing
     sk: SigningKey,
     domain: BytesN<32>,
-    // the USDC Stellar Asset Contract (issuer flags for the freeze test)
-    sac: soroban_sdk::testutils::StellarAssetContract,
 }
 
-/// Deploy + wire all four contracts exactly as a real deployment would. `mock_all_auths` covers
-/// every `require_auth` (payer transfers + the contract-as-caller cross-calls) on the happy path.
+/// Deploy + wire all four contracts exactly as deploy.sh does. `mock_all_auths` covers every
+/// `require_auth` on the happy path; the auth-specific tests switch it off.
 fn deploy<'a>() -> World<'a> {
+    deploy_with(true)
+}
+
+/// `bind == false` skips `adapter.set_payout_receiver(pr)`, the one step that has to follow
+/// the PayoutReceiver's deployment.
+fn deploy_with<'a>(bind: bool) -> World<'a> {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(NOW);
 
     let admin = Address::generate(&env);
     let backend = Address::generate(&env);
-    let backend_wallet = Address::generate(&env);
     let farmer = Address::generate(&env);
     let distributor = Address::generate(&env);
     let org = Address::generate(&env);
     let relayer = Address::generate(&env);
 
-    // USDC as a real Stellar Asset Contract.
-    let sac = env.register_stellar_asset_contract_v2(admin.clone());
-    let usdc_addr = sac.address();
-    let token = TokenClient::new(&env, &usdc_addr);
-    let token_admin = StellarAssetClient::new(&env, &usdc_addr);
-
-    // ---- register the four real contracts ----
     let nft_addr = env.register(
         PolicyNft,
         (
@@ -215,80 +197,66 @@ fn deploy<'a>() -> World<'a> {
         ),
     );
     let pm_addr = env.register(PolicyManager, (admin.clone(),));
-    let treasury_id = env.register(
-        Treasury,
-        (usdc_addr.clone(), backend_wallet.clone(), admin.clone()),
-    );
+    let adapter_addr = env.register(SettlementAdapter, (admin.clone(),));
     let pr_addr = env.register(
         PayoutReceiver,
-        (treasury_id.clone(), pm_addr.clone(), admin.clone()),
+        (adapter_addr.clone(), pm_addr.clone(), admin.clone()),
     );
 
     let nft = PolicyNftClient::new(&env, &nft_addr);
     let pm = PolicyManagerClient::new(&env, &pm_addr);
-    let treasury = TreasuryClient::new(&env, &treasury_id);
+    let adapter = SettlementAdapterClient::new(&env, &adapter_addr);
     let pr = PayoutReceiverClient::new(&env, &pr_addr);
 
-    // ---- wire cross-contract references ----
     pm.set_policy_nft(&admin, &nft_addr);
     nft.set_policy_manager(&admin, &pm_addr);
-    treasury.set_policy_manager(&admin, &pm_addr);
-    treasury.set_payout_receiver(&admin, &pr_addr);
+    if bind {
+        adapter.set_payout_receiver(&admin, &pr_addr);
+    }
 
-    // ---- grant the roles the cross-calls require ----
-    // backend: create/activate policies + receive premiums.
     pm.grant_role(&admin, &Role::Backend, &backend);
-    treasury.grant_role(&admin, &Role::Backend, &backend);
-    // PolicyManager (acting as itself) mints certificates.
     nft.grant_role(&admin, &Role::Minter, &pm_addr);
-    // PayoutReceiver (acting as itself) marks claimed / increments count / requests payout.
     pm.grant_role(&admin, &Role::Oracle, &pr_addr);
-    treasury.grant_role(&admin, &Role::Payout, &pr_addr);
-    // relayer: anti-spam gate on submit_determination.
+    adapter.grant_role(&admin, &Role::Funder, &backend);
     pr.grant_role(&admin, &Role::Relayer, &relayer);
 
-    // ---- configure the payout authority (the signature) ----
     let sk = sk_from(0x11);
     pr.set_authorized_signer(&admin, &pubkey65(&env, &sk));
     let domain = BytesN::from_array(&env, &[0xABu8; 32]);
     pr.set_network_domain(&admin, &domain);
-    // Accept CROP_DROUGHT; CROP_DAMAGE stays disabled (retired).
     pr.set_methodology_enabled(&admin, &MethodologyKind::CropDroughtRdi10, &true);
 
     World {
         env,
-        admin: admin.clone(),
+        admin,
         pm,
         nft,
-        treasury,
+        adapter,
         pr,
-        token,
-        token_admin,
-        treasury_id,
         pr_addr,
         backend,
-        backend_wallet,
         farmer,
         distributor,
         org,
         relayer,
         sk,
         domain,
-        sac,
     }
 }
 
 impl<'a> World<'a> {
     /// create_policy (PENDING) then activate_policy (ACTIVE + real NFT mint). Returns policy_id.
-    fn create_and_activate(&self, premium: i128) -> u64 {
+    /// The premium is recorded on the policy but never paid on-chain (it stays off-chain, with
+    /// its M-Pesa reference).
+    fn create_and_activate(&self) -> u64 {
         let policy_id = self.pm.create_policy(
             &self.backend,
             &self.farmer,
-            &7u64, // plot_id
+            &7u64,
             &PLOT_LAT_E6,
             &PLOT_LON_E6,
             &SUM_INSURED,
-            &premium,
+            &PREMIUM,
             &DURATION_DAYS,
             &CoverageType::Drought,
             &self.org,
@@ -303,22 +271,13 @@ impl<'a> World<'a> {
         policy_id
     }
 
-    /// Fund the backend payer and pay the premium into the Treasury (real SAC transfer).
-    fn pay_premium(&self, policy_id: u64, premium: i128) {
-        self.token_admin.mint(&self.backend, &premium);
-        self.treasury
-            .receive_premium(&self.backend, &policy_id, &premium);
-    }
-
-    /// Move the ledger to the relayer's submission time (a minute after the assessment) if it
-    /// is earlier: a drought determination can only be assessed once the season is over.
+    /// Move the ledger to the relayer's submission time (a minute after the assessment).
     fn at_assessment(&self) {
         if self.env.ledger().timestamp() < ASSESSED + 60 {
             self.env.ledger().set_timestamp(ASSESSED + 60);
         }
     }
 
-    /// Sign `d` with the authorized key and submit it at assessment time.
     fn submit(&self, d: &DroughtDetermination) {
         self.at_assessment();
         let (sig, recid) = sign(&self.env, &self.sk, &self.pr_addr, &self.domain, d);
@@ -326,7 +285,6 @@ impl<'a> World<'a> {
             .submit_drought_determination(&self.relayer, d, &sig, &recid);
     }
 
-    /// `try_` form of [`Self::submit`] with an explicit signature.
     fn try_submit(
         &self,
         d: &DroughtDetermination,
@@ -341,354 +299,200 @@ impl<'a> World<'a> {
             .try_submit_drought_determination(&self.relayer, d, sig, &recid)
     }
 
-    /// Solvency invariant that must hold after every Treasury state change.
-    fn assert_solvent(&self) {
-        let balance = self.token.balance(&self.treasury_id);
-        let backed = self.treasury.total_org_reserves() + self.treasury.accumulated_fees();
-        assert!(
-            balance >= backed,
-            "solvency invariant breached: balance {} < backed {}",
-            balance,
-            backed
+    /// Nothing anywhere recorded a claim for `policy_id`.
+    fn assert_nothing_owed(&self, policy_id: u64) {
+        assert!(!self.pr.is_policy_paid(&policy_id));
+        assert_eq!(
+            self.adapter.find_obligation(&self.pr_addr, &policy_id),
+            None
         );
+        assert_eq!(self.adapter.obligation_count(), 0);
+        assert_eq!(self.pm.get_policy(&policy_id).status, PolicyStatus::Active);
     }
 }
 
-// ============ 1. Full lifecycle: premium -> signed determination -> payout ============
+fn reference(env: &Env, b: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[b; 32])
+}
+
+// ============ 1. Full lifecycle: determination -> obligation -> funded -> settled ============
 
 #[test]
-fn full_lifecycle_premium_to_payout() {
+fn full_lifecycle_determination_to_obligation_to_settlement() {
     let w = deploy();
-    let premium: i128 = 10_000_000_000; // 1,000 USDC; 10% fee => 900 USDC net to org reserve.
 
-    // --- create + activate; the REAL NFT is minted to the farmer ---
-    let policy_id = w.create_and_activate(premium);
+    let policy_id = w.create_and_activate();
     assert_eq!(policy_id, 1);
-    assert!(w.nft.policy_nft_exists(&policy_id));
     assert_eq!(w.nft.owner_of(&policy_id), w.farmer);
     assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Active);
-    // Activation booked the org's outstanding exposure.
     assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), SUM_INSURED);
 
-    // --- premium in: fee split, org reserve credited ---
-    w.pay_premium(policy_id, premium);
-    let platform_fee = premium / 10; // default global fee = 10%
-    let net = premium - platform_fee; // 9_000_000_000
-    assert_eq!(w.treasury.accumulated_fees(), platform_fee);
-    assert_eq!(w.treasury.org_reserve(&w.org), net);
-    assert_eq!(w.treasury.get_available_for_payouts(&w.org), net);
-    assert_eq!(w.token.balance(&w.treasury_id), premium);
-    w.assert_solvent();
-
-    // --- after the season: sign the determination with the real k256 key and submit it ---
+    // After the season: sign with the real k256 key and submit.
     let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
-    let backend_wallet_before = w.token.balance(&w.backend_wallet);
     w.submit(&d);
+    let digest = drought_determination_digest(&w.env, &d, &w.pr_addr, &w.domain).to_bytes();
 
-    // --- REAL USDC moved: Treasury -> backend offramp wallet, exactly the derived payout ---
-    assert_eq!(
-        w.token.balance(&w.backend_wallet) - backend_wallet_before,
-        PAYOUT
-    );
-    assert_eq!(w.token.balance(&w.treasury_id), premium - PAYOUT);
-    // Org reserve decreased by exactly the payout.
-    assert_eq!(w.treasury.org_reserve(&w.org), net - PAYOUT);
-    // Replay + processing guards set across contracts.
-    assert!(w.treasury.is_payout_processed(&policy_id));
+    // Owed, exactly the verified claim.
+    let id = w.adapter.find_obligation(&w.pr_addr, &policy_id).unwrap();
+    let ob = w.adapter.get_obligation(&id).unwrap();
+    assert_eq!(ob.id, 1);
+    assert_eq!(ob.payout_receiver, w.pr_addr);
+    assert_eq!(ob.policy_id, policy_id);
+    assert_eq!(ob.org, w.org);
+    assert_eq!(ob.amount, PAYOUT);
+    assert_eq!(ob.determination_digest, digest);
+    assert_eq!(ob.status, ObligationStatus::Owed);
+    assert_eq!(w.adapter.org_obligation_count(&w.org), 1);
+    // Policy CLAIMED, exposure released, report stored; the farmer still owns the certificate.
     assert!(w.pr.is_policy_paid(&policy_id));
-    // Policy transitioned ACTIVE -> CLAIMED, and the stored report matches.
     assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
+    assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), 0);
+    assert_eq!(w.pm.get_farmer_claim_count(&w.farmer), 1);
     let report = w.pr.get_report(&policy_id);
     assert_eq!(report.payout_amount, PAYOUT);
     assert_eq!(report.damage_percentage, DAMAGE_BP);
-    assert_eq!(report.weather_damage, 0);
-    assert_eq!(report.satellite_damage, 0);
-    // Farmer is still the on-chain certificate owner.
     assert_eq!(w.nft.owner_of(&policy_id), w.farmer);
-    w.assert_solvent();
+    assert!(!w.nft.get_certificate(&policy_id).is_active);
+
+    // Funded: the backend (Funder) attests the off-ramp order was accepted.
+    let rf = reference(&w.env, 0xF1);
+    let ob = w.adapter.mark_funded(&w.backend, &id, &rf);
+    assert_eq!(ob.status, ObligationStatus::Funded);
+    assert_eq!(ob.funded_by, Some(w.backend.clone()));
+
+    // Settled: the org itself attests, with its own signature and nothing else.
+    let rs = reference(&w.env, 0x51);
+    let ob = w
+        .adapter
+        .mock_auths(&[MockAuth {
+            address: &w.org,
+            invoke: &MockAuthInvoke {
+                contract: &w.adapter.address,
+                fn_name: "mark_settled",
+                args: (w.org.clone(), id, rs.clone()).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .mark_settled(&w.org, &id, &rs);
+    assert_eq!(ob.status, ObligationStatus::Settled);
+    assert_eq!(ob.settled_by, Some(w.org.clone()));
+    assert_eq!(ob.funding_reference, Some(rf));
+    assert_eq!(ob.settlement_reference, Some(rs));
+    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
+    assert_eq!(w.nft.owner_of(&policy_id), w.farmer);
 }
 
-// ============ 2. Replay of an identical determination is rejected, no double payout ============
+// ============ 2. Replay ============
 
 #[test]
 fn determination_replay_rejected() {
     let w = deploy();
-    let premium: i128 = 10_000_000_000;
-    let policy_id = w.create_and_activate(premium);
-    w.pay_premium(policy_id, premium);
-
+    let policy_id = w.create_and_activate();
     let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
-
-    // First submission pays out.
     w.try_submit(&d, &sig, recid).unwrap().unwrap();
-    let backend_wallet_after_first = w.token.balance(&w.backend_wallet);
-    let reserve_after_first = w.treasury.org_reserve(&w.org);
-    assert_eq!(backend_wallet_after_first, PAYOUT);
 
-    // Second (identical) submission must be rejected. NOTE an emergent property only visible with
-    // the REAL cross-contract wiring: the first payout drove PolicyManager ACTIVE -> CLAIMED, so on
-    // replay the policy-status guard (`PolicyNotActive`, #308) fires *before* PayoutReceiver's own
-    // persistent `PolicyAlreadyPaid` guard (#310) would. (The isolated unit test — whose mock keeps
-    // the policy Active — sees #310 instead.) Either way the replay is blocked and no second payout
-    // occurs; that difference is exactly what an integration test exists to surface.
-    let res = w.try_submit(&d, &sig, recid);
-    assert_eq!(res, Err(Ok(PayoutError::PolicyNotActive.into())));
-
-    // No second payout: balances + reserve unchanged, Treasury still solvent.
+    // With the REAL wiring the first claim drove PolicyManager ACTIVE -> CLAIMED, so on replay
+    // the status guard (#308) fires before PayoutReceiver's own PolicyPaid guard (#310).
     assert_eq!(
-        w.token.balance(&w.backend_wallet),
-        backend_wallet_after_first
+        w.try_submit(&d, &sig, recid),
+        Err(Ok(PayoutError::PolicyNotActive.into()))
     );
-    assert_eq!(w.treasury.org_reserve(&w.org), reserve_after_first);
-    assert_eq!(w.token.balance(&w.treasury_id), premium - PAYOUT);
-    w.assert_solvent();
+    assert_eq!(w.adapter.obligation_count(), 1);
 }
 
-// ============ 3. A short org reserve records the claim; it settles in full later ============
-// (audit findings 9 and 11 — previously the determination reverted with no record, and the
-// claim was lost once the signed report aged out or the policy reached end_date.)
-
-/// Sell (create + activate) a policy on planting day and pay a 100 USDC premium (90 USDC
-/// net reserve). Returns the policy id.
-fn sell_short(w: &World) -> u64 {
-    let premium: i128 = 1_000_000_000; // 100 USDC; net after 10% fee = 90 USDC.
-    let policy_id = w.create_and_activate(premium);
-    w.pay_premium(policy_id, premium);
-    assert!(premium - premium / 10 < PAYOUT);
-    policy_id
-}
-
-/// [`sell_short`], then after the season submit a valid determination for a 500 USDC payout
-/// the reserve cannot cover. Returns the policy id.
-fn record_short_claim(w: &World) -> u64 {
-    let policy_id = sell_short(w);
-    w.submit(&determination(&w.env, policy_id, SUM_INSURED, PAYOUT));
-    policy_id
-}
-
+/// Swapping the adapter cannot reopen a settled policy: neither the same determination nor a
+/// new one records a second obligation in the new adapter.
 #[test]
-fn short_reserve_records_pending_claim_then_settles_in_full() {
+fn replay_after_adapter_swap_still_rejected() {
     let w = deploy();
-    let policy_id = record_short_claim(&w);
-    let net: i128 = 900_000_000;
-
-    // Nothing paid yet; the full amount is recorded and the policy is CLAIM_PENDING.
-    assert_eq!(w.token.balance(&w.backend_wallet), 0);
-    assert_eq!(w.treasury.org_reserve(&w.org), net);
-    assert!(w.pr.is_claim_pending(&policy_id));
-    assert!(w.pr.is_policy_paid(&policy_id));
-    assert!(!w.treasury.is_payout_processed(&policy_id));
-    assert_eq!(
-        w.treasury.get_pending_payout(&policy_id).unwrap().amount,
-        PAYOUT
-    );
-    assert_eq!(w.treasury.org_pending_payouts(&w.org), PAYOUT);
-    assert_eq!(
-        w.pm.get_policy(&policy_id).status,
-        PolicyStatus::ClaimPending
-    );
-    assert_eq!(w.pm.get_farmer_claim_count(&w.farmer), 1);
-    // Counted once each: the claim holds the farmer's slot (as a claim in the window) and the
-    // org's reserve (as the full pending payout), so the active slot and the 30% exposure on
-    // the policy are released when it goes CLAIM_PENDING.
-    assert_eq!(w.pm.get_farmer_active_count(&w.farmer), 0);
-    assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), 0);
-    assert!(w.nft.get_certificate(&policy_id).is_active);
-
-    // Reserve lock: the requirement is the whole pending payout, and nothing on top of it.
-    assert_eq!(w.treasury.reserve_required(&w.org), PAYOUT);
-    let to = Address::generate(&w.env);
-    assert!(w
-        .treasury
-        .try_withdraw_org_surplus(&w.org, &1, &to)
-        .is_err());
-
-    // Settling while still short reverts InsufficientOrgReserve and keeps the claim.
-    assert_eq!(
-        w.pr.try_settle_pending_claim(&policy_id),
-        Err(Ok(TreasuryError::InsufficientOrgReserve.into()))
-    );
-    assert!(w.pr.is_claim_pending(&policy_id));
-
-    // Time passes: far beyond MAX_REPORT_AGE and the policy's end_date. The claim does not
-    // lapse — the policy cannot be expired or cancelled while the claim is pending.
-    let end = w.pm.get_policy(&policy_id).end_date;
-    w.env.ledger().set_timestamp(end + 30 * 86_400);
-    assert!(w.pm.try_expire_policy(&policy_id).is_err());
-    assert!(w.pm.try_cancel_policy(&w.admin, &policy_id).is_err());
-
-    // The org tops up exactly the claim. Before settlement it still cannot withdraw the
-    // claim money.
-    let top_up = PAYOUT;
-    w.token_admin.mint(&w.org, &top_up);
-    w.treasury.deposit_reserve(&w.org, &w.org, &top_up);
-    assert!(w
-        .treasury
-        .try_withdraw_org_surplus(&w.org, &(net + 1), &to)
-        .is_err());
-
-    // Anyone settles — no authorization at all.
-    w.env.set_auths(&[]);
-    w.pr.settle_pending_claim(&policy_id);
-
-    // Exactly the signed payout moved, once.
-    assert_eq!(w.token.balance(&w.backend_wallet), PAYOUT);
-    assert_eq!(w.treasury.org_reserve(&w.org), net + top_up - PAYOUT);
-    assert!(w.treasury.is_payout_processed(&policy_id));
-    assert!(w.treasury.get_pending_payout(&policy_id).is_none());
-    assert_eq!(w.treasury.org_pending_payouts(&w.org), 0);
-    assert!(!w.pr.is_claim_pending(&policy_id));
-    // Marked claimed exactly as the normal path: status, slot, exposure, certificate.
-    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
-    assert_eq!(w.pm.get_farmer_active_count(&w.farmer), 0);
-    assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), 0);
-    assert!(!w.nft.get_certificate(&policy_id).is_active);
-    // Counted once, at approval.
-    assert_eq!(w.pm.get_farmer_claim_count(&w.farmer), 1);
-    w.assert_solvent();
-
-    // No double pay: a second settle reverts, and the original determination cannot replay.
-    let res = w.pr.try_settle_pending_claim(&policy_id);
-    assert_eq!(res, Err(Ok(PayoutError::NoPendingClaim.into())));
-    assert_eq!(w.token.balance(&w.backend_wallet), PAYOUT);
-}
-
-#[test]
-fn pending_claim_blocks_replay_and_other_determinations() {
-    let w = deploy();
-    let policy_id = record_short_claim(&w);
-
-    // The same determination again: rejected, and no second pending record.
+    let policy_id = w.create_and_activate();
     let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
-    assert!(w.try_submit(&d, &sig, recid).is_err());
+    w.try_submit(&d, &sig, recid).unwrap().unwrap();
 
-    // A different, smaller determination (signed later) cannot settle the policy either.
-    // W1 at normal, W2 at 80% of normal: d2 = 20, g2 = 30 -> 30%.
+    let adapter2_addr = w.env.register(SettlementAdapter, (w.admin.clone(),));
+    let adapter2 = SettlementAdapterClient::new(&w.env, &adapter2_addr);
+    // Not yet bound: refused.
+    assert_eq!(
+        w.pr.try_set_settlement_adapter(&w.admin, &adapter2_addr),
+        Err(Ok(PayoutError::SettlementAdapterNotBound.into()))
+    );
+    adapter2.set_payout_receiver(&w.admin, &w.pr_addr);
+    w.pr.set_settlement_adapter(&w.admin, &adapter2_addr);
+    assert_eq!(w.pr.settlement_adapter(), adapter2_addr);
+
+    assert_eq!(
+        w.try_submit(&d, &sig, recid),
+        Err(Ok(PayoutError::PolicyNotActive.into()))
+    );
     w.env.ledger().set_timestamp(ASSESSED + 120);
-    let mut d2 = determination(&w.env, policy_id, SUM_INSURED, SUM_INSURED * 3_000 / 10_000);
-    d2.rain_w1_e2 = 20_000;
-    d2.rain_w2_e2 = 14_400;
-    d2.drought_damage = 30;
-    d2.damage_percent_bp = 3_000;
+    let mut d2 = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     d2.assessed_at = ASSESSED + 100;
     let (sig2, recid2) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d2);
-    let res = w.try_submit(&d2, &sig2, recid2);
-    assert_eq!(res, Err(Ok(PayoutError::PolicyNotActive.into())));
-
-    // The recorded amount is still the original, full one.
-    assert_eq!(
-        w.treasury.get_pending_payout(&policy_id).unwrap().amount,
-        PAYOUT
-    );
-    assert_eq!(w.token.balance(&w.backend_wallet), 0);
+    assert!(w.try_submit(&d2, &sig2, recid2).is_err());
+    assert_eq!(adapter2.obligation_count(), 0);
+    // The original obligation stays in the original adapter, still markable.
+    assert_eq!(w.adapter.obligation_count(), 1);
+    w.adapter
+        .mark_settled(&w.backend, &1, &reference(&w.env, 0x51));
 }
 
 #[test]
-fn new_claim_queues_behind_an_older_pending_claim() {
-    let w = deploy();
-    // Two policies of the same farmer, both sold on planting day.
-    let first = sell_short(&w);
-    let premium: i128 = 1_000_000_000;
-    let second = w.create_and_activate(premium);
-    w.pay_premium(second, premium);
-    // After the season the first claim finds 180 USDC of reserve: 500 USDC pending.
-    w.submit(&determination(&w.env, first, SUM_INSURED, PAYOUT));
-    // Reserve 600 USDC: the second 500 USDC claim fits the reserve, but only 100 USDC of it
-    // is not already owed to the first claim.
-    let top_up: i128 = 4_200_000_000;
-    w.token_admin.mint(&w.org, &top_up);
-    w.treasury.deposit_reserve(&w.org, &w.org, &top_up);
-    assert_eq!(w.treasury.org_reserve(&w.org), 6_000_000_000);
-
-    w.submit(&determination(&w.env, second, SUM_INSURED, PAYOUT));
-
-    // Queued, not paid ahead of the first claim.
-    assert_eq!(w.token.balance(&w.backend_wallet), 0);
-    assert_eq!(w.pm.get_policy(&second).status, PolicyStatus::ClaimPending);
-    assert_eq!(w.treasury.org_pending_payouts(&w.org), 2 * PAYOUT);
-
-    // The first claim settles from the reserve it was waiting on.
-    w.env.set_auths(&[]);
-    w.pr.settle_pending_claim(&first);
-    assert_eq!(w.token.balance(&w.backend_wallet), PAYOUT);
-    assert_eq!(w.pm.get_policy(&first).status, PolicyStatus::Claimed);
-    assert!(w.pr.is_claim_pending(&second));
-    w.assert_solvent();
-}
-
-#[test]
-fn pending_claim_settlement_respects_both_pauses() {
-    let w = deploy();
-    let policy_id = record_short_claim(&w);
-    w.token_admin.mint(&w.org, &PAYOUT);
-    w.treasury.deposit_reserve(&w.org, &w.org, &PAYOUT);
-
-    // PayoutReceiver paused: ContractPaused (318).
-    w.pr.pause(&w.admin);
+fn adapter_not_bound_reverts_atomically_then_succeeds_after_binding() {
+    let w = deploy_with(false);
+    let policy_id = w.create_and_activate();
+    let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
+    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
     assert_eq!(
-        w.pr.try_settle_pending_claim(&policy_id),
-        Err(Ok(PrPausedError::ContractPaused.into()))
+        w.try_submit(&d, &sig, recid),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            microcrop_shared::errors::CommonError::NotConfigured as u32
+        )))
     );
-    w.pr.unpause(&w.admin);
+    w.assert_nothing_owed(policy_id);
 
-    // Treasury paused: its Paused (215) propagates; the claim stays recorded.
-    w.treasury.pause(&w.admin);
+    // Bound to another receiver: still refused, still nothing persists.
+    let other = Address::generate(&w.env);
+    w.adapter.set_payout_receiver(&w.admin, &other);
     assert_eq!(
-        w.pr.try_settle_pending_claim(&policy_id),
-        Err(Ok(TreasuryPausedError::Paused.into()))
+        w.try_submit(&d, &sig, recid),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            AdapterError::NotPayoutReceiver as u32
+        )))
     );
-    assert!(w.pr.is_claim_pending(&policy_id));
-    assert_eq!(w.token.balance(&w.backend_wallet), 0);
+    w.assert_nothing_owed(policy_id);
 
-    // Unpaused — even long after the policy's end_date — it settles in full.
-    w.treasury.unpause(&w.admin);
-    let end = w.pm.get_policy(&policy_id).end_date;
-    w.env.ledger().set_timestamp(end + 1);
-    w.pr.settle_pending_claim(&policy_id);
-    assert_eq!(w.token.balance(&w.backend_wallet), PAYOUT);
+    // Bound to this one: the same signed determination settles.
+    w.adapter.set_payout_receiver(&w.admin, &w.pr_addr);
+    w.try_submit(&d, &sig, recid).unwrap().unwrap();
+    assert_eq!(w.adapter.obligation_count(), 1);
     assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
-    w.assert_solvent();
 }
-
-// ============ Bonus: a wrong-signer determination is rejected end-to-end ============
 
 #[test]
 fn wrong_signer_determination_rejected() {
     let w = deploy();
-    let premium: i128 = 10_000_000_000;
-    let policy_id = w.create_and_activate(premium);
-    w.pay_premium(policy_id, premium);
-
-    // Correct payload, but signed by a key that is NOT the configured authorized signer.
+    let policy_id = w.create_and_activate();
     let attacker = sk_from(0x22);
     let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     let (sig, recid) = sign(&w.env, &attacker, &w.pr_addr, &w.domain, &d);
-
-    let res = w.try_submit(&d, &sig, recid);
-    assert_eq!(res, Err(Ok(PayoutError::InvalidSignature.into())));
-
-    // Nothing moved.
-    assert_eq!(w.token.balance(&w.backend_wallet), 0);
-    assert_eq!(w.treasury.org_reserve(&w.org), premium - premium / 10);
-    assert!(!w.pr.is_policy_paid(&policy_id));
-    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Active);
+    assert_eq!(
+        w.try_submit(&d, &sig, recid),
+        Err(Ok(PayoutError::InvalidSignature.into()))
+    );
+    w.assert_nothing_owed(policy_id);
 }
 
-// ============ 5. has_role reports the wiring a deployment depends on ============
+// ============ has_role reports the wiring a deployment depends on ============
 //
-// These are the grants that produce a SILENTLY BROKEN deployment when missed: none of them
-// fails at deploy time, and three of them go to CONTRACTS rather than people. Before
-// has_role() existed there was no way to ask a deployed contract whether they had been made,
-// so scripts/verify-deployment.sh had to read raw storage and match on addresses — indirect,
-// and able to false-pass. This pins the exact queries that verifier now relies on.
+// These grants produce a SILENTLY BROKEN deployment when missed: none fails at deploy time,
+// two go to CONTRACTS rather than people. scripts/verify-deployment.sh relies on exactly these
+// queries.
+
 #[test]
 fn has_role_reports_the_money_path_grants() {
     let w = deploy();
-
-    // Granted to CONTRACTS. Missing #1 -> activation cannot mint a certificate; #2 ->
-    // determinations cannot mark a policy claimed; #3 -> NO PAYOUT CAN EVER BE DRAWN.
     assert!(
         w.nft.has_role(&Role::Minter, &w.pm.address),
         "PolicyManager must hold Minter on PolicyNft"
@@ -698,190 +502,55 @@ fn has_role_reports_the_money_path_grants() {
         "PayoutReceiver must hold Oracle on PolicyManager"
     );
     assert!(
-        w.treasury.has_role(&Role::Payout, &w.pr_addr),
-        "PayoutReceiver must hold Payout on Treasury"
+        w.adapter.has_role(&Role::Funder, &w.backend),
+        "the backend must hold Funder on the SettlementAdapter"
     );
-
-    // Granted to accounts.
+    assert_eq!(w.adapter.payout_receiver(), Some(w.pr_addr.clone()));
+    assert_eq!(w.pr.settlement_adapter(), w.adapter.address);
     assert!(w.pm.has_role(&Role::Backend, &w.backend));
-    assert!(w.treasury.has_role(&Role::Backend, &w.backend));
     assert!(w.pr.has_role(&Role::Relayer, &w.relayer));
 }
 
 #[test]
 fn has_role_is_false_for_non_holders_and_is_per_contract() {
     let w = deploy();
-
-    // An address holding a role in one contract does not hold it in another. The registry is
-    // namespaced per contract, and a verifier that assumed otherwise would false-pass.
     assert!(w.pm.has_role(&Role::Backend, &w.backend));
     assert!(
         !w.nft.has_role(&Role::Backend, &w.backend),
         "Backend on PolicyManager must not leak into PolicyNft"
     );
-
-    // Holding one role does not imply another.
+    assert!(
+        !w.pm.has_role(&Role::Funder, &w.backend),
+        "Funder on the adapter must not leak into PolicyManager"
+    );
     assert!(!w.pm.has_role(&Role::Oracle, &w.backend));
-    assert!(!w.treasury.has_role(&Role::Payout, &w.backend));
-
-    // A never-granted address holds nothing.
-    assert!(!w.treasury.has_role(&Role::Payout, &w.farmer));
+    assert!(!w.adapter.has_role(&Role::Funder, &w.farmer));
+    assert!(!w.adapter.has_role(&Role::Funder, &w.pr_addr));
     assert!(!w.pr.has_role(&Role::Relayer, &w.farmer));
 }
 
 #[test]
 fn revoking_a_role_is_visible_through_has_role() {
     let w = deploy();
-    let admin = w.pm.has_role(&Role::Backend, &w.backend);
-    assert!(admin);
-
-    // Revocation must be observable, or an operator cannot confirm an emergency lockout
-    // actually took effect.
-    w.treasury.revoke_role(&w.admin, &Role::Payout, &w.pr_addr);
+    let policy_id = w.create_and_activate();
+    w.submit(&determination(&w.env, policy_id, SUM_INSURED, PAYOUT));
+    // An emergency lockout of the Funder must be observable, and effective.
+    w.adapter.revoke_role(&w.admin, &Role::Funder, &w.backend);
     assert!(
-        !w.treasury.has_role(&Role::Payout, &w.pr_addr),
+        !w.adapter.has_role(&Role::Funder, &w.backend),
         "revoke must be visible via has_role"
     );
-}
-
-// ============ Finding 4: a PENDING policy's premium backs its own exposure ============
-
-#[test]
-fn pending_policy_premium_is_reserve_not_surplus() {
-    let w = deploy();
-    let premium: i128 = 10_000_000_000; // 1,000 USDC; 900 USDC net to the org reserve.
-    let policy_id = w.pm.create_policy(
-        &w.backend,
-        &w.farmer,
-        &7u64,
-        &PLOT_LAT_E6,
-        &PLOT_LON_E6,
-        &SUM_INSURED,
-        &premium,
-        &DURATION_DAYS,
-        &CoverageType::Drought,
-        &w.org,
-    );
-    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Pending);
-    // Exposure is counted while PENDING.
-    assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), SUM_INSURED);
-
-    w.pay_premium(policy_id, premium);
-    let net = premium - premium / 10;
-    let required = w.treasury.reserve_required(&w.org);
-    assert_eq!(required, SUM_INSURED * 3_000 / 10_000);
-
-    // The org cannot take the reserve below what the PENDING policy needs.
-    let to = Address::generate(&w.env);
     assert!(w
-        .treasury
-        .try_withdraw_org_surplus(&w.org, &(net - required + 1), &to)
+        .adapter
+        .try_mark_funded(&w.backend, &1, &reference(&w.env, 1))
         .is_err());
-    w.treasury
-        .withdraw_org_surplus(&w.org, &(net - required), &to);
-    assert_eq!(w.treasury.org_reserve(&w.org), required);
-
-    // Cancelling the PENDING policy releases the exposure, and the requirement with it.
-    w.pm.cancel_policy(&w.backend, &policy_id);
-    assert_eq!(w.pm.org_outstanding_sum_insured(&w.org), 0);
-    assert_eq!(w.treasury.reserve_required(&w.org), 0);
-    w.assert_solvent();
-}
-
-// ============ Pending claims settle first-in-first-out per org ============
-
-#[test]
-fn pending_claims_of_one_org_settle_in_arrival_order() {
-    let w = deploy();
-    // Both sold on planting day; both claims recorded after the season.
-    let first = sell_short(&w);
-    let second = sell_short(&w);
-    w.submit(&determination(&w.env, first, SUM_INSURED, PAYOUT)); // 500 pending, reserve 180
-    w.submit(&determination(&w.env, second, SUM_INSURED, PAYOUT)); // 500 pending
-    assert_eq!(w.treasury.pending_payout_head(&w.org), Some(first));
-    assert_eq!(w.treasury.pending_payout_count(&w.org), 2);
-
-    // Fund exactly one claim. Anyone may settle, but only the head: the second claim
-    // cannot take the money the first has been waiting for.
-    w.token_admin.mint(&w.org, &(PAYOUT - 1_800_000_000));
-    w.treasury
-        .deposit_reserve(&w.org, &w.org, &(PAYOUT - 1_800_000_000));
-    w.env.set_auths(&[]);
-    assert_eq!(
-        w.pr.try_settle_pending_claim(&second),
-        Err(Ok(TreasuryError::NotPendingQueueHead.into()))
-    );
-    assert!(w.pr.is_claim_pending(&second));
-    w.pr.settle_pending_claim(&first);
-    assert_eq!(w.token.balance(&w.backend_wallet), PAYOUT);
-    assert_eq!(w.treasury.pending_payout_head(&w.org), Some(second));
-
-    // The second settles once funded.
-    w.env.mock_all_auths();
-    w.token_admin.mint(&w.org, &PAYOUT);
-    w.treasury.deposit_reserve(&w.org, &w.org, &PAYOUT);
-    w.env.set_auths(&[]);
-    w.pr.settle_pending_claim(&second);
-    assert_eq!(w.token.balance(&w.backend_wallet), 2 * PAYOUT);
-    assert_eq!(w.pm.get_policy(&second).status, PolicyStatus::Claimed);
-    assert_eq!(w.treasury.pending_payout_head(&w.org), None);
-    w.assert_solvent();
-}
-
-// ============ An issuer freeze on the backend wallet does not lose the claim ============
-
-#[test]
-fn frozen_backend_wallet_queues_the_claim_until_the_wallet_is_rotated() {
-    let w = deploy();
-    let premium: i128 = 10_000_000_000; // reserve 900 USDC covers the 500 USDC claim.
-    let policy_id = w.create_and_activate(premium);
-    w.pay_premium(policy_id, premium);
-
-    // Circle's issuer has AUTH_REVOCABLE: it deauthorizes the backend wallet.
-    w.sac
-        .issuer()
-        .set_flag(soroban_sdk::testutils::IssuerFlags::RevocableFlag);
-    w.token_admin.set_authorized(&w.backend_wallet, &false);
-
-    // The determination is accepted, not reverted: consumed, counted, and queued.
-    w.submit(&determination(&w.env, policy_id, SUM_INSURED, PAYOUT));
-    assert!(w.pr.is_policy_paid(&policy_id));
-    assert!(w.pr.is_claim_pending(&policy_id));
-    assert_eq!(
-        w.pm.get_policy(&policy_id).status,
-        PolicyStatus::ClaimPending
-    );
-    assert_eq!(w.token.balance(&w.backend_wallet), 0);
-    assert_eq!(w.treasury.org_pending_payouts(&w.org), PAYOUT);
-
-    // Settling into the frozen wallet fails and keeps the claim.
-    assert_eq!(
-        w.pr.try_settle_pending_claim(&policy_id),
-        Err(Ok(TreasuryError::PayoutTransferFailed.into()))
-    );
-    assert!(w.pr.is_claim_pending(&policy_id));
-
-    // The admin rotates the wallet; anyone settles; the farmer's claim is paid in full,
-    // long after MAX_REPORT_AGE.
-    let new_wallet = Address::generate(&w.env);
-    w.treasury.set_backend_wallet(&w.admin, &new_wallet);
-    w.env.ledger().set_timestamp(ASSESSED + 7 * 86_400);
-    w.env.set_auths(&[]);
-    w.pr.settle_pending_claim(&policy_id);
-    assert_eq!(w.token.balance(&new_wallet), PAYOUT);
-    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
-    w.assert_solvent();
 }
 
 // ============ Coverage type and plot binding, end to end ============
 
 #[test]
 fn only_drought_cover_can_be_sold() {
-    // The one signable methodology (crop-drought-rdi-1.0) settles drought cover only, so
-    // every other cover is refused at sale: no policy, no exposure, no farmer slot, no
-    // premium.
     let w = deploy();
-    let premium: i128 = 10_000_000_000;
     for coverage in [
         CoverageType::Comprehensive,
         CoverageType::Flood,
@@ -896,7 +565,7 @@ fn only_drought_cover_can_be_sold() {
                 &PLOT_LAT_E6,
                 &PLOT_LON_E6,
                 &SUM_INSURED,
-                &premium,
+                &PREMIUM,
                 &DURATION_DAYS,
                 &coverage,
                 &w.org,
@@ -912,10 +581,7 @@ fn only_drought_cover_can_be_sold() {
 #[test]
 fn evidence_from_another_plot_does_not_settle() {
     let w = deploy();
-    let premium: i128 = 10_000_000_000;
-    let policy_id = w.create_and_activate(premium);
-    w.pay_premium(policy_id, premium);
-
+    let policy_id = w.create_and_activate();
     let mut d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     d.latitude_e6 = -1_300_000; // ~1.5 km south
     let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
@@ -923,7 +589,7 @@ fn evidence_from_another_plot_does_not_settle() {
         w.try_submit(&d, &sig, recid),
         Err(Ok(PayoutError::PlotLocationMismatch.into()))
     );
-    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Active);
+    w.assert_nothing_owed(policy_id);
 }
 
 // ============ Rent cap: keepers reach every contract ============
@@ -946,9 +612,7 @@ fn extend_contract_ttl_reaches_every_contract() {
     use soroban_sdk::testutils::storage::Instance as _;
 
     let w = deploy();
-    let premium: i128 = 10_000_000_000;
-    let policy_id = w.create_and_activate(premium);
-    w.pay_premium(policy_id, premium);
+    w.create_and_activate();
     let inst = |a: &Address| {
         w.env
             .as_contract(a, || w.env.storage().instance().get_ttl())
@@ -956,16 +620,13 @@ fn extend_contract_ttl_reaches_every_contract() {
     let all = [
         w.pm.address.clone(),
         w.nft.address.clone(),
-        w.treasury_id.clone(),
+        w.adapter.address.clone(),
         w.pr_addr.clone(),
     ];
-    // The whole money path so far extended code and instances to 10 days at most. (Admin
-    // and config calls extend nothing, so PayoutReceiver is still at its deploy TTL: run the
-    // keeper right after a deploy.)
-    for a in all[..3].iter() {
-        assert_eq!(inst(a), USER_TARGET_LEDGERS);
+    // Every call so far extended code and instances to 10 days at most.
+    for a in all.iter() {
+        assert!(inst(a) <= USER_TARGET_LEDGERS);
     }
-    assert!(inst(&w.pr_addr) < USER_TARGET_LEDGERS);
     // One permissionless call extends all four to 30 days.
     w.env.set_auths(&[]);
     w.pr.extend_contract_ttl();
@@ -976,62 +637,64 @@ fn extend_contract_ttl_reaches_every_contract() {
 
 #[test]
 fn extend_policy_ttl_reaches_every_contract() {
+    use microcrop_settlement_adapter::DataKey as Ad;
     use microcrop_shared::ttl::{NETWORK_MAX_ENTRY_TTL_LEDGERS, PENDING_TARGET_LEDGERS};
     use soroban_sdk::testutils::storage::Persistent as _;
-    use soroban_sdk::IntoVal;
 
     let w = deploy();
     w.env
         .ledger()
         .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
-    let policy_id = record_short_claim(&w);
+    let policy_id = w.create_and_activate();
+    w.submit(&determination(&w.env, policy_id, SUM_INSURED, PAYOUT));
 
     let ttl_in = |contract: &Address, k: soroban_sdk::Val| {
         w.env
             .as_contract(contract, || w.env.storage().persistent().get_ttl(&k))
     };
     let pm_policy = || microcrop_policy_manager::DataKey::Policy(policy_id).into_val(&w.env);
-    let tr_premium = || microcrop_treasury::DataKey::PremiumReceived(policy_id).into_val(&w.env);
-    let tr_pending = || microcrop_treasury::DataKey::PendingPayout(policy_id).into_val(&w.env);
     let pr_paid = || microcrop_payout_receiver::DataKey::PolicyPaid(policy_id).into_val(&w.env);
-    let pr_pending =
-        || microcrop_payout_receiver::DataKey::ClaimPending(policy_id).into_val(&w.env);
     let nft_cert = || microcrop_policy_nft::DataKey::Certificate(policy_id).into_val(&w.env);
+    let ob_keys = || {
+        [
+            Ad::Obligation(1).into_val(&w.env),
+            Ad::ObligationOf(w.pr_addr.clone(), policy_id).into_val(&w.env),
+            Ad::OrgObligationAt(w.org.clone(), 0).into_val(&w.env),
+        ]
+    };
 
-    // Per-policy entries live until end + 30 days, counted from when they were written:
-    // the premium flag, certificate and policy at sale (NOW), PolicyPaid at the claim.
+    // Per-policy entries live until end + 30 days, counted from when they were written.
     let until = w.pm.get_policy(&policy_id).end_date + 30 * 86_400;
     let need_at = |t: u64| ((until - t).div_ceil(5)) as u32;
     assert_eq!(ttl_in(&w.pr_addr, pr_paid()), need_at(ASSESSED + 60));
-    assert_eq!(ttl_in(&w.treasury_id, tr_premium()), need_at(NOW));
     assert_eq!(ttl_in(&w.nft.address, nft_cert()), need_at(NOW));
-    // The policy entry already lived until end + 30 days; going CLAIM_PENDING never
-    // shortens it. Pending-claim entries: 60 days.
     assert_eq!(ttl_in(&w.pm.address, pm_policy()), need_at(NOW));
+    // The open obligation and its lookup/index items: 60 days.
+    for k in ob_keys() {
+        assert_eq!(ttl_in(&w.adapter.address, k), PENDING_TARGET_LEDGERS);
+    }
     let before = [
         ttl_in(&w.pm.address, pm_policy()),
         ttl_in(&w.pr_addr, pr_paid()),
-        ttl_in(&w.treasury_id, tr_premium()),
         ttl_in(&w.nft.address, nft_cert()),
     ];
-    assert_eq!(ttl_in(&w.treasury_id, tr_pending()), PENDING_TARGET_LEDGERS);
-    assert_eq!(ttl_in(&w.pr_addr, pr_pending()), PENDING_TARGET_LEDGERS);
 
-    // 40 days with only the contract keeper running: the pending entries are under 30 days.
+    // 40 days with only the contract keeper running: the obligation is under 30 days.
     advance_with_keeper(&w, 40);
-    assert_eq!(ttl_in(&w.pr_addr, pr_pending()), 20 * DAY);
+    for k in ob_keys() {
+        assert_eq!(ttl_in(&w.adapter.address, k), 20 * DAY);
+    }
 
-    // One permissionless call.
+    // One permissionless call reaches the adapter through the PayoutReceiver.
     w.env.set_auths(&[]);
     w.pr.extend_policy_ttl(&policy_id);
-    for (c, k) in [(&w.treasury_id, tr_pending()), (&w.pr_addr, pr_pending())] {
-        assert_eq!(ttl_in(c, k), PENDING_TARGET_LEDGERS);
+    for k in ob_keys() {
+        assert_eq!(ttl_in(&w.adapter.address, k), PENDING_TARGET_LEDGERS);
     }
-    // The per-policy entries already live until end + 30 days: left as they are.
+    // Closed per-policy entries already live until end + 30 days: left as they are.
     for (i, (c, k)) in [
         (&w.pm.address, pm_policy()),
         (&w.pr_addr, pr_paid()),
-        (&w.treasury_id, tr_premium()),
         (&w.nft.address, nft_cert()),
     ]
     .into_iter()
@@ -1039,94 +702,64 @@ fn extend_policy_ttl_reaches_every_contract() {
     {
         assert_eq!(ttl_in(c, k), before[i] - 40 * DAY);
     }
+
+    // Once Settled, the keeper leaves the obligation to archive.
+    w.env.mock_all_auths();
+    w.adapter
+        .mark_settled(&w.backend, &1, &reference(&w.env, 0x51));
+    advance_with_keeper(&w, 10);
+    let settled = ttl_in(&w.adapter.address, Ad::Obligation(1).into_val(&w.env));
+    w.pr.extend_policy_ttl(&policy_id);
+    assert_eq!(
+        ttl_in(&w.adapter.address, Ad::Obligation(1).into_val(&w.env)),
+        settled
+    );
 }
 
 #[test]
 fn extend_policy_ttl_keeps_org_and_farmer_entries_alive() {
-    use microcrop_shared::ttl::{
-        NETWORK_MAX_ENTRY_TTL_LEDGERS, PENDING_TARGET_LEDGERS, SHARED_FLOOR_LEDGERS,
-    };
+    use microcrop_settlement_adapter::DataKey as Ad;
+    use microcrop_shared::ttl::{NETWORK_MAX_ENTRY_TTL_LEDGERS, SHARED_FLOOR_LEDGERS};
     use soroban_sdk::testutils::storage::Persistent as _;
-    use soroban_sdk::IntoVal;
 
     let w = deploy();
     w.env
         .ledger()
         .set_max_entry_ttl(NETWORK_MAX_ENTRY_TTL_LEDGERS);
-    // Admin-set org terms (the same values as the defaults, so the claim math is unchanged).
-    w.treasury.set_org_fee_bps(&w.admin, &w.org, &1_000u32);
-    w.treasury
-        .set_org_reserve_ratio_bps(&w.admin, &w.org, &3_000u32);
-    let policy_id = record_short_claim(&w);
+    let policy_id = w.create_and_activate();
+    w.submit(&determination(&w.env, policy_id, SUM_INSURED, PAYOUT));
 
     let ttl_in = |contract: &Address, k: soroban_sdk::Val| {
         w.env
             .as_contract(contract, || w.env.storage().persistent().get_ttl(&k))
     };
     use microcrop_policy_manager::DataKey as Pm;
-    use microcrop_treasury::DataKey as Tr;
     let until = w.pm.get_policy(&policy_id).end_date + 30 * 86_400;
-    // Written for the policy at sale (NOW): its need then.
     let need = ((until - NOW).div_ceil(5)) as u32;
-    // Per-org terms and reserve: the policy's need (they were read or written for it).
-    let org_keys = [
-        Tr::OrgReserve(w.org.clone()),
-        Tr::OrgFeeSet(w.org.clone()),
-        Tr::OrgFeeBps(w.org.clone()),
-        Tr::OrgRatioSet(w.org.clone()),
-        Tr::OrgReserveRatioBps(w.org.clone()),
-    ];
-    // (`OrgQueueHead` is first written when the head advances, so it is absent here.)
-    let pending_keys = [
-        Tr::OrgQueueTail(w.org.clone()),
-        Tr::OrgPendingPayouts(w.org.clone()),
-    ];
     let pm_keys = [
         Pm::OrgOutstanding(w.org.clone()),
         Pm::FarmerPolicyCount(w.farmer.clone()),
     ];
-    // The fee terms and the reserve were used for this policy: its need (from the premium
-    // at sale). The ratio terms were only read by `reserve_required`, which has no policy at
-    // hand: the 60-day floor, from when the admin set them.
-    for k in org_keys[..3].iter() {
-        assert_eq!(ttl_in(&w.treasury_id, k.clone().into_val(&w.env)), need);
-    }
-    for k in org_keys[3..].iter() {
-        assert_eq!(
-            ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
-            SHARED_FLOOR_LEDGERS
-        );
-    }
+    let org_count = || Ad::OrgObligationCount(w.org.clone()).into_val(&w.env);
+    assert_eq!(
+        ttl_in(&w.adapter.address, org_count()),
+        SHARED_FLOOR_LEDGERS
+    );
 
     advance_with_keeper(&w, 40);
     w.env.set_auths(&[]);
     w.pr.extend_policy_ttl(&policy_id);
-    for k in pending_keys.iter() {
-        assert_eq!(
-            ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
-            PENDING_TARGET_LEDGERS
-        );
-    }
-    // Fee terms and reserve: left as they are (they already outlive the policy). Ratio
-    // terms: under the floor, so topped up to at least 60 days.
-    for k in org_keys[..3].iter() {
-        assert_eq!(
-            ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
-            need - 40 * DAY
-        );
-    }
-    for k in org_keys[3..].iter() {
-        assert_eq!(
-            ttl_in(&w.treasury_id, k.clone().into_val(&w.env)),
-            SHARED_FLOOR_LEDGERS
-        );
-    }
     for k in pm_keys.iter() {
         assert_eq!(
             ttl_in(&w.pm.address, k.clone().into_val(&w.env)),
             need - 40 * DAY
         );
     }
+    // The org's obligation count: back to at least the 60-day floor.
+    assert_eq!(
+        ttl_in(&w.adapter.address, org_count()),
+        SHARED_FLOOR_LEDGERS
+    );
 }
 
 // ============ CROP_DROUGHT end to end ============
@@ -1135,9 +768,7 @@ fn extend_policy_ttl_keeps_org_and_farmer_entries_alive() {
 fn crop_determination_is_rejected_after_the_upgrade() {
     // CROP_DAMAGE is retired: disabled, so even a validly signed one is refused.
     let w = deploy();
-    let premium: i128 = 10_000_000_000;
-    let policy_id = w.create_and_activate(premium);
-    w.pay_premium(policy_id, premium);
+    let policy_id = w.create_and_activate();
     let c = CropDetermination {
         on_chain_policy_id: policy_id,
         damage_percent_bp: 5_000,
@@ -1164,7 +795,7 @@ fn crop_determination_is_rejected_after_the_upgrade() {
         w.pr.try_submit_determination(&w.relayer, &c, &sig, &recid),
         Err(Ok(PayoutError::MethodologyDisabled.into()))
     );
-    assert_eq!(w.token.balance(&w.backend_wallet), 0);
+    w.assert_nothing_owed(policy_id);
 }
 
 #[test]
@@ -1173,42 +804,37 @@ fn cover_bought_after_planting_does_not_settle_that_season() {
     // evidence cannot settle the policy (anti-adverse-selection rule), however dry it was.
     let w = deploy();
     w.env.ledger().set_timestamp(PLANT + 86_400 + 60);
-    let premium: i128 = 10_000_000_000;
-    let policy_id = w.create_and_activate(premium);
-    w.pay_premium(policy_id, premium);
+    let policy_id = w.create_and_activate();
     let d = determination(&w.env, policy_id, SUM_INSURED, PAYOUT);
     let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
     assert_eq!(
         w.try_submit(&d, &sig, recid),
         Err(Ok(PayoutError::EvidenceOutsideCoverWindow.into()))
     );
-    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Active);
+    w.assert_nothing_owed(policy_id);
 }
 
-/// Positive end-to-end with REAL evidence: the 2022 long-rains season at the oracle's pilot
-/// pixel (ERA5 cell 1.0 N / 35.0 E, Trans Nzoia), planted 2022-04-01. The values below are
-/// what the oracle's own index (`calculateDroughtDamage`, microcrop-lit-oracle 1bc2d9d
-/// `src/scoring/drought.shared.js`) returns for the live Open-Meteo archive response of
+/// The real 2022 long-rains season at the oracle's pilot pixel (ERA5 cell 1.0 N / 35.0 E,
+/// Trans Nzoia), planted 2022-04-01, exactly as `scripts/testnet-evidence.sh` Lane E signs
+/// it. The values are what the oracle's own index (`calculateDroughtDamage`,
+/// microcrop-lit-oracle 1bc2d9d `src/scoring/drought.shared.js`) returns for the live
+/// Open-Meteo archive response of
 ///   https://archive-api.open-meteo.com/v1/archive?latitude=1.016700&longitude=35.006200&start_date=1991-01-01&end_date=2022-07-19&daily=precipitation_sum&timezone=Africa%2FNairobi&models=era5
 /// fetched 2026-10-18 (209,608 bytes, sha256 213bdcc7…b7c117); `source_hash` is keccak256 of
 /// that run's canonical projection. Signed here with the test key; the ledger clock is set
 /// inside the window.
 #[test]
-fn real_era5_season_settles_end_to_end() {
-    const PLANT_2022: u64 = 1_648_771_200; // 2022-04-01
-    const LAT: i64 = 1_016_700;
-    const LON: i64 = 35_006_200;
+fn real_era5_season_records_an_obligation_end_to_end() {
     let w = deploy();
     w.env.ledger().set_timestamp(PLANT_2022 + 6 * 3_600);
-    let premium: i128 = 1_000_000_000;
     let policy_id = w.pm.create_policy(
         &w.backend,
         &w.farmer,
         &7u64,
-        &LAT,
-        &LON,
+        &ERA5_LAT,
+        &ERA5_LON,
         &SUM_INSURED,
-        &premium,
+        &PREMIUM,
         &DURATION_DAYS,
         &CoverageType::Drought,
         &w.org,
@@ -1220,25 +846,42 @@ fn real_era5_season_settles_end_to_end() {
         &String::from_str(&w.env, "Acme Distributor"),
         &String::from_str(&w.env, "Trans Nzoia"),
     );
-    w.token_admin.mint(&w.org, &SUM_INSURED);
-    w.treasury.deposit_reserve(&w.org, &w.org, &SUM_INSURED);
-    w.pay_premium(policy_id, premium);
+    let d = era5_determination(&w.env, policy_id);
+    w.env.ledger().set_timestamp(d.assessed_at + 600);
+    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
+    // The view returns the digest that was signed.
+    let digest = drought_determination_digest(&w.env, &d, &w.pr_addr, &w.domain).to_bytes();
+    assert_eq!(w.pr.drought_determination_digest(&d), digest);
+    w.pr.submit_drought_determination(&w.relayer, &d, &sig, &recid);
 
+    let ob = w.adapter.get_obligation(&1).unwrap();
+    assert_eq!(ob.amount, SUM_INSURED * 4_200 / 10_000);
+    assert_eq!(ob.determination_digest, digest);
+    assert_eq!(ob.status, ObligationStatus::Owed);
+    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
+    assert_eq!(w.pr.get_report(&policy_id).damage_percentage, 4_200);
+}
+
+const PLANT_2022: u64 = 1_648_771_200; // 2022-04-01
+const ERA5_LAT: i64 = 1_016_700;
+const ERA5_LON: i64 = 35_006_200;
+
+/// The 2022 ERA5 determination (4,200 bp) for `policy_id`, assessed 117 days after planting.
+fn era5_determination(env: &Env, policy_id: u64) -> DroughtDetermination {
     // W1 31130 vs normal 27260 (satisfied); W2 16280 vs 22305: s2 = 729, d2 = 28, g2 = 42.
     let source_hash: [u8; 32] = [
         0x20, 0x7c, 0xa2, 0x6b, 0x24, 0x54, 0xf0, 0xd0, 0x8e, 0x04, 0x96, 0x2f, 0x42, 0x00, 0x8b,
         0x73, 0xba, 0x0a, 0x51, 0x74, 0x4f, 0x26, 0x73, 0xe9, 0x9a, 0x0e, 0xe9, 0xf5, 0xf5, 0x6a,
         0xf8, 0x42,
     ];
-    let assessed = PLANT_2022 + 117 * 86_400;
-    let d = DroughtDetermination {
+    DroughtDetermination {
         on_chain_policy_id: policy_id,
         damage_percent_bp: 4_200,
         drought_damage: 42,
         payout_amount: SUM_INSURED * 4_200 / 10_000,
-        assessed_at: assessed,
-        latitude_e6: LAT as i128,
-        longitude_e6: LON as i128,
+        assessed_at: PLANT_2022 + 117 * 86_400,
+        latitude_e6: ERA5_LAT as i128,
+        longitude_e6: ERA5_LON as i128,
         sum_insured: SUM_INSURED,
         season_start_epoch: PLANT_2022,
         lgp_days: 180,
@@ -1247,24 +890,119 @@ fn real_era5_season_settles_end_to_end() {
         rain_w2_e2: 16_280,
         rain_ref_w2_e2: 22_305,
         cdd_w2_days: 7,
-        source_hash: BytesN::from_array(&w.env, &source_hash),
-        methodology_params_hash: BytesN::from_array(&w.env, &DROUGHT_PARAMS_HASH_RDI_1_0),
-    };
-    w.env.ledger().set_timestamp(assessed + 600);
-    let (sig, recid) = sign(&w.env, &w.sk, &w.pr_addr, &w.domain, &d);
-    // The view returns the digest that was signed.
-    assert_eq!(
-        w.pr.drought_determination_digest(&d),
-        drought_determination_digest(&w.env, &d, &w.pr_addr, &w.domain).to_bytes()
-    );
-    w.pr.submit_drought_determination(&w.relayer, &d, &sig, &recid);
+        source_hash: BytesN::from_array(env, &source_hash),
+        methodology_params_hash: BytesN::from_array(env, &DROUGHT_PARAMS_HASH_RDI_1_0),
+    }
+}
 
-    assert_eq!(
-        w.token.balance(&w.backend_wallet),
-        SUM_INSURED * 4_200 / 10_000
+// ============ Real-WASM lane ============
+
+mod wasm {
+    //! The four optimized contracts as built by `stellar contract build` +
+    //! `stellar contract optimize` (or plain `cargo build --release --target wasm32v1-none`).
+    use std::path::PathBuf;
+
+    pub fn bytes(name: &str) -> std::vec::Vec<u8> {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/wasm32v1-none/release");
+        let optimized = dir.join(std::format!("{name}.optimized.wasm"));
+        let plain = dir.join(std::format!("{name}.wasm"));
+        let path = if optimized.exists() { optimized } else { plain };
+        std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e}. Build first: cargo build --target wasm32v1-none --release",
+                path.display()
+            )
+        })
+    }
+}
+
+/// The core flow against the compiled WASM (testing.md, "Cross-contract interactions tested
+/// against real WASM"). Ignored by default because it needs the wasm build in `target/`:
+/// `cargo build --target wasm32v1-none --release && cargo test -p microcrop-integration-tests -- --ignored`.
+#[test]
+#[ignore]
+fn wasm_lane_full_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_unlimited();
+    env.ledger().set_timestamp(PLANT_2022 + 6 * 3_600);
+    let admin = Address::generate(&env);
+    let backend = Address::generate(&env);
+    let relayer = Address::generate(&env);
+    let farmer = Address::generate(&env);
+    let org = Address::generate(&env);
+
+    let nft_wasm = wasm::bytes("microcrop_policy_nft");
+    let pm_wasm = wasm::bytes("microcrop_policy_manager");
+    let ad_wasm = wasm::bytes("microcrop_settlement_adapter");
+    let pr_wasm = wasm::bytes("microcrop_payout_receiver");
+    let nft_addr = env.register(
+        nft_wasm.as_slice(),
+        (
+            admin.clone(),
+            String::from_str(&env, "MicroCrop Policy"),
+            String::from_str(&env, "MCP"),
+        ),
     );
-    assert_eq!(w.pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
-    assert!(w.treasury.is_payout_processed(&policy_id));
-    assert_eq!(w.pr.get_report(&policy_id).damage_percentage, 4_200);
-    w.assert_solvent();
+    let pm_addr = env.register(pm_wasm.as_slice(), (admin.clone(),));
+    let ad_addr = env.register(ad_wasm.as_slice(), (admin.clone(),));
+    let pr_addr = env.register(
+        pr_wasm.as_slice(),
+        (ad_addr.clone(), pm_addr.clone(), admin.clone()),
+    );
+    let nft = PolicyNftClient::new(&env, &nft_addr);
+    let pm = PolicyManagerClient::new(&env, &pm_addr);
+    let adapter = SettlementAdapterClient::new(&env, &ad_addr);
+    let pr = PayoutReceiverClient::new(&env, &pr_addr);
+
+    pm.set_policy_nft(&admin, &nft_addr);
+    nft.set_policy_manager(&admin, &pm_addr);
+    adapter.set_payout_receiver(&admin, &pr_addr);
+    pm.grant_role(&admin, &Role::Backend, &backend);
+    nft.grant_role(&admin, &Role::Minter, &pm_addr);
+    pm.grant_role(&admin, &Role::Oracle, &pr_addr);
+    adapter.grant_role(&admin, &Role::Funder, &backend);
+    pr.grant_role(&admin, &Role::Relayer, &relayer);
+    let sk = sk_from(0x11);
+    pr.set_authorized_signer(&admin, &pubkey65(&env, &sk));
+    let domain = BytesN::from_array(&env, &[0xABu8; 32]);
+    pr.set_network_domain(&admin, &domain);
+    pr.set_methodology_enabled(&admin, &MethodologyKind::CropDroughtRdi10, &true);
+
+    let policy_id = pm.create_policy(
+        &backend,
+        &farmer,
+        &7u64,
+        &ERA5_LAT,
+        &ERA5_LON,
+        &SUM_INSURED,
+        &PREMIUM,
+        &DURATION_DAYS,
+        &CoverageType::Drought,
+        &org,
+    );
+    pm.activate_policy(
+        &backend,
+        &policy_id,
+        &Address::generate(&env),
+        &String::from_str(&env, "Acme Distributor"),
+        &String::from_str(&env, "Trans Nzoia"),
+    );
+    let d = era5_determination(&env, policy_id);
+    env.ledger().set_timestamp(d.assessed_at + 600);
+    let (sig, recid) = sign(&env, &sk, &pr_addr, &domain, &d);
+    pr.submit_drought_determination(&relayer, &d, &sig, &recid);
+
+    let ob = adapter.get_obligation(&1).unwrap();
+    assert_eq!(ob.status, ObligationStatus::Owed);
+    assert_eq!(ob.amount, SUM_INSURED * 4_200 / 10_000);
+    assert_eq!(pm.get_policy(&policy_id).status, PolicyStatus::Claimed);
+    adapter.mark_funded(&backend, &1, &reference(&env, 0xF1));
+    let ob = adapter.mark_settled(&org, &1, &reference(&env, 0x51));
+    assert_eq!(ob.status, ObligationStatus::Settled);
+    // Replay is refused by the compiled contract too.
+    assert!(pr
+        .try_submit_drought_determination(&relayer, &d, &sig, &recid)
+        .is_err());
 }
