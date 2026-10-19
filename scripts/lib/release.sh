@@ -111,5 +111,39 @@ release_verify_asset() {        # release_verify_asset <tag> <file> -> source co
   [[ "$meta" == "github:$RELEASE_REPO" ]] \
     || _rel_die "$(basename "$file"): contractmetav0 source_repo is '${meta:-<none>}', expected github:$RELEASE_REPO"
 
-  printf '%s\n' "${commit:-unknown}"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] \
+    || _rel_die "$(basename "$file"): the attestation names no source commit (sourceRepositoryDigest '${commit:-<none>}'). Do not deploy it."
+  printf '%s\n' "$commit"
+}
+
+# The commit refs/tags/<tag> points at now (annotated tags peeled).
+release_tag_commit() {          # release_tag_commit <tag> -> sha
+  local sha
+  sha="$(gh api "repos/$RELEASE_REPO/commits/refs/tags/$1" --jq .sha 2>/dev/null)" || sha=""
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || _rel_die "cannot resolve tag $1 in $RELEASE_REPO (deleted? gh auth status?)"
+  printf '%s\n' "$sha"
+}
+
+# Every asset of one release must come from ONE commit, and it must be the commit the tag
+# points at now. Each asset is attested against refs/tags/<tag>, but that does not stop a mix:
+# if a release job fails after `gh release create` and someone deletes and re-pushes the tag on
+# a different commit, the jobs whose releases survived keep the old build and only the deleted
+# ones rebuild from the new commit. Same source ref, two commits. This catches it, and a tag
+# that moved after the build.
+release_check_commits() {       # release_check_commits <tag> <commit>... -> the one commit
+  local tag="$1" first="$2" c tagsha
+  shift
+  for c in "$@"; do
+    [[ "$c" == "$first" ]] \
+      || _rel_die "release $tag mixes builds: assets were built from $first and $c. Cut a new tag; never move or re-push one."
+  done
+  if [[ "$first" == "unverified" ]]; then
+    printf '%s\n' "$first"; return 0     # dry-run test hook: nothing was verified
+  fi
+  # `|| exit 1`: _rel_die inside $(...) ends only that subshell, and callers run this one in
+  # $(...) too, where errexit is not inherited.
+  tagsha="$(release_tag_commit "$tag")" || exit 1
+  [[ "$tagsha" == "$first" ]] \
+    || _rel_die "tag $tag now points at $tagsha but its assets were built from $first: the tag moved. Do not deploy it."
+  printf '%s\n' "$first"
 }

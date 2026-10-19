@@ -104,7 +104,9 @@ has() { [[ -f "$1" ]] && grep -qiF -- "$2" "$1"; }
 view() {                        # view <contract> <fn> [--args...]
   local contract="$1" fn="$2"; shift 2
   stellar contract invoke --id "$contract" --network "$NETWORK" --source "${ADMIN_KEY:-default}" \
-      --send no -- "$fn" "$@" 2>/dev/null | tr -d '"' | tail -1
+      --send no -- "$fn" "$@" 2>/dev/null | tr -d '"' | tail -1 || true
+  # `|| true`: under pipefail a failed invoke would otherwise end the whole script at the
+  # caller's assignment instead of being counted as a failed check.
 }
 
 echo "2. Cross-contract wiring"
@@ -138,7 +140,7 @@ role_is() {                     # role_is <label> <contract> <Role> <who> <conse
     Relayer) role=4 ;; Upgrader) role=5 ;; Minter) role=6 ;; Funder) role=7 ;;
   esac
   out="$(stellar contract invoke --id "$contract" --network "$NETWORK" --source "${ADMIN_KEY:-default}" \
-          -- has_role --role "$role" --who "$who" 2>/dev/null | tr -d '"' | tail -1)"
+          -- has_role --role "$role" --who "$who" 2>/dev/null | tr -d '"' | tail -1)" || true
   case "$out" in
     true)  ok "$label" ;;
     false) bad "$label - NOT GRANTED. $why" ;;
@@ -259,6 +261,7 @@ if [[ -n "$RELEASE" ]]; then
     RELEASE_DIR="${STATE_DIR}/releases/${RELEASE}"
     ( release_download "$RELEASE" "$RELEASE_DIR" ) || true
   fi
+  rel_commits=()
   for triple in "${SEVEN[@]}"; do
     key="${triple%%:*}"; rest="${triple#*:}"; name="${rest%%:*}"; crate="${rest#*:}"
     if [[ ! -f "$TMP/hash_$name" ]]; then bad "$name: no on-chain hash to compare (see section 6)"; continue; fi
@@ -268,6 +271,7 @@ if [[ -n "$RELEASE" ]]; then
     if ! commit="$(release_verify_asset "$RELEASE" "$file" 2>/dev/null)"; then
       bad "$name: $(basename "$file") has NO valid attestation for $RELEASE. Its hash proves nothing."; continue
     fi
+    rel_commits+=("$commit")
     onchain="$(tr 'A-F' 'a-f' < "$TMP/hash_$name")"
     want="$(sha256_of "$file")"
     if [[ "$onchain" == "$want" ]]; then
@@ -280,6 +284,15 @@ if [[ -n "$RELEASE" ]]; then
       bad "$name: deploy.sh recorded $recorded, the release asset is $want"
     fi
   done
+  # One commit for all four, and the commit the tag points at now (release_check_commits).
+  # Run in a subshell: its failures are fatal there, a counted failure here.
+  if (( ${#rel_commits[@]} > 0 )); then
+    if one="$( release_check_commits "$RELEASE" "${rel_commits[@]}" 2>"$TMP/commits_err" )"; then
+      ok "all attested assets of $RELEASE were built from $one, the commit the tag points at"
+    else
+      bad "$(tr -d '\033' < "$TMP/commits_err" | sed -E 's/\[[0-9;]*m//g; s/^\[fatal\] //')"
+    fi
+  fi
 else
   echo "7. Deployed code is the local build (NO attestation: testnet only)"
   # Each instance's wasm hash must equal sha256 of the local optimized wasm deploy.sh uploaded.

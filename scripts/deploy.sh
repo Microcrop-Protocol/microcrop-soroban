@@ -168,13 +168,18 @@ if [[ -n "$RELEASE" ]]; then
     release_download "$RELEASE" "$RELEASE_DIR"
   fi
   [[ "${DRY_RUN_SKIP_ATTESTATION:-0}" == "1" ]] && RELEASE_SKIP_VERIFY=1
+  commits=()
   for pair in "${RELEASE_CONTRACTS[@]}"; do
     key="${pair%%:*}"; crate="${pair#*:}"
     file="$(release_asset "$RELEASE_DIR" "$crate")"
     commit="$(release_verify_asset "$RELEASE" "$file")"
+    commits+=("$commit")
     printf -v "WASM_${key}" '%s' "$file"
     say "$crate: $(basename "$file")  sha256 $(sha256_of "$file")  built from $commit"
   done
+  # All four from one commit, and the commit the tag points at now. Fatal otherwise.
+  REL_COMMIT="$(release_check_commits "$RELEASE" "${commits[@]}")"
+  say "release $RELEASE: all four assets built from $REL_COMMIT"
 else
   WASM_DIR="target/wasm32v1-none/release"
   for pair in policy_nft:microcrop_policy_nft policy_manager:microcrop_policy_manager \
