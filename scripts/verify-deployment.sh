@@ -5,7 +5,9 @@
 # the SettlementAdapter bound to EACH OTHER), every role granted, the signer and network
 # domain set, CROP_DROUGHT enabled and the retired CROP_DAMAGE methodology disabled, every
 # instance and code entry kept alive by the keeper (at least 23 days of TTL left), and every
-# deployed wasm hash equal to the local optimized build.
+# deployed wasm hash equal to the sha256 of the ATTESTED SEP-55 release asset (--release, or
+# the release deploy.sh recorded in the state file), or, for a local testnet build, of the
+# local optimized wasm.
 #
 # WHY THIS EXISTS. None of the wiring fails at deploy time. A missed role grant or an unbound
 # adapter produces a deployment that looks complete and is dead on the claim path — the
@@ -19,16 +21,25 @@
 # an address appeared in storage for an unrelated reason.
 #
 # Usage: ./scripts/verify-deployment.sh --network testnet
+#        ./scripts/verify-deployment.sh --network mainnet --release v0.2.0 [--release-dir <dir>]
+#
+# --release defaults to the release deploy.sh recorded in the state file. Its assets are read
+# from --release-dir, else <state-dir>/releases/<tag>/ (where deploy.sh put them), else
+# downloaded; each one's build attestation is verified before its hash is trusted.
 #
 set -euo pipefail
 
 NETWORK="testnet"
 STATE_DIR="deployments"
+RELEASE=""
+RELEASE_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --network) NETWORK="${2:?}"; shift 2 ;;
     --state-dir) STATE_DIR="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    --release) RELEASE="${2:?--release needs a tag, e.g. v0.2.0}"; shift 2 ;;
+    --release-dir) RELEASE_DIR="${2:?}"; shift 2 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -97,17 +108,23 @@ view() {                        # view <contract> <fn> [--args...]
 }
 
 echo "2. Cross-contract wiring"
-has "$TMP/pm"       "$NFT"      && ok "PolicyManager -> PolicyNft"       || bad "PolicyManager is missing its PolicyNft reference"
-has "$TMP/nft"      "$PM"       && ok "PolicyNft -> PolicyManager"       || bad "PolicyNft is missing its PolicyManager reference"
-has "$TMP/pr"       "$PM"       && ok "PayoutReceiver -> PolicyManager"  || bad "PayoutReceiver is missing its PolicyManager reference"
+check() {                       # check <ok-message> <bad-message> <command...>
+  local good="$1" fail="$2"; shift 2
+  if "$@"; then ok "$good"; else bad "$fail"; fi
+}
+check "PolicyManager -> PolicyNft"      "PolicyManager is missing its PolicyNft reference"      has "$TMP/pm"  "$NFT"
+check "PolicyNft -> PolicyManager"      "PolicyNft is missing its PolicyManager reference"      has "$TMP/nft" "$PM"
+check "PayoutReceiver -> PolicyManager" "PayoutReceiver is missing its PolicyManager reference" has "$TMP/pr"  "$PM"
 # The PayoutReceiver <-> SettlementAdapter binding, asked through the exact views. Both
 # directions must hold: an adapter that names another receiver refuses every obligation (500).
 got="$(view "$PR" settlement_adapter)"
-[[ "$got" == "$ADAPTER" ]] && ok "PayoutReceiver.settlement_adapter() == SettlementAdapter" \
-                           || bad "PayoutReceiver.settlement_adapter() is '${got:-<empty>}', expected $ADAPTER"
+check "PayoutReceiver.settlement_adapter() == SettlementAdapter" \
+      "PayoutReceiver.settlement_adapter() is '${got:-<empty>}', expected $ADAPTER" \
+      [ "$got" == "$ADAPTER" ]
 got="$(view "$ADAPTER" payout_receiver)"
-[[ "$got" == "$PR" ]] && ok "SettlementAdapter.payout_receiver() == PayoutReceiver" \
-                      || bad "SettlementAdapter.payout_receiver() is '${got:-<empty>}', expected $PR. Every determination will revert (500). Run set_payout_receiver."
+check "SettlementAdapter.payout_receiver() == PayoutReceiver" \
+      "SettlementAdapter.payout_receiver() is '${got:-<empty>}', expected $PR. Every determination will revert (500). Run set_payout_receiver." \
+      [ "$got" == "$PR" ]
 echo
 
 echo "3. Roles (the ones whose absence kills the money path)"
@@ -156,14 +173,16 @@ echo
 
 echo "4. Payout authority"
 if [[ -n "$DOMAIN" ]]; then
-  has "$TMP/pr" "$DOMAIN" && ok "network_domain set and matches state: $DOMAIN" \
-                          || bad "network_domain in state ($DOMAIN) not found on PayoutReceiver"
+  check "network_domain set and matches state: $DOMAIN" \
+        "network_domain in state ($DOMAIN) not found on PayoutReceiver" \
+        has "$TMP/pr" "$DOMAIN"
 else
   bad "no network_domain recorded in the state file"
 fi
 if [[ -n "${AUTHORIZED_SIGNER_PUBKEY:-}" ]]; then
-  has "$TMP/pr" "${AUTHORIZED_SIGNER_PUBKEY#0x}" && ok "authorized signer matches the expected PKP pubkey" \
-                                                 || bad "authorized signer does NOT match AUTHORIZED_SIGNER_PUBKEY"
+  check "authorized signer matches the expected PKP pubkey" \
+        "authorized signer does NOT match AUTHORIZED_SIGNER_PUBKEY" \
+        has "$TMP/pr" "${AUTHORIZED_SIGNER_PUBKEY#0x}"
 else
   echo "  (set AUTHORIZED_SIGNER_PUBKEY to also check the signer)"
 fi
@@ -223,24 +242,67 @@ for pair in "${CONTRACTS[@]}"; do
 done
 
 echo
-echo "7. Deployed code is the local build (stand-in for SEP-55 attestation)"
-# Each instance's wasm hash must equal sha256 of the local optimized wasm deploy.sh uploaded.
-# This proves the chain runs the bytes in target/, not that target/ came from a given commit:
-# that needs the SEP-55 release workflow (MIGRATION_NOTES §11, flag 1).
-WASM_DIR="target/wasm32v1-none/release"
-for pair in "PolicyNft:microcrop_policy_nft" "PolicyManager:microcrop_policy_manager" \
-            "SettlementAdapter:microcrop_settlement_adapter" "PayoutReceiver:microcrop_payout_receiver"; do
-  name="${pair%%:*}"; wasm="$WASM_DIR/${pair#*:}.optimized.wasm"
-  if [[ ! -f "$TMP/hash_$name" ]]; then bad "$name: no on-chain hash to compare (see section 6)"; continue; fi
-  if [[ ! -f "$wasm" ]]; then bad "$name: $wasm not found locally"; continue; fi
-  onchain="$(tr 'A-F' 'a-f' < "$TMP/hash_$name")"
-  local_hash="$(shasum -a 256 "$wasm" | cut -d' ' -f1)"
-  if [[ "$onchain" == "$local_hash" ]]; then
-    ok "$name wasm $local_hash"
-  else
-    bad "$name runs $onchain but the local build is $local_hash"
+# The expected bytes for each contract: <state key>:<display name>:<crate>.
+SEVEN=("policy_nft:PolicyNft:microcrop-policy-nft" "policy_manager:PolicyManager:microcrop-policy-manager"
+       "settlement_adapter:SettlementAdapter:microcrop-settlement-adapter"
+       "payout_receiver:PayoutReceiver:microcrop-payout-receiver")
+[[ -n "$RELEASE" ]] || RELEASE="$(get release)"
+if [[ -n "$RELEASE" ]]; then
+  echo "7. Deployed code is the attested SEP-55 release $RELEASE"
+  # Each instance's wasm hash must equal sha256 of the release asset, and that asset must carry
+  # a valid build attestation (signer workflow at a pinned digest, built from refs/tags/<tag>,
+  # this repo). Together: the chain runs bytes a GitHub workflow built from that tagged commit.
+  # shellcheck source=scripts/lib/release.sh
+  source "$(dirname "$0")/lib/release.sh"
+  release_check_tag "$RELEASE"
+  if [[ -z "$RELEASE_DIR" ]]; then
+    RELEASE_DIR="${STATE_DIR}/releases/${RELEASE}"
+    ( release_download "$RELEASE" "$RELEASE_DIR" ) || true
   fi
-done
+  for triple in "${SEVEN[@]}"; do
+    key="${triple%%:*}"; rest="${triple#*:}"; name="${rest%%:*}"; crate="${rest#*:}"
+    if [[ ! -f "$TMP/hash_$name" ]]; then bad "$name: no on-chain hash to compare (see section 6)"; continue; fi
+    if ! file="$(release_asset "$RELEASE_DIR" "$crate" 2>/dev/null)"; then
+      bad "$name: no ${crate}_v*.wasm for $RELEASE in $RELEASE_DIR"; continue
+    fi
+    if ! commit="$(release_verify_asset "$RELEASE" "$file" 2>/dev/null)"; then
+      bad "$name: $(basename "$file") has NO valid attestation for $RELEASE. Its hash proves nothing."; continue
+    fi
+    onchain="$(tr 'A-F' 'a-f' < "$TMP/hash_$name")"
+    want="$(sha256_of "$file")"
+    if [[ "$onchain" == "$want" ]]; then
+      ok "$name runs $(basename "$file") $want (attested, built from $commit)"
+    else
+      bad "$name runs $onchain but release $RELEASE's attested asset is $want"
+    fi
+    recorded="$(get "wasm_sha256_${key}")"
+    if [[ -n "$recorded" && "$recorded" != "$want" ]]; then
+      bad "$name: deploy.sh recorded $recorded, the release asset is $want"
+    fi
+  done
+else
+  echo "7. Deployed code is the local build (NO attestation: testnet only)"
+  # Each instance's wasm hash must equal sha256 of the local optimized wasm deploy.sh uploaded.
+  # This proves the chain runs the bytes in target/, not that target/ came from a given commit.
+  # A mainnet deployment is made with deploy.sh --release and checked against the release.
+  if [[ "$NETWORK" == "mainnet" ]]; then
+    bad "mainnet deployment with no release recorded: pass --release <tag>. A local-build match proves nothing on mainnet."
+  fi
+  WASM_DIR="target/wasm32v1-none/release"
+  for triple in "${SEVEN[@]}"; do
+    rest="${triple#*:}"; name="${rest%%:*}"; crate="${rest#*:}"
+    wasm="$WASM_DIR/${crate//-/_}.optimized.wasm"
+    if [[ ! -f "$TMP/hash_$name" ]]; then bad "$name: no on-chain hash to compare (see section 6)"; continue; fi
+    if [[ ! -f "$wasm" ]]; then bad "$name: $wasm not found locally"; continue; fi
+    onchain="$(tr 'A-F' 'a-f' < "$TMP/hash_$name")"
+    local_hash="$(shasum -a 256 "$wasm" | cut -d' ' -f1)"
+    if [[ "$onchain" == "$local_hash" ]]; then
+      ok "$name wasm $local_hash"
+    else
+      bad "$name runs $onchain but the local build is $local_hash"
+    fi
+  done
+fi
 
 echo
 echo "=============================================="
