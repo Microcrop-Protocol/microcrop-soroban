@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 #
-# Verify a MicroCrop Soroban deployment: every contract live, every cross-reference wired,
-# every role granted, the signer and network domain set, CROP_DROUGHT enabled and the retired
-# CROP_DAMAGE methodology disabled, and every instance and code entry kept alive by the keeper
-# (at least 23 days of TTL left).
+# Verify a MicroCrop Soroban deployment (Option B: PolicyNft, PolicyManager, SettlementAdapter,
+# PayoutReceiver): every contract live, every cross-reference wired (the PayoutReceiver and
+# the SettlementAdapter bound to EACH OTHER), every role granted, the signer and network
+# domain set, CROP_DROUGHT enabled and the retired CROP_DAMAGE methodology disabled, every
+# instance and code entry kept alive by the keeper (at least 23 days of TTL left), and every
+# deployed wasm hash equal to the local optimized build.
 #
-# WHY THIS EXISTS. None of the wiring fails at deploy time. A missed role grant produces a
-# deployment that looks complete and is dead on the money path — the backend cannot create a
-# policy, or PayoutReceiver cannot draw a payout — and you discover it on the first real
-# claim. This reads the deployed state back and says so before that happens.
+# WHY THIS EXISTS. None of the wiring fails at deploy time. A missed role grant or an unbound
+# adapter produces a deployment that looks complete and is dead on the claim path — the
+# backend cannot create a policy, PayoutReceiver cannot record an obligation, or nobody can
+# mark one settled — and you discover it on the first real claim. This reads the deployed
+# state back and says so before that happens.
 #
 # HOW IT CHECKS ROLES. Each contract exposes `has_role(role, who) -> bool` as a read-only
 # view, so role checks are EXACT: the contract is asked directly rather than its storage being
@@ -25,7 +28,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --network) NETWORK="${2:?}"; shift 2 ;;
     --state-dir) STATE_DIR="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -39,8 +42,13 @@ command -v jq      >/dev/null || { echo "jq not found" >&2; exit 1; }
 get() { jq -r --arg k "$1" '.[$k] // empty' "$STATE"; }
 
 NFT="$(get policy_nft)"; PM="$(get policy_manager)"
-TREASURY="$(get treasury)"; PR="$(get payout_receiver)"
+ADAPTER="$(get settlement_adapter)"; PR="$(get payout_receiver)"
 DOMAIN="$(get network_domain)"
+FUNDER_ADDR="${FUNDER_ADDR:-${BACKEND_ADDR:-}}"
+if [[ -n "$(get treasury)" ]]; then
+  echo "this state file belongs to a Treasury-era deployment; this script verifies Option B" >&2
+  exit 1
+fi
 
 PASS=0; FAIL=0
 ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
@@ -50,7 +58,8 @@ echo "Verifying $NETWORK deployment from $STATE"
 echo
 
 echo "1. Contracts deployed and reachable"
-for pair in "PolicyNft:$NFT" "PolicyManager:$PM" "Treasury:$TREASURY" "PayoutReceiver:$PR"; do
+CONTRACTS=("PolicyNft:$NFT" "PolicyManager:$PM" "SettlementAdapter:$ADAPTER" "PayoutReceiver:$PR")
+for pair in "${CONTRACTS[@]}"; do
   name="${pair%%:*}"; addr="${pair#*:}"
   if [[ -z "$addr" ]]; then bad "$name missing from state file"; continue; fi
   if [[ ! "$addr" =~ ^C[A-Z0-9]{55}$ ]]; then bad "$name has a malformed address: $addr"; continue; fi
@@ -76,29 +85,40 @@ dump() {
 }
 [[ -n "$NFT"      ]] && dump "$NFT"      "$TMP/nft"
 [[ -n "$PM"       ]] && dump "$PM"       "$TMP/pm"
-[[ -n "$TREASURY" ]] && dump "$TREASURY" "$TMP/treasury"
 [[ -n "$PR"       ]] && dump "$PR"       "$TMP/pr"
 
 has() { [[ -f "$1" ]] && grep -qiF -- "$2" "$1"; }
 
+# Read-only view: simulate, never submit. Prints the bare value (quotes stripped).
+view() {                        # view <contract> <fn> [--args...]
+  local contract="$1" fn="$2"; shift 2
+  stellar contract invoke --id "$contract" --network "$NETWORK" --source "${ADMIN_KEY:-default}" \
+      --send no -- "$fn" "$@" 2>/dev/null | tr -d '"' | tail -1
+}
+
 echo "2. Cross-contract wiring"
 has "$TMP/pm"       "$NFT"      && ok "PolicyManager -> PolicyNft"       || bad "PolicyManager is missing its PolicyNft reference"
 has "$TMP/nft"      "$PM"       && ok "PolicyNft -> PolicyManager"       || bad "PolicyNft is missing its PolicyManager reference"
-has "$TMP/treasury" "$PM"       && ok "Treasury -> PolicyManager"        || bad "Treasury is missing its PolicyManager reference"
-has "$TMP/treasury" "$PR"       && ok "Treasury -> PayoutReceiver"       || bad "Treasury is missing its PayoutReceiver reference"
-has "$TMP/pr"       "$TREASURY" && ok "PayoutReceiver -> Treasury"       || bad "PayoutReceiver is missing its Treasury reference"
 has "$TMP/pr"       "$PM"       && ok "PayoutReceiver -> PolicyManager"  || bad "PayoutReceiver is missing its PolicyManager reference"
+# The PayoutReceiver <-> SettlementAdapter binding, asked through the exact views. Both
+# directions must hold: an adapter that names another receiver refuses every obligation (500).
+got="$(view "$PR" settlement_adapter)"
+[[ "$got" == "$ADAPTER" ]] && ok "PayoutReceiver.settlement_adapter() == SettlementAdapter" \
+                           || bad "PayoutReceiver.settlement_adapter() is '${got:-<empty>}', expected $ADAPTER"
+got="$(view "$ADAPTER" payout_receiver)"
+[[ "$got" == "$PR" ]] && ok "SettlementAdapter.payout_receiver() == PayoutReceiver" \
+                      || bad "SettlementAdapter.payout_receiver() is '${got:-<empty>}', expected $PR. Every determination will revert (500). Run set_payout_receiver."
 echo
 
 echo "3. Roles (the ones whose absence kills the money path)"
-# Exact queries against each contract's has_role view. Three of these are held by CONTRACTS,
+# Exact queries against each contract's has_role view. Two of these are held by CONTRACTS,
 # not people - the set most often missed, and none of them fails at deploy time.
 role_is() {                     # role_is <label> <contract> <Role> <who> <consequence>
   local label="$1" contract="$2" role="$3" who="$4" why="$5" out
   # Role is a #[repr(u32)] enum: the CLI takes its number (crates/shared/src/types.rs).
   case "$role" in
-    Admin) role=0 ;; Backend) role=1 ;; Oracle) role=2 ;; Payout) role=3 ;;
-    Relayer) role=4 ;; Upgrader) role=5 ;; Minter) role=6 ;;
+    Admin) role=0 ;; Backend) role=1 ;; Oracle) role=2 ;;
+    Relayer) role=4 ;; Upgrader) role=5 ;; Minter) role=6 ;; Funder) role=7 ;;
   esac
   out="$(stellar contract invoke --id "$contract" --network "$NETWORK" --source "${ADMIN_KEY:-default}" \
           -- has_role --role "$role" --who "$who" 2>/dev/null | tr -d '"' | tail -1)"
@@ -113,14 +133,16 @@ role_is "PolicyManager holds Minter on PolicyNft"      "$NFT"      Minter  "$PM"
         "Policy activation cannot mint a certificate."
 role_is "PayoutReceiver holds Oracle on PolicyManager" "$PM"       Oracle  "$PR" \
         "Determinations cannot mark a policy claimed."
-role_is "PayoutReceiver holds Payout on Treasury"      "$TREASURY" Payout  "$PR" \
-        "NO PAYOUT CAN EVER BE DRAWN."
+if [[ -n "$FUNDER_ADDR" ]]; then
+  role_is "funder holds Funder on SettlementAdapter" "$ADAPTER" Funder "$FUNDER_ADDR" \
+          "obligations can never be marked funded/settled."
+else
+  bad "set FUNDER_ADDR (or BACKEND_ADDR) to check the Funder role on the SettlementAdapter"
+fi
 
 if [[ -n "${BACKEND_ADDR:-}" ]]; then
   role_is "backend holds Backend on PolicyManager" "$PM"       Backend "$BACKEND_ADDR" \
           "The backend cannot create policies."
-  role_is "backend holds Backend on Treasury"      "$TREASURY" Backend "$BACKEND_ADDR" \
-          "The backend cannot receive premiums."
 else
   echo "  (set BACKEND_ADDR to also check the backend's roles)"
 fi
@@ -173,7 +195,7 @@ ttl_left() {                    # ttl_left <ledger entry fetch args...> -> ledge
   stellar ledger entry fetch "$@" --network "$NETWORK" --output json 2>/dev/null \
     | jq -r '(.entries[0].liveUntilLedgerSeq // empty) as $l | if $l == "" then empty else ($l - .latestLedger) end' 2>/dev/null
 }
-for pair in "PolicyNft:$NFT" "PolicyManager:$PM" "Treasury:$TREASURY" "PayoutReceiver:$PR"; do
+for pair in "${CONTRACTS[@]}"; do
   name="${pair%%:*}"; addr="${pair#*:}"
   [[ -n "$addr" ]] || continue
   inst_json="$(stellar ledger entry fetch contract-data --contract "$addr" --instance --network "$NETWORK" --output json 2>/dev/null || true)"
@@ -189,6 +211,7 @@ for pair in "PolicyNft:$NFT" "PolicyManager:$PM" "Treasury:$TREASURY" "PayoutRec
   if [[ -z "$hash" ]]; then
     bad "$name code hash could not be read from its instance"; continue
   fi
+  echo "$hash" > "$TMP/hash_$name"
   left="$(ttl_left contract-code --wasm-hash "$hash")"
   if [[ -z "$left" ]]; then
     bad "$name code entry TTL could not be read ($hash)"
@@ -196,6 +219,26 @@ for pair in "PolicyNft:$NFT" "PolicyManager:$PM" "Treasury:$TREASURY" "PayoutRec
     ok "$name code lives $((left / 17280)) more days"
   else
     bad "$name code has only $((left / 17280)) days left (< 23). Run the keeper: extend_contract_ttl with --send=yes"
+  fi
+done
+
+echo
+echo "7. Deployed code is the local build (stand-in for SEP-55 attestation)"
+# Each instance's wasm hash must equal sha256 of the local optimized wasm deploy.sh uploaded.
+# This proves the chain runs the bytes in target/, not that target/ came from a given commit:
+# that needs the SEP-55 release workflow (MIGRATION_NOTES §11, flag 1).
+WASM_DIR="target/wasm32v1-none/release"
+for pair in "PolicyNft:microcrop_policy_nft" "PolicyManager:microcrop_policy_manager" \
+            "SettlementAdapter:microcrop_settlement_adapter" "PayoutReceiver:microcrop_payout_receiver"; do
+  name="${pair%%:*}"; wasm="$WASM_DIR/${pair#*:}.optimized.wasm"
+  if [[ ! -f "$TMP/hash_$name" ]]; then bad "$name: no on-chain hash to compare (see section 6)"; continue; fi
+  if [[ ! -f "$wasm" ]]; then bad "$name: $wasm not found locally"; continue; fi
+  onchain="$(tr 'A-F' 'a-f' < "$TMP/hash_$name")"
+  local_hash="$(shasum -a 256 "$wasm" | cut -d' ' -f1)"
+  if [[ "$onchain" == "$local_hash" ]]; then
+    ok "$name wasm $local_hash"
+  else
+    bad "$name runs $onchain but the local build is $local_hash"
   fi
 done
 
