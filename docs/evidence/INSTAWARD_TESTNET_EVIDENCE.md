@@ -1,6 +1,16 @@
 # MicroCrop on Stellar: Instaward evidence for the SettlementAdapter (Option B)
 
-Testnet run, 2026-10-19 (ledgers 5,277,185 to 5,277,356). Code: microcrop-soroban branch `feat/settlement-adapter` at `c7a4065` ([PR #8](https://github.com/Microcrop-Protocol/microcrop-soroban/pull/8), open, not merged). No contract code was changed for this run.
+Testnet run, 2026-10-19 (ledgers 5,277,185 to 5,277,356). Code: microcrop-soroban branch `feat/settlement-adapter` at `c7a4065` ([PR #8](https://github.com/Microcrop-Protocol/microcrop-soroban/pull/8), since merged into `master`). No contract code was changed for this run.
+
+## Status update, 2026-10-21
+
+What changed after the 2026-10-19 run:
+
+- **Merged.** PR #8 (SettlementAdapter) is on `master` (merge `1103732`), with PR #9 (CI and SEP-55 release workflow, `master` head `d7051b1`).
+- **Lane P now uses the production signer.** The Lane P PayoutReceiver's authorized signer was switched from the throwaway key to the Lit PKP public key (`04a2f05a…7d19`) in tx [604b61c4…](https://stellar.expert/explorer/testnet/tx/604b61c410553495945deec0c62482f2e62b102c80b1d1b2079c7b66e33791e6) (event `AuthorizedSignerUpdated`). The contract's instance storage was read back afterwards: it holds the PKP key, and the throwaway key is gone. Lane E keeps the throwaway key; it is an evidence lane only.
+- **Backend integration merged.** The backend writer, keeper and settlement-report flow for the SettlementAdapter are in microcrop-core [PR #97](https://github.com/Microcrop-Protocol/microcrop-core/pull/97) and [PR #98](https://github.com/Microcrop-Protocol/microcrop-core/pull/98) (both merged 2026-10-19). Pointing the production backend at these testnet contracts is a configuration step still to do.
+- **Verified builds.** The release workflow (`.github/workflows/release.yml`, SEP-55 via stellar-expert/soroban-build-workflow pinned at `e43b241`) is on `master`. The first release tag has not been pushed yet, so no attested release exists yet. The contracts deployed for this run were built locally at `c7a4065`, not from a release; PolicyManager's source has also changed since then. Tying on-chain wasm hashes to an attestation needs a redeploy with `scripts/deploy.sh --release <tag>`.
+- **Unchanged.** A positive determination on Lane P's own sale is still blocked by the season length (earliest about 2027-02-06).
 
 ## Summary
 
@@ -17,7 +27,7 @@ Testnet run, 2026-10-19 (ledgers 5,277,185 to 5,277,356). Code: microcrop-soroba
 |---|---|
 | network | Stellar testnet, passphrase `Test SDF Network ; September 2015` |
 | network_domain (= sha256(passphrase), set on both PayoutReceivers) | `cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472` |
-| authorized signer (both PayoutReceivers) | throwaway secp256k1 key generated for this run, SEC-1 `04487c79e2ccfb147cc5b2c9ec240959824da0d54e89cd49f52acabcec03f2f6a53361a214cbc074d4b2efcac1ca5db1caf21da047a6140cf9d0ee987306e947c2`. **Not** the Lit PKP. The secret was never committed and is held only locally. |
+| authorized signer (both PayoutReceivers, at the time of the run; Lane P switched to the Lit PKP on 2026-10-21, see the status update) | throwaway secp256k1 key generated for this run, SEC-1 `04487c79e2ccfb147cc5b2c9ec240959824da0d54e89cd49f52acabcec03f2f6a53361a214cbc074d4b2efcac1ca5db1caf21da047a6140cf9d0ee987306e947c2`. **Not** the Lit PKP. The secret was never committed and is held only locally. |
 | admin (Admin + Upgrader) | alice `GDNFTJ73BDOFY34AKX73BBJODKY5MM2CDU5ESMAKKBZWREDKFIVOSCC6` |
 | backend (Backend on PM, Funder on adapters) | `GDP3C2TQWKU7WQYQO6DELJ4C6JFGWMV3ODKNW7DZ3Z4GLCQH4RDMZNIT` |
 | relayer (Relayer on PRs) | `GAGARTIEXV4VNOIUOXIPPXYI6AGAY5UBYLUXCIBY5UJ22BJX5X2RYKAL` |
@@ -47,7 +57,7 @@ Testnet run, 2026-10-19 (ledgers 5,277,185 to 5,277,356). Code: microcrop-soroba
 
 The evidence script compared each Lane E instance's on-chain wasm hash with Lane P's and stopped if they differed. They match, so the PayoutReceiver and SettlementAdapter code that produced the positive result is byte for byte the code deployed by `deploy.sh`.
 
-**SettlementAdapter source:** [crates/settlement-adapter/src/lib.rs @ c7a4065](https://github.com/Microcrop-Protocol/microcrop-soroban/blob/c7a4065d826eeaf0821ef48dfcd3383b9ff668fe/crates/settlement-adapter/src/lib.rs) (public repo; branch [feat/settlement-adapter](https://github.com/Microcrop-Protocol/microcrop-soroban/tree/feat/settlement-adapter); PR #8 open, not merged).
+**SettlementAdapter source:** [crates/settlement-adapter/src/lib.rs @ c7a4065](https://github.com/Microcrop-Protocol/microcrop-soroban/blob/c7a4065d826eeaf0821ef48dfcd3383b9ff668fe/crates/settlement-adapter/src/lib.rs) (public repo; branch [feat/settlement-adapter](https://github.com/Microcrop-Protocol/microcrop-soroban/tree/feat/settlement-adapter); PR #8, merged).
 
 ## verify-deployment.sh (Lane P)
 
@@ -215,7 +225,7 @@ All 41 transactions succeeded (Horizon `successful: true`). Total fee_charged: *
 - The **network domain** is a 32-byte fingerprint of the testnet network (`cee0302d…d472`). Every determination is signed over it, so a testnet signature can never be replayed on mainnet.
 - The contract only accepts a determination signed with a secp256k1 key in the format the Soroban host verifies: the 65-byte SEC-1 public key, a 64-byte signature and a recovery id. The contract recovers the key itself.
 - In this run, a throwaway key in that format signed a real 2022 drought season and the contract accepted it. The contract's own digest view matched the off-chain encoder byte for byte.
-- **Separately proven, not repeated here:** the user's real Lit PKP signs a Stellar drought determination whose digest equals the live contract's `drought_determination_digest` byte for byte. This was recorded in the earlier oracle and PR #7 work (`crop-drought-rdi-1.0` with `chain:'stellar'`, 2026-10-19). This run deliberately did not use the PKP, so the production signer was never configured on or exposed to an evidence contract.
+- **Separately proven, not repeated here:** the user's real Lit PKP signs a Stellar drought determination whose digest equals the live contract's `drought_determination_digest` byte for byte. This was recorded in the earlier oracle and PR #7 work (`crop-drought-rdi-1.0` with `chain:'stellar'`, 2026-10-19). This run deliberately did not use the PKP, so the production signer was never configured on or exposed to an evidence contract. On 2026-10-21 the Lane P PayoutReceiver (the production stack, not the evidence lane) was switched to the PKP; see the status update.
 
 **Deliverable 2: the SettlementAdapter.**
 - **Address:** Lane P [CAAVFAC6ML3ZR5DZHQUKKG5WEJJ7PANQ2XHZJ3PXP3AMBZVWUCEQVCV3](https://stellar.expert/explorer/testnet/contract/CAAVFAC6ML3ZR5DZHQUKKG5WEJJ7PANQ2XHZJ3PXP3AMBZVWUCEQVCV3). It is the same code as Lane E's [CDBDMGQ62OSIQBPQKCDGS3DGG5Z5EBWN6O2UPWSL25GUJ4D4CX7KXRHQ](https://stellar.expert/explorer/testnet/contract/CDBDMGQ62OSIQBPQKCDGS3DGG5Z5EBWN6O2UPWSL25GUJ4D4CX7KXRHQ), which holds the settled obligation.
@@ -241,15 +251,15 @@ The sale and the payout determination are on two different PolicyManagers, for t
 2. **The org signing `mark_funded` / `mark_settled`.**
    - This is no longer allowed by the code (review fix `70af932`, Funder-only marks). Backend-onboarded org addresses are also keyless (sha256-derived), so they could never sign anyway.
    - The org's attempt is shown failing with #1, and the Funder made both marks.
-3. **The Lit PKP signing for these contracts.** It was deliberately not used (throwaway key only). Its digest compatibility is the separately proven fact cited under Deliverable 1, not re-run here.
+3. **The Lit PKP signing for these contracts.** It was deliberately not used in this run (throwaway key only). Its digest compatibility is the separately proven fact cited under Deliverable 1, not re-run here. Since 2026-10-21 Lane P's PayoutReceiver accepts only the PKP, but no PKP-signed determination has been submitted to it yet: its sale cannot be assessed before the season ends.
 4. **A real M-Pesa receipt behind `mark_settled`.**
    - The reference hashes here are sha256 of evidence labels, not of a real payout.
    - "Settled" is an attestation by the Funder; the chain cannot prove the off-chain payment happened.
-5. **Backend integration (spec §8).** Built in [microcrop-core PR #97](https://github.com/Microcrop-Protocol/microcrop-core/pull/97) (open, not merged), but not used for this run: the CLI drove these transactions, not a backend job.
+5. **Backend integration (spec §8).** Built in [microcrop-core PR #97](https://github.com/Microcrop-Protocol/microcrop-core/pull/97) and [PR #98](https://github.com/Microcrop-Protocol/microcrop-core/pull/98) (both merged 2026-10-19), but not used for this run: the CLI drove these transactions, not a backend job.
 6. **The host-side refusal of a forged PayoutReceiver authorization.**
    - On testnet the CLI cannot even build that transaction, because no key exists for a contract address.
    - The host's own refusal is proven only in the unit test `record_needs_the_receivers_own_authorization`.
-7. **SEP-55 build attestation.** None exists (no CI). The wasm-hash equality in verify section 7 is a stand-in: it ties the deployment to a local build at `c7a4065`, not to a published release artifact.
+7. **SEP-55 build attestation.** None existed at the time of the run. The release workflow has since been merged (PR #9), but no release has been tagged yet, and these deployments were built locally. The wasm-hash equality in verify section 7 is a stand-in: it ties the deployment to a local build at `c7a4065`, not to a published release artifact.
 
 ## Bug found while running (script only, not contract code)
 
