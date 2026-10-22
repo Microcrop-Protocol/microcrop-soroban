@@ -403,10 +403,10 @@ stellar contract invoke --id "$ADAPTER" --network testnet --send no \
   -- get_obligation --obligation_id <obligation id>
 ```
 
-**Funding and settlement are attestations.** The backend (Funder) marks the obligation when
-its mobile-money off-ramp accepts the order (`mark_funded`) and when the M-Pesa receipt
-arrives (`mark_settled`), each with a 32-byte reference hash of the off-chain record (never a
-phone number or name). `Owed → Settled` directly is allowed. Repeating a mark with the same
+**Funding and settlement are attestations.** The partner pays the farmer off-platform and
+files a settlement report; the backend (Funder) then marks the obligation, `mark_funded` for a
+partial settlement and `mark_settled` for a full one, each with a 32-byte reference hash
+identifying that report (never a phone number or name). `Owed → Settled` directly is allowed. Repeating a mark with the same
 reference is a no-op (webhooks arrive twice); a different reference is refused (504 / 505);
 an all-zero reference is refused (506); anyone without `Role::Funder`, the obligation's own
 org included, is refused (1).
@@ -557,7 +557,8 @@ re-geocoded after sale and the signer reads the new values, every determination 
 policy reverts `PlotLocationMismatch`.
 
 **Premiums are off-chain.** There is no `receive_premium`: no contract takes custody of a
-premium. The premium proof is the M-Pesa reference held by the backend.
+premium. On Stellar the partner collects the premium off-platform and attests it at
+activation; the proof is the partner's own reference, held by the backend.
 
 **Signer rule: one determination per policy per window.** Two determinations signed for the
 same policy are both valid for an hour, and whichever is submitted first settles it. The
