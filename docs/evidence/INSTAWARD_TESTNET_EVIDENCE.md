@@ -1,297 +1,234 @@
-# MicroCrop on Stellar: Instaward evidence for the SettlementAdapter (Option B)
+# MicroCrop on Stellar: Instaward testnet evidence
 
-Testnet run, 2026-10-19 (ledgers 5,277,185 to 5,277,356). Code: microcrop-soroban branch `feat/settlement-adapter` at `c7a4065` ([PR #8](https://github.com/Microcrop-Protocol/microcrop-soroban/pull/8), since merged into `master`). No contract code was changed for this run.
+Testnet run of 2026-10-22, on contracts deployed from release `v0.1.0`.
 
-## Status update, 2026-10-21
-
-What changed after the 2026-10-19 run:
-
-- **Merged.** PR #8 (SettlementAdapter) is on `master` (merge `1103732`), with PR #9 (CI and SEP-55 release workflow, `master` head `d7051b1`).
-- **Lane P now uses the production signer.** The Lane P PayoutReceiver's authorized signer was switched from the throwaway key to the Lit PKP public key (`04a2f05a…7d19`) in tx [604b61c4…](https://stellar.expert/explorer/testnet/tx/604b61c410553495945deec0c62482f2e62b102c80b1d1b2079c7b66e33791e6) (event `AuthorizedSignerUpdated`). The contract's instance storage was read back afterwards: it holds the PKP key, and the throwaway key is gone. Lane E keeps the throwaway key; it is an evidence lane only.
-- **Backend integration merged.** The backend writer, keeper and settlement-report flow for the SettlementAdapter are in microcrop-core [PR #97](https://github.com/Microcrop-Protocol/microcrop-core/pull/97) and [PR #98](https://github.com/Microcrop-Protocol/microcrop-core/pull/98) (both merged 2026-10-19). Pointing the production backend at these testnet contracts is a configuration step still to do.
-- **Verified builds.** The release workflow (`.github/workflows/release.yml`, SEP-55 via stellar-expert/soroban-build-workflow pinned at `e43b241`) is on `master`. The first release tag has not been pushed yet, so no attested release exists yet. The contracts deployed for this run were built locally at `c7a4065`, not from a release; PolicyManager's source has also changed since then. Tying on-chain wasm hashes to an attestation needs a redeploy with `scripts/deploy.sh --release <tag>`.
-- **Unchanged.** A positive determination on Lane P's own sale is still blocked by the season length (earliest about 2027-02-06).
+This replaces the write-up of the 2026-10-19 run. That run used a local build on contracts that have since been retired. Its version of this file is in the git history at `0a7d187`.
 
 ## Summary
 
-- **Deployed:** a fresh four-contract Option B stack (PolicyNft, PolicyManager, SettlementAdapter, PayoutReceiver) with the branch's own `deploy.sh`. `verify-deployment.sh` passed **30 of 30** checks, including the signer and the check that each deployed wasm hash equals the local build.
-- **End to end, verified on-chain:** a signed drought determination was checked by the PayoutReceiver (secp256k1 recovery, network domain, digest). It recorded obligation #1 in the SettlementAdapter as **Owed**. The Funder then marked it **Funded** and then **Settled**, each with a reference hash. Every step has a tx hash, a Horizon `fee_charged` and an event.
-- **No custody:** all three SettlementAdapters hold **0 USDC and 0 XLM**. The adapter wasm imports **no** contract-call host function at all, so it cannot move a token.
-- **Negative cases:** a caller that is not the PayoutReceiver gets **#500**. A caller without the Funder role gets **#1** when it tries to mark an obligation settled; that includes the org that owes the obligation. Replays get **#308/#310**, also after an adapter swap. A zero reference gets **#506**, and an adapter bound to another PayoutReceiver gets **#328**.
-- **What could not be shown:** a positive determination against the **real** PolicyManager's own sale. It is blocked by ledger time (at least 110 days). That sale was made on-chain and its determination correctly stops at **#327 SeasonNotComplete**. The positive run therefore used an evidence lane: the same adapter and PayoutReceiver code (identical wasm hashes), wired to a testnet-only fixture that injects the policy. Details are in "What was not shown" below.
-- **Org-signed marks, on purpose not shown:** the task asked for `mark_funded` / `mark_settled` by the org. Review fix `70af932` on this branch made both marks **Funder-only**, so the org is refused with #1. The run proves that refusal and has the Funder (the backend account) make both marks.
+- The four contracts (PolicyNft, PolicyManager, SettlementAdapter, PayoutReceiver) were deployed by `scripts/deploy.sh --release v0.1.0`. Before deploying, the script checked the GitHub build attestation on each release asset. `scripts/verify-deployment.sh` then passed 31 of 31 checks. One of those checks confirms that the code running on-chain is the attested release, built from `d7051b1`.
+- The live PayoutReceiver accepts determinations only from the Lit PKP. That signer was set at deploy time and is confirmed by verify-deployment.
+- A real policy was sold and activated on the live PolicyManager. Its determination is refused with #327 (season not complete), as it should be: a drought season takes 110 days and the policy is a day old.
+- The full payout path ran on a second set of contracts, using the same release code, with a test signer and the real 2022 long-rains season. The PayoutReceiver verified the signed determination and recorded an obligation of 420 USDC as Owed. The Funder then marked it Funded and then Settled.
+- Every refusal case behaved as expected: the insurer marking its own payout settled, an account with no role, a zero reference, three kinds of replay, and an adapter bound to another PayoutReceiver.
+- No contract holds money. All three SettlementAdapters have 0 USDC and 0 XLM, and the adapter code has no way to call a token contract.
 
-## Network
+## Release and network
 
 | item | value |
 |---|---|
+| release | `v0.1.0`, built by the SEP-55 release workflow from commit [`d7051b1`](https://github.com/Microcrop-Protocol/microcrop-soroban/commit/d7051b195ef1ead3feadebec97b09fb9b1ec391c) |
 | network | Stellar testnet, passphrase `Test SDF Network ; September 2015` |
-| network_domain (= sha256(passphrase), set on both PayoutReceivers) | `cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472` |
-| authorized signer (both PayoutReceivers, at the time of the run; Lane P switched to the Lit PKP on 2026-10-21, see the status update) | throwaway secp256k1 key generated for this run, SEC-1 `04487c79e2ccfb147cc5b2c9ec240959824da0d54e89cd49f52acabcec03f2f6a53361a214cbc074d4b2efcac1ca5db1caf21da047a6140cf9d0ee987306e947c2`. **Not** the Lit PKP. The secret was never committed and is held only locally. |
-| admin (Admin + Upgrader) | alice `GDNFTJ73BDOFY34AKX73BBJODKY5MM2CDU5ESMAKKBZWREDKFIVOSCC6` |
-| backend (Backend on PM, Funder on adapters) | `GDP3C2TQWKU7WQYQO6DELJ4C6JFGWMV3ODKNW7DZ3Z4GLCQH4RDMZNIT` |
-| relayer (Relayer on PRs) | `GAGARTIEXV4VNOIUOXIPPXYI6AGAY5UBYLUXCIBY5UJ22BJX5X2RYKAL` |
-| org | `GD5LFJHPQEDLC6MYMEMSJ24BQHF3VQOPVTQKSL4LNM3PQHZ56JU6RXRZ` |
-| farmer | `GAJWHHOVOWFHQ5WZBOYX3IXJUEWOW7BI3E4FLDM7OTCYPHPHXLXYA2WC` |
-| stranger (no role) | `GB2IKBYDOKIVO4FBUYBXO2GJUMF7JEHJBNY5P7HPQXJTKU2H7CX2QIW5` |
+| network_domain | `cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472` (sha256 of the passphrase). Every determination is signed over it, so a testnet signature cannot be replayed on mainnet. |
+| live signer | Lit PKP, SEC-1 public key `04a2f05aa5a0b831473d4885f175044d74ff99b637ab0344d8a8f815a94d8d54079e7ffea716040c74888cabe6ecbeb8532fea7f0b8c8fb038e840c7309b977d19` |
+| test signer (second set only) | secp256k1 key generated for this run, public key `04ca9daf8d32fbe2dd0cdffcabba07028e9d7be960ea600ab7965c8495754536ee8fc7cd145e4767907b172dfaef7809b35fa28725156a974b6d67df3df216d796`. The secret was never committed. |
+
+| account | role | address |
+|---|---|---|
+| alice | Admin and Upgrader on every contract | `GDNFTJ73BDOFY34AKX73BBJODKY5MM2CDU5ESMAKKBZWREDKFIVOSCC6` |
+| backend | Backend on PolicyManager, Funder on the SettlementAdapters | `GDP3C2TQWKU7WQYQO6DELJ4C6JFGWMV3ODKNW7DZ3Z4GLCQH4RDMZNIT` |
+| relayer | Relayer on the PayoutReceivers | `GAGARTIEXV4VNOIUOXIPPXYI6AGAY5UBYLUXCIBY5UJ22BJX5X2RYKAL` |
+| evidence-org | the insurer that owes the obligation | `GCSZGTZDT6RYO45ARDUJSHUWWFA5VD33V72TXAAGCZXZ3TYGCA7TGTIF` |
+| evidence-farmer | the insured farmer | `GA77BEOQ26IA6Z5CPQL7G2BSYI7Y3SRIONSJBEAARN7KOD3NRW7M7WDG` |
+| evidence-stranger | no role | `GB2IKBYDOKIVO4FBUYBXO2GJUMF7JEHJBNY5P7HPQXJTKU2H7CX2QIW5` |
 
 ## Contracts
 
-### Lane P: the production stack, deployed by `scripts/deploy.sh`
+### The live deployment
 
-| contract | address | wasm hash (sha256 of the local `.optimized.wasm`, checked on-chain) |
+| contract | address | wasm sha256 (equals the release asset) |
 |---|---|---|
-| PolicyNft | [CC47Y7HULIONSTJQP22GODU7FPPFN34RQQBIYKB4IYWCCDBFJ3AMCJYM](https://stellar.expert/explorer/testnet/contract/CC47Y7HULIONSTJQP22GODU7FPPFN34RQQBIYKB4IYWCCDBFJ3AMCJYM) | `1cd911a4be28ec43ec4a46d9b04948f4c70d01d346b745e5f051650c7b61dc8a` |
-| PolicyManager | [CBS4N27ZWRAFPQAXW6PLUT4I3HRREZSAPUK7UCPZJG7UFGJO5Q556UCM](https://stellar.expert/explorer/testnet/contract/CBS4N27ZWRAFPQAXW6PLUT4I3HRREZSAPUK7UCPZJG7UFGJO5Q556UCM) | `e714a4224639d9dfab2ee6887ca04c3b6d62352f73563a72cc3f3affd01761e9` |
-| **SettlementAdapter** | [CAAVFAC6ML3ZR5DZHQUKKG5WEJJ7PANQ2XHZJ3PXP3AMBZVWUCEQVCV3](https://stellar.expert/explorer/testnet/contract/CAAVFAC6ML3ZR5DZHQUKKG5WEJJ7PANQ2XHZJ3PXP3AMBZVWUCEQVCV3) | `5e7d155e5ef7d9fe3c5fa822cc84ec939e937dac757cf594c0df0836bd738fc8` |
-| PayoutReceiver | [CBA54XPGIFXOWGVO27LZ6VMGTVRCKVP7I7JJMA5AMRG2WSPXOGSSSIBL](https://stellar.expert/explorer/testnet/contract/CBA54XPGIFXOWGVO27LZ6VMGTVRCKVP7I7JJMA5AMRG2WSPXOGSSSIBL) | `3339369994e0db08498b73c1f542c43adc38143a6025a66d7ef38fc4ea9cb947` |
+| PolicyNft | [CB6FEFIXBDID45GVVCDWMLNKFBIWIJEDVFPIUJDAMRIISYWEA5FQ3HV4](https://stellar.expert/explorer/testnet/contract/CB6FEFIXBDID45GVVCDWMLNKFBIWIJEDVFPIUJDAMRIISYWEA5FQ3HV4) | `cfe38b89800f261ad9c69d9070dc0f3cb8f8d9f5e2984126b6b00aa6b7ba863a` |
+| PolicyManager | [CDGQWA6QC2BRR5HHFJVNWAY4C34WXH7BCUFGHRDB4KT4WDMVUMDGDBSR](https://stellar.expert/explorer/testnet/contract/CDGQWA6QC2BRR5HHFJVNWAY4C34WXH7BCUFGHRDB4KT4WDMVUMDGDBSR) | `4845cfc0c6fa826ff31ffda18fbde4ac966a9a22993d83c79f856269423187b0` |
+| SettlementAdapter | [CCAALDRQWXFAIOS7NMYCGJL2QKKTIKSJSX5DXFDTMIJWHV5FMGKOKQF5](https://stellar.expert/explorer/testnet/contract/CCAALDRQWXFAIOS7NMYCGJL2QKKTIKSJSX5DXFDTMIJWHV5FMGKOKQF5) | `007a5a387bbee9fa45e2f57cd7fcba97621444715efdb2122700d3b9c5883a79` |
+| PayoutReceiver | [CCBWJMQM42WA6AWYEBAJCP6JCJBDPB7TBWAAEEECIN4OOTZGRAELBVX3](https://stellar.expert/explorer/testnet/contract/CCBWJMQM42WA6AWYEBAJCP6JCJBDPB7TBWAAEEECIN4OOTZGRAELBVX3) | `4bd87149801feec7941967d10bc49969fb9cf9f865fa0a3fd831a42c34ebbe0c` |
 
-### Lane E: the evidence lane (same SettlementAdapter and PayoutReceiver wasm)
+Source for the adapter: [crates/settlement-adapter/src/lib.rs at d7051b1](https://github.com/Microcrop-Protocol/microcrop-soroban/blob/d7051b195ef1ead3feadebec97b09fb9b1ec391c/crates/settlement-adapter/src/lib.rs).
 
-| contract | address | wasm hash |
+### The second set, used for the payout path
+
+| contract | address | wasm sha256 |
 |---|---|---|
-| TestnetPolicyFixture (injects policy state; not a sale; refuses mainnet in its constructor) | [CBKNNOLB6AFZH5MHIM5WK2U5TMZ3ZIXQVE6S36ABNAYAIM5CPKFITWXC](https://stellar.expert/explorer/testnet/contract/CBKNNOLB6AFZH5MHIM5WK2U5TMZ3ZIXQVE6S36ABNAYAIM5CPKFITWXC) | fixture build |
-| **SettlementAdapter-E** (holds obligation #1) | [CDBDMGQ62OSIQBPQKCDGS3DGG5Z5EBWN6O2UPWSL25GUJ4D4CX7KXRHQ](https://stellar.expert/explorer/testnet/contract/CDBDMGQ62OSIQBPQKCDGS3DGG5Z5EBWN6O2UPWSL25GUJ4D4CX7KXRHQ) | `5e7d155e…38fc8` (= Lane P) |
-| PayoutReceiver-E | [CA6DG3W2QTJGIDQVJWK6U7LWGURUNOGUTTUM6E3FHOHXZ4MOTF5DJD2H](https://stellar.expert/explorer/testnet/contract/CA6DG3W2QTJGIDQVJWK6U7LWGURUNOGUTTUM6E3FHOHXZ4MOTF5DJD2H) | `33393699…cb947` (= Lane P) |
-| SettlementAdapter-E2 (target of the adapter swap test) | [CA4EUGBZNP5PZD3HKN25YSR2J6FFVIMNSCGZK32DINKHF2N4TYCROZWR](https://stellar.expert/explorer/testnet/contract/CA4EUGBZNP5PZD3HKN25YSR2J6FFVIMNSCGZK32DINKHF2N4TYCROZWR) | `5e7d155e…38fc8` |
+| TestnetPolicyFixture | [CAOE45YNHTQJFOWV7GJ5ONDZJHGZX7NEE3JLDYTL47JCYXSCXTGJJJPQ](https://stellar.expert/explorer/testnet/contract/CAOE45YNHTQJFOWV7GJ5ONDZJHGZX7NEE3JLDYTL47JCYXSCXTGJJJPQ) | test-only build. It stands in for the PolicyManager, lets the admin write a policy directly, and refuses to deploy on mainnet. |
+| SettlementAdapter-E | [CANZ3JHL2P5HKBZ44GFZE55ECTFH77XTLDEONLCWQMWBRLRLTDPHTMD2](https://stellar.expert/explorer/testnet/contract/CANZ3JHL2P5HKBZ44GFZE55ECTFH77XTLDEONLCWQMWBRLRLTDPHTMD2) | `007a5a38…3a79`, same as live |
+| PayoutReceiver-E | [CDPXZQLGNJ25O6SUEYT65RE6BCHNQTSYNT6SLHTDOZJKTO24DJFWCWC4](https://stellar.expert/explorer/testnet/contract/CDPXZQLGNJ25O6SUEYT65RE6BCHNQTSYNT6SLHTDOZJKTO24DJFWCWC4) | `4bd87149…be0c`, same as live |
+| SettlementAdapter-E2 (used for the adapter swap test) | [CBRINQ3QBXTHPPVEVKRQREUZOSTGKO6T6DLDP4TRXAUYLLJ3SJQY4AVE](https://stellar.expert/explorer/testnet/contract/CBRINQ3QBXTHPPVEVKRQREUZOSTGKO6T6DLDP4TRXAUYLLJ3SJQY4AVE) | `007a5a38…3a79`, same as live |
 
-The evidence script compared each Lane E instance's on-chain wasm hash with Lane P's and stopped if they differed. They match, so the PayoutReceiver and SettlementAdapter code that produced the positive result is byte for byte the code deployed by `deploy.sh`.
+`scripts/testnet-evidence.sh` reads the wasm hash of each contract in this set from the chain and stops if it differs from the live one. It did not stop, so the payout path below ran on exactly the code that is deployed live.
 
-**SettlementAdapter source:** [crates/settlement-adapter/src/lib.rs @ c7a4065](https://github.com/Microcrop-Protocol/microcrop-soroban/blob/c7a4065d826eeaf0821ef48dfcd3383b9ff668fe/crates/settlement-adapter/src/lib.rs) (public repo; branch [feat/settlement-adapter](https://github.com/Microcrop-Protocol/microcrop-soroban/tree/feat/settlement-adapter); PR #8, merged).
+## Deployment check
 
-## verify-deployment.sh (Lane P)
+`scripts/verify-deployment.sh --release v0.1.0` result: `passed: 31   failed: 0`. It checks:
 
-`passed: 30   failed: 0 — Deployment verified.` It checked:
-- the four contracts are live;
-- PR→PM, PM↔NFT, `PR.settlement_adapter() == Adapter` and `Adapter.payout_receiver() == PR`;
-- Minter, Oracle, Funder, Backend and Relayer roles;
-- the signer matches the throwaway pubkey, and the network domain matches;
-- drought enabled, crop disabled;
-- every instance and code entry has more than 23 days of TTL (29 d);
-- each deployed wasm hash equals the local optimized build.
+1. All four contracts are live.
+2. The wiring runs in both directions: PolicyManager and PolicyNft point at each other, the PayoutReceiver points at the PolicyManager, and the PayoutReceiver and SettlementAdapter are bound to each other.
+3. The roles the payout path needs are in place: Minter, Oracle, Funder, Backend, Relayer.
+4. The authorized signer is the Lit PKP and the network_domain is correct.
+5. The drought methodology is enabled and the retired crop-damage one is disabled.
+6. Every contract instance and code entry has at least 23 days of TTL left (29 at the time of the check).
+7. Each deployed wasm hash equals its attested release asset, and all four assets were built from the commit the tag points to.
 
-Full log: `deploy-v3/verify.log`.
+## The flow
 
-## End-to-end flow
-
-### Lane P: real sale on the real PolicyManager
+### Sale on the live PolicyManager
 
 | step | result | tx |
 |---|---|---|
-| `create_policy` (backend; Drought, 150 d, SI 1,000 USDC, plot 1.0167 N / 35.0062 E, org = org) | policy id 1. Event `PolicyCreated`. No premium on-chain. | [37f622bb…](https://stellar.expert/explorer/testnet/tx/37f622bbe7cb679fab551a96310ec3444a66a02d3ccc98986cb30faaa41e7f72) |
-| `activate_policy` (backend) | Events `PolicyNftMinted` (token 1) and `PolicyActivated`. Policy status 1 (Active). | [e3fa3cff…](https://stellar.expert/explorer/testnet/tx/e3fa3cff0395f2b01eedcd8d80afd937ca1a4a6ac1d1d03f63170f63c3c63e51) |
-| `submit_drought_determination` (relayer, season start = today) | refused **#327 SeasonNotComplete** (simulation; nothing submitted). #327 fires before signature recovery, so validation steps 1-11 ran on the live stack. | log `evidence/logs/p_submit_season_not_complete.log` |
-| afterwards | `Adapter.obligation_count() = 0`, `PR.is_policy_paid(1) = false`, policy still Active | view calls |
+| `create_policy` by backend: drought, 150 days, 1,000 USDC sum insured, plot at 1.0167 N 35.0062 E | policy 1 created. No premium moves on-chain. | [a735c342…](https://stellar.expert/explorer/testnet/tx/a735c342214893a2fbed937e91c3467fa00beb9f014af35fa21c45a71a46fef0) |
+| `activate_policy` by backend | NFT minted, policy Active | [8db8e257…](https://stellar.expert/explorer/testnet/tx/8db8e2576a31672b529c5c83cc1dc60a7a7b83e27444017a52b9c027bef32e09) |
+| `submit_drought_determination` by relayer | refused with #327 SeasonNotComplete. This check runs before signature recovery, so it fires even though the test signer is not the PKP. | simulated only, no tx |
+| afterwards | the live adapter's `obligation_count` is 0 | view call |
 
-### Lane E: signed determination → obligation Owed → Funded → Settled
+### Determination, then Owed, Funded and Settled
 
-The fixture policy is id 1: Drought, Active, org = org, farmer = farmer, plot 1.016700 / 35.006200, SI 1,000 USDC, starting 2022-04-01. The determination is the real 2022 ERA5 long-rains season (W1 31130/27260, W2 16280/22305, CDD 7, 4200 bp, season start 1648771200). The throwaway key signed it over PayoutReceiver-E's address and the network domain.
+The policy is written into the fixture as policy 1: drought, Active, owed by evidence-org, farmer evidence-farmer, same plot and sum insured as the live sale, cover starting 2022-04-01. The determination is the real 2022 long-rains season for that plot from ERA5 data. The test key signed it over PayoutReceiver-E's address and the network_domain.
 
-1. **Digest agreement.** `PR-E.drought_determination_digest(d)` (a view) equalled the local encoder's digest, `472c1677390f5d83c71b023ab7485b863b300d158e13c1283dadaf416ebd44ae`, before submission.
-2. **`submit_drought_determination`** (relayer): [f9b26492…](https://stellar.expert/explorer/testnet/tx/f9b264928429b780e68a4bedd24adb796925f0b5b25496e683fd93981f32e06b), ledger 5,277,317, fee_charged 13,833,269 stroops. One atomic transaction emitted:
-   - PR-E `DroughtEvidenceRecorded{policy_id:1, drought_damage:42, season_start_epoch:1648771200, source_hash:207ca26b…f842}`
-   - **Adapter-E `ObligationRecorded{obligation_id:1, policy_id:1, org:GD5L…RXRZ, payout_receiver:CA6D…JD2H, amount:4200000000, determination_digest:472c1677…44ae}`**, i.e. `record_obligation` called by the PayoutReceiver contract
-   - PR-E `DeterminationVerified{policy_id:1, preimage_hash:472c1677…44ae}`
-   - PR-E `DamageReportReceived{policy_id:1, farmer, damage_percentage:4200, payout_amount:4200000000}`
-   - PR-E `ObligationRequested{policy_id:1, obligation_id:1, adapter:CDBD…XRHQ, amount:4200000000}`
-   - The fixture policy moved to Claimed (4).
+1. Before submitting, the contract's own `drought_determination_digest` view was called. It returned `8713e294019282f8cbe80ebaf0f09ebcdecc82c68132b701caba77e9570b8280`, the same digest the off-chain encoder produced.
+2. `submit_drought_determination` by relayer: [5d431d91…](https://stellar.expert/explorer/testnet/tx/5d431d918de7b13c3e2be0fb9d7447b6a5168955c5a49afce584d511af39734d), ledger 5,326,528. In one transaction it emitted:
+   - `DroughtEvidenceRecorded`: policy 1, damage 42%, season start 1648771200, source hash `207ca26b…f842`
+   - `ObligationRecorded` on SettlementAdapter-E: obligation 1, amount 4,200,000,000 (420 USDC at 7 decimals, 42% of the sum insured), org evidence-org, with the determination digest above
+   - `DeterminationVerified`, `DamageReportReceived` and `ObligationRequested` on PayoutReceiver-E
 
-   `get_obligation(1)` afterwards: `status:0 (Owed)`, amount 4,200,000,000 (420 USDC at 7 dp, 42% of SI), and the digest equals the PR's preimage hash.
-3. **`mark_funded(1, sha256("microcrop:evidence:funding:v1:2026-10-19"))`** by backend (Funder): [207b90ef…](https://stellar.expert/explorer/testnet/tx/207b90efcdbe0d0567e9dec85f8fb4660e06abe5461afd5477b71aa10241e24f), ledger 5,277,334, fee 534,770. Event `ObligationFunded{by: backend, reference_hash: e95e6915…ad00}`.
-4. **`mark_settled(1, sha256("microcrop:evidence:settlement:v1:2026-10-19"))`** by backend (Funder): [2975028c…](https://stellar.expert/explorer/testnet/tx/2975028c7078b8864ecbfb80e0a8c021898ff48667270aa0c964d369d3bbedcb), ledger 5,277,339, fee 535,078. Event `ObligationSettled{by: backend, reference_hash: 60225691…833e, amount: 4200000000}`.
+   The policy moved to Claimed, and `get_obligation(1)` returned status Owed.
+3. `mark_funded` by backend (Funder): [2a0e2b7f…](https://stellar.expert/explorer/testnet/tx/2a0e2b7f46068af3f30feab9f95c16c1e00edd17271c18f73ff19c7e95059be7), ledger 5,326,532. Event `ObligationFunded`, reference hash `e7e882f2…5a7d`.
+4. `mark_settled` by backend (Funder): [899d7cd8…](https://stellar.expert/explorer/testnet/tx/899d7cd89fc7ef741d188c367007b86cfaba576089c34588ea56ccf1435d2541), ledger 5,326,534. Event `ObligationSettled`, reference hash `0c913e42…30fe`.
 
-   Final `get_obligation(1)`:
-   ```
-   {id:1, status:2 (Settled), amount:4200000000, org:GD5LFJHPQEDLC6MYMEMSJ24BQHF3VQOPVTQKSL4LNM3PQHZ56JU6RXRZ,
-    payout_receiver:CA6DG3W2QTJGIDQVJWK6U7LWGURUNOGUTTUM6E3FHOHXZ4MOTF5DJD2H, policy_id:1, org_index:0,
-    determination_digest:472c1677390f5d83c71b023ab7485b863b300d158e13c1283dadaf416ebd44ae, recorded_at:1792410172,
-    funded_by:GDP3C2…ZNIT, funded_at:1792410257, funding_reference:e95e691595679e2d3574003467b2c4715c6c8922d14ba849039007a07a0bad00,
-    settled_by:GDP3C2…ZNIT, settled_at:1792410282, settlement_reference:60225691d7df79012e0a90fd59a70014bd954c0ba1145c027e52294c6a57833e}
-   ```
-5. **Adapter swap.** `PR-E.set_settlement_adapter(Adapter-E2)`: [ad67a36e…](https://stellar.expert/explorer/testnet/tx/ad67a36e0b99365dfa3e31e3663d53c2741f4d9b7d6636577910f15d45f69208), event `SettlementAdapterUpdated{previous: CDBD…XRHQ, adapter: CA4E…OZWR}`. It succeeded only after Adapter-E2 was bound back to PR-E ([5d29aa7f…](https://stellar.expert/explorer/testnet/tx/5d29aa7f2a6b851ea0b559dab0cc1e8a107edafa1e31049a7a9b6d75ab50b1cf)).
+The obligation as stored at the end:
 
-Event dumps (RPC `getEvents`): `deploy-v3/events-e.json` and `deploy-v3/events-p.json`.
+```
+{id:1, status:2 (Settled), policy_id:1, amount:4200000000,
+ org:GCSZGTZDT6RYO45ARDUJSHUWWFA5VD33V72TXAAGCZXZ3TYGCA7TGTIF,
+ payout_receiver:CDPXZQLGNJ25O6SUEYT65RE6BCHNQTSYNT6SLHTDOZJKTO24DJFWCWC4,
+ determination_digest:8713e294019282f8cbe80ebaf0f09ebcdecc82c68132b701caba77e9570b8280,
+ recorded_at:1792656227,
+ funded_by:GDP3C2…ZNIT, funded_at:1792656247,
+ funding_reference:e7e882f2f10f995ed7629bccbb3058344ff09f81a7ce4c58eb79871756855a7d,
+ settled_by:GDP3C2…ZNIT, settled_at:1792656257,
+ settlement_reference:0c913e424b5cd61c55d1378396b3d989da7dc6c172403474fc3d9d0300cf30fe}
+```
 
-## The adapter holds no tokens
+The reference hashes are sha256 of a label (`microcrop:evidence:funding:v1:2026-10-22` and the settlement equivalent). In production they would be hashes of the M-Pesa payout receipt. The payment itself happens off-chain. Funded and Settled are statements by the Funder, not proof that money moved.
 
-| adapter | USDC balance (testnet Circle USDC SAC `CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA`) | XLM balance (native SAC `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`) |
+## Refusals
+
+These were run as simulations. The CLI does not submit a transaction whose simulation fails, so there is no tx hash. The error is the contract's own.
+
+| attempt | by | result |
 |---|---|---|
-| Lane P `CAAVFAC6…VCV3` | 0 | 0 |
-| Lane E `CDBDMGQ6…XRHQ` (after recording and settling a 420 USDC obligation) | 0 | 0 |
-| Lane E2 `CA4EUGBZ…OZWR` | 0 | 0 |
+| insurer marks its own obligation settled (obligation was Funded at the time) | evidence-org | #1 Unauthorized. Only the Funder can mark. |
+| account with no role marks it funded | evidence-stranger | #1 |
+| Funder marks with an all-zero reference hash | backend | #506 InvalidReference |
+| same determination submitted again (policy is now Claimed) | relayer | #308 |
+| policy reset to Active ([a7ad7014…](https://stellar.expert/explorer/testnet/tx/a7ad701491b54bbc624997c1f7972775251b44af703537f3e3f70c2dba916687)), then the same determination again | relayer | #310. The PayoutReceiver remembers the policy was paid. |
+| point PayoutReceiver-E at the live adapter, which is bound to the live PayoutReceiver | alice | #328 SettlementAdapterNotBound |
+| bind Adapter-E2 to PayoutReceiver-E ([8a66316e…](https://stellar.expert/explorer/testnet/tx/8a66316e2fd092417e1b604a7ecd524aa81dcff4fda6a8fa7bdeb106a3d16b39)), swap to it ([4e1cae0b…](https://stellar.expert/explorer/testnet/tx/4e1cae0b543f8410b0874fda239b26311e35b4f597452275e06d3bd07ae02b20)), then replay | relayer | #310, and Adapter-E2 still has 0 obligations. Swapping the adapter does not reopen a paid policy. |
+| record an obligation claiming to be PayoutReceiver-E | alice | cannot be signed: no key can authorize as a contract address. The host-side refusal is covered by the unit test `record_needs_the_receivers_own_authorization`. |
 
-The adapter also **has no token calls** in its code:
-- **Wasm imports.** The optimized adapter wasm imports 28 host functions and **none from module `d`**, the module that holds `call` / `try_call`, the only way to invoke another contract such as a token. The PayoutReceiver wasm imports `d._` and `d.0` because it calls the adapter and the PolicyManager. So the adapter cannot reach a token contract even in principle.
-- **Interface.** `stellar contract info interface` lists only: constructor, roles, upgrade, `set_payout_receiver`, `payout_receiver`, `record_obligation`, `mark_funded`, `mark_settled`, `get_obligation`, `find_obligation`, `obligation_count`, `org_obligation_count`, `get_org_obligations`, `extend_obligation_ttl` and `extend_contract_ttl`. There is no transfer, deposit or withdraw.
-- **Unit test.** `the_adapter_never_touches_a_token_or_calls_another_contract` fails if `lib.rs` ever contains `token::`, `TokenClient`, `invoke_contract` or `Client::new`.
+A caller other than the bound PayoutReceiver gets #500 from `record_obligation`. That case is covered by the unit test `a_caller_other_than_the_receiver_is_refused_even_with_every_auth_mocked` and was not repeated on-chain in this run.
 
-The amount is a unit of account only. Payment happens off-chain (M-Pesa), and `Funded` / `Settled` are **attestations** by the Funder, not proof of payment (MIGRATION_NOTES §11).
+## No custody
 
-## Negative cases
+| adapter | USDC (Circle testnet SAC `CBIELTK6…DAMA`) | XLM (native SAC `CDLZFC3S…CYSC`) |
+|---|---|---|
+| live `CCAALDRQ…KQF5` | 0 | 0 |
+| `CANZ3JHL…TMD2`, after recording and settling a 420 USDC obligation | 0 | 0 |
+| `CBRINQ3Q…4AVE` | 0 | 0 |
 
-These run as simulations: the CLI will not submit a transaction whose simulation fails, so nothing is spent and there is no tx hash. Each refusal is the contract's own error, captured in the logs listed.
+The balances alone don't show the adapter can't move money, so it was checked in two more ways:
 
-| case | who | result | log |
-|---|---|---|---|
-| **non-PayoutReceiver caller records an obligation**: `record_obligation(caller=alice, …)` on the Lane P adapter | alice (admin) | **#500 NotPayoutReceiver** | `extra/neg_record_CAAVFAC6…log` |
-| same, with caller = relayer, Lane P adapter | relayer | **#500** | `extra/neg_record_relayer_CAAVFAC6…log` |
-| same two cases on the Lane E adapter | alice / relayer | **#500** / **#500** | `extra/neg_record_*CDBDMGQ6…log` |
-| `record_obligation(caller=PR-E)` signed by alice: claims to be the PayoutReceiver without its authorization | alice | refused before submission: "Missing signing key for account CA6DG3…". No key can authorize as a contract address. The host-side refusal is proven by unit test `record_needs_the_receivers_own_authorization`. | `evidence/logs/e_neg_record_without_pr_auth.log` |
-| **org marks its own obligation settled** | org | **#1 Unauthorized** (marks are Funder-only since `70af932`) | `evidence/logs/e_neg_org_marks_own_settled.log` |
-| **non-Funder marks settled** | stranger | **#1** | `extra/neg_stranger_settled.log` |
-| **non-Funder marks settled** | farmer | **#1** | `extra/neg_farmer_settled.log` |
-| non-Funder marks funded | stranger | **#1** | `evidence/logs/e_neg_stranger_mark.log` |
-| zero reference hash | backend (Funder) | **#506 InvalidReference** | `evidence/logs/e_neg_zero_reference.log` |
-| replay of the same determination (policy now Claimed) | relayer | **#308** | `evidence/logs/e_neg_replay_claimed.log` |
-| replay after re-injecting the policy as Active ([f808d571…](https://stellar.expert/explorer/testnet/tx/f808d5713050ec4105bf5e65b7b9a592f2328436f5f71c98f02b3e62cf76d9eb)) | relayer | **#310** (PR's own `PolicyPaid` guard) | `evidence/logs/e_neg_replay_paid.log` |
-| `set_settlement_adapter` to Lane P's adapter, which is bound to another PR | alice | **#328 SettlementAdapterNotBound** | `evidence/logs/e_neg_adapter_bound_elsewhere.log` |
-| replay after swapping to Adapter-E2 | relayer | **#310**; Adapter-E2 `obligation_count = 0` | `evidence/logs/e_neg_replay_after_swap.log` |
+- The release wasm for the adapter imports 28 host functions and none from module `d`. That module holds `call` and `try_call`, the only way a contract can invoke another contract, a token included. The PayoutReceiver wasm does import `d._` and `d.0`, because it calls the PolicyManager and the adapter.
+- The unit test `the_adapter_never_touches_a_token_or_calls_another_contract` fails if the adapter source ever uses `token::`, `TokenClient`, `invoke_contract` or `Client::new`.
 
-Note on the stranger and farmer `mark_settled` cases: they ran against obligation 1 after it was already Settled. The adapter checks authorization before the state transition, so they returned #1, not #505. The org's refusal ran while the obligation was still Funded, so it is the clean case.
+## Fees
 
-## Every transaction, with Horizon fee_charged
+All 41 transactions succeeded. Fees are Horizon's `fee_charged`.
 
-#### Lane P: deploy and configure (deploy.sh)
+| part | transactions | XLM |
+|---|---:|---:|
+| deploy and configure the live contracts | 20 | 225.21 |
+| sale on the live PolicyManager | 2 | 5.81 |
+| second set: deploy, configure, payout path, swap | 19 | 10.05 |
+| total | 41 | 241.08 |
 
-| step | source | tx (stellar.expert) | ledger | fee_charged (stroops) | XLM |
-|---|---|---|---|---:|---:|
-| PolicyNft: upload wasm | alice (admin) | [ad00be1985662108…](https://stellar.expert/explorer/testnet/tx/ad00be198566210828569570e587a0d67d18e62a3db19d730ee22b1f490124f2) | 5277185 | 152,799,987 | 15.2800 |
-| PolicyNft: create contract | alice (admin) | [d440a9dca1401399…](https://stellar.expert/explorer/testnet/tx/d440a9dca140139924698906395b743dc403155c97e8f68d79d2b07282ce3e95) | 5277188 | 1,137,251 | 0.1137 |
-| PolicyManager: upload wasm | alice (admin) | [6fd27b25bbfd7157…](https://stellar.expert/explorer/testnet/tx/6fd27b25bbfd71576bc971929cab7e4148e169f490ba68a33408cb29345aae96) | 5277190 | 209,636,447 | 20.9636 |
-| PolicyManager: create contract | alice (admin) | [f4825210be4f033d…](https://stellar.expert/explorer/testnet/tx/f4825210be4f033de919b84749e4507356e3590266417177a4c93f6d54f25cd3) | 5277193 | 2,078,307 | 0.2078 |
-| SettlementAdapter: upload wasm | alice (admin) | [968858dea921ef2d…](https://stellar.expert/explorer/testnet/tx/968858dea921ef2d54ea30f34863f8c25bb0427369b902b572b560ee03c44d6a) | 5277195 | 165,557,321 | 16.5557 |
-| SettlementAdapter: create contract | alice (admin) | [a9052227e4998bc1…](https://stellar.expert/explorer/testnet/tx/a9052227e4998bc186eaec1fdc8d3d453d1267326bcf305d638231ea03caa5a5) | 5277199 | 2,078,263 | 0.2078 |
-| PayoutReceiver: upload wasm | alice (admin) | [51c92dd309650634…](https://stellar.expert/explorer/testnet/tx/51c92dd3096506342fe195fa60367b1c0d10f249ae8c66cd7f9f0b07e7be990c) | 5277201 | 270,937,933 | 27.0938 |
-| PayoutReceiver: create contract | alice (admin) | [ef4e9891086a7a52…](https://stellar.expert/explorer/testnet/tx/ef4e9891086a7a5226f0663cc4de89014bb9ad7973a643b317bacc5a8fe4df1d) | 5277205 | 2,195,223 | 0.2195 |
-| PolicyManager.set_policy_nft | alice (admin) | [cdb43cc7638930bc…](https://stellar.expert/explorer/testnet/tx/cdb43cc7638930bcb48414e8994038ffa263eb84c2cb1625a7845c7cfda3942b) | 5277212 | 62,347 | 0.0062 |
-| PolicyNft.set_policy_manager | alice (admin) | [fd3591629ff80326…](https://stellar.expert/explorer/testnet/tx/fd3591629ff803267f7d8d3cfac5338bc40cfee50315906afb1e872269d4d9ab) | 5277214 | 65,587 | 0.0066 |
-| SettlementAdapter.set_payout_receiver(PR) | alice (admin) | [9061f8c3fb910749…](https://stellar.expert/explorer/testnet/tx/9061f8c3fb910749eddd517ee6ea0b2a54ab4ba801d1a8af929ba11eb483b634) | 5277216 | 65,704 | 0.0066 |
-| PM grant Backend(1) to backend | alice (admin) | [7e0c9ff5fece3ca9…](https://stellar.expert/explorer/testnet/tx/7e0c9ff5fece3ca9ae1c56c5fa4fa488f151f099b2933ada93a5ff916faf3fdc) | 5277218 | 976,001 | 0.0976 |
-| NFT grant Minter(6) to PM | alice (admin) | [ebc2742eaaf63e1b…](https://stellar.expert/explorer/testnet/tx/ebc2742eaaf63e1b141afed536d40029cc03e3e6cef6d3d6591a7a2d4f372eaf) | 5277222 | 948,212 | 0.0948 |
-| PM grant Oracle(2) to PR | alice (admin) | [a053b07f101622f6…](https://stellar.expert/explorer/testnet/tx/a053b07f101622f62503eaaafed7478a4188eb1804b9d1686495ae5849f724cd) | 5277224 | 948,242 | 0.0948 |
-| PR grant Relayer(4) to relayer | alice (admin) | [103ed9cc115b6b73…](https://stellar.expert/explorer/testnet/tx/103ed9cc115b6b734bc441ec313c9a6bd12f372be3211476671e38256529ad1a) | 5277227 | 976,008 | 0.0976 |
-| Adapter grant Funder(7) to backend | alice (admin) | [0037fb644c2fdbb6…](https://stellar.expert/explorer/testnet/tx/0037fb644c2fdbb65eed058d390ecef3fd94c657a1229a182e8be3fa7e3975e4) | 5277229 | 976,459 | 0.0976 |
-| PR.set_authorized_signer (throwaway key) | alice (admin) | [3daf9d5c83bef6fc…](https://stellar.expert/explorer/testnet/tx/3daf9d5c83bef6fce4a1a589827ca7ac9560497a1ddd42c5bf9ccca5059cce73) | 5277233 | 95,128 | 0.0095 |
-| PR.set_network_domain | alice (admin) | [fc89b6a202cda0f9…](https://stellar.expert/explorer/testnet/tx/fc89b6a202cda0f93743aae95e218f4a91d8e8fdeae3d7a9ab977bb594ce3924) | 5277235 | 65,402 | 0.0065 |
-| PR.set_methodology_enabled(drought) | alice (admin) | [e0036c71597e18e7…](https://stellar.expert/explorer/testnet/tx/e0036c71597e18e7cd8fdf6de7fddc446409386cf8c7d682ecbd05eaff037169) | 5277239 | 49,486 | 0.0049 |
-| PR.extend_contract_ttl (keeper: 4 contracts to 30 d) | alice (admin) | [8307be7e39e11b0c…](https://stellar.expert/explorer/testnet/tx/8307be7e39e11b0cdb45e9f60254585c7c5343b6483b592d841e00da5aa63933) | 5277241 | 2,626,888,787 | 262.6889 |
-| **subtotal** | | | | **3,438,538,095** | **343.8538** |
+Of the deploy cost, 171.7 XLM is the first TTL extension to 30 days, in [26643ca0…](https://stellar.expert/explorer/testnet/tx/26643ca0674c74667b848c068c0912b16dd1601133a5f0ed840be220f02cb2b2). The four wasm uploads cost 9.5 to 18.6 XLM each. The payout path itself is cheap: the determination with its obligation record was 1.49 XLM, and each mark about 0.058 XLM. These are testnet figures; mainnet rent has not been measured.
 
-#### Lane P: real sale on the real PolicyManager
+Every transaction in this run:
 
-| step | source | tx (stellar.expert) | ledger | fee_charged (stroops) | XLM |
-|---|---|---|---|---:|---:|
-| PolicyManager.create_policy (Drought, 150 d) | backend | [37f622bbe7cb679f…](https://stellar.expert/explorer/testnet/tx/37f622bbe7cb679fab551a96310ec3444a66a02d3ccc98986cb30faaa41e7f72) | 5277275 | 26,573,581 | 2.6574 |
-| PolicyManager.activate_policy (NFT minted) | backend | [e3fa3cff0395f2b0…](https://stellar.expert/explorer/testnet/tx/e3fa3cff0395f2b01eedcd8d80afd937ca1a4a6ac1d1d03f63170f63c3c63e51) | 5277280 | 26,660,654 | 2.6661 |
-| **subtotal** | | | | **53,234,235** | **5.3234** |
+| step | tx | ledger | fee (stroops) |
+|---|---|---:|---:|
+| PolicyNft upload | [d61e5ccb…](https://stellar.expert/explorer/testnet/tx/d61e5ccbaec325c0de5223e7d5aa1b9eec0a2f2fee5aebd206184eab6f602e65) | 5318534 | 95,014,207 |
+| PolicyNft create | [154e9e68…](https://stellar.expert/explorer/testnet/tx/154e9e6817309efc95715aeb41cdb0f72ee0f9e3b367304419b1a9ae1ba447b3) | 5318535 | 1,219,765 |
+| PolicyManager upload | [c5fa7e42…](https://stellar.expert/explorer/testnet/tx/c5fa7e420fd258bf5e4737db438c1a6d5a4d044f21667123752f0b9e15a1eb7a) | 5318539 | 133,879,085 |
+| PolicyManager create | [7ff8a814…](https://stellar.expert/explorer/testnet/tx/7ff8a8143b5695d1deddb4846c72556947e6e8a1d0219194334da9d817b9be07) | 5318540 | 2,229,388 |
+| SettlementAdapter upload | [bf02098e…](https://stellar.expert/explorer/testnet/tx/bf02098ec469b90b8f0cf9744d389f1fb78bf941f1d9b24a66c1e4faa33dfa09) | 5318542 | 106,747,095 |
+| SettlementAdapter create | [317f7605…](https://stellar.expert/explorer/testnet/tx/317f7605b8e837755dd3e980649b21f8dd3ecd550d24d75785a19cd838d6e3a1) | 5318545 | 2,229,346 |
+| PayoutReceiver upload | [47060f1c…](https://stellar.expert/explorer/testnet/tx/47060f1cbda18d3d81d583770e8bae7835b9de20ecb6c2b183644a1d1cfc7ec6) | 5318547 | 186,128,379 |
+| PayoutReceiver create | [88211ab2…](https://stellar.expert/explorer/testnet/tx/88211ab261d9408d9c6751c1143b266075009aa42a19f89473fc988d3612c63b) | 5318549 | 2,354,814 |
+| PolicyManager.set_policy_nft | [760ce8f2…](https://stellar.expert/explorer/testnet/tx/760ce8f2ecbf5c2f0a5853d0355ff760c7d95dca1b16173ba7993aa2972cb727) | 5318552 | 66,600 |
+| PolicyNft.set_policy_manager | [252dea98…](https://stellar.expert/explorer/testnet/tx/252dea98f92f02917a8f027059403b0fb8ccc6fb4b303639cec4ede542a68594) | 5318553 | 70,078 |
+| SettlementAdapter.set_payout_receiver | [6a30fbce…](https://stellar.expert/explorer/testnet/tx/6a30fbce5e6752119e00359131375e587b4884d26d5882ec3ae23fb563e319ff) | 5318557 | 70,192 |
+| grant Backend on PolicyManager | [8c9fcea8…](https://stellar.expert/explorer/testnet/tx/8c9fcea8d3f8af56cf195f8fafe56add9665b13a4b46341709e33eacbd0121c1) | 5318558 | 1,046,929 |
+| grant Minter on PolicyNft to PolicyManager | [576b294f…](https://stellar.expert/explorer/testnet/tx/576b294f0d047f70f0871bb2ba3e7fd5224e0fa5813edfe7e303824cbc69cf7d) | 5318559 | 1,017,112 |
+| grant Oracle on PolicyManager to PayoutReceiver | [91ba80ae…](https://stellar.expert/explorer/testnet/tx/91ba80ae0cf94f68fc6dde5b604cea9e3e1eaaee48e4d0853da79c62b3a737fc) | 5318563 | 1,017,142 |
+| grant Relayer on PayoutReceiver | [acb43251…](https://stellar.expert/explorer/testnet/tx/acb432517409ed67f652ffe0838bff664fbb822274f9d82716979edd694f36d3) | 5318564 | 1,046,936 |
+| grant Funder on SettlementAdapter | [6f0c1f56…](https://stellar.expert/explorer/testnet/tx/6f0c1f564b65013e2670fc614aff8a6d0d8c0bca06ddf195fd04f24ebd2086eb) | 5318566 | 1,047,386 |
+| set signer to the Lit PKP | [b9ba0338…](https://stellar.expert/explorer/testnet/tx/b9ba033477229c82b5f5671ffa39c54d3504ceab358bb12ee45ef9cae7d4bb0d) | 5318569 | 101,748 |
+| set network_domain | [061759b8…](https://stellar.expert/explorer/testnet/tx/061759b89e724a637cb04a7a597e7adc9a13ee991b98b770fc1e46e6a2ea6178) | 5318570 | 69,893 |
+| enable drought methodology | [1f0236cc…](https://stellar.expert/explorer/testnet/tx/1f0236ccc53a7e8dd815deb253db208999080ac79bdd1ae4a0a3143d14e6de83) | 5318571 | 52,795 |
+| extend TTL of all four to 30 days | [26643ca0…](https://stellar.expert/explorer/testnet/tx/26643ca0674c74667b848c068c0912b16dd1601133a5f0ed840be220f02cb2b2) | 5318575 | 1,716,732,604 |
+| create_policy | [a735c342…](https://stellar.expert/explorer/testnet/tx/a735c342214893a2fbed937e91c3467fa00beb9f014af35fa21c45a71a46fef0) | 5326481 | 29,013,896 |
+| activate_policy | [8db8e257…](https://stellar.expert/explorer/testnet/tx/8db8e2576a31672b529c5c83cc1dc60a7a7b83e27444017a52b9c027bef32e09) | 5326483 | 29,108,599 |
+| fixture upload | [83ba8183…](https://stellar.expert/explorer/testnet/tx/83ba8183d361c97a1d266b1faeece07cc066ceccacc49e34cfbc8c03896b8f84) | 5326493 | 68,529,309 |
+| fixture create | [e914ae50…](https://stellar.expert/explorer/testnet/tx/e914ae50a4ce35f5b5b3e43d5ac7545ef18f748fd5ad34a1b08d32aa5de0827f) | 5326494 | 1,159,970 |
+| Adapter-E create (release wasm already on-chain) | [c314ec31…](https://stellar.expert/explorer/testnet/tx/c314ec317f54a542ef777e1741fd5138cd7ff53557f8cc184f7fedf0dd59d788) | 5326498 | 2,269,105 |
+| PayoutReceiver-E create | [6bf13e68…](https://stellar.expert/explorer/testnet/tx/6bf13e68ec6cc47724001d8116c6a040baba2b8715c46e49ebe695bd18c710ef) | 5326503 | 2,396,813 |
+| Adapter-E.set_payout_receiver | [8019fc48…](https://stellar.expert/explorer/testnet/tx/8019fc486d9a59855a5d2f6b5afc05cdb5bddb8008d4eb37f1f6c9911963cdd1) | 5326505 | 71,377 |
+| grant Oracle on fixture to PayoutReceiver-E | [1aedfc79…](https://stellar.expert/explorer/testnet/tx/1aedfc7967e01f0777691dc5bc375d600a356286a535a05fa90a3274da1b75ba) | 5326509 | 1,035,235 |
+| grant Relayer on PayoutReceiver-E | [7b05b94f…](https://stellar.expert/explorer/testnet/tx/7b05b94fdf5983a0267097072f8221d35496499c34da77da7bb0f7fc4c8a052f) | 5326510 | 1,065,602 |
+| grant Funder on Adapter-E | [3a4f1fea…](https://stellar.expert/explorer/testnet/tx/3a4f1fea2a0e23c20a3eb203793d4e6e44b2d3002c5cd789ebb9694df0227cf6) | 5326511 | 1,066,052 |
+| set signer to the test key | [453cb87a…](https://stellar.expert/explorer/testnet/tx/453cb87ab2a7c64e52eaa7ac59d14717ffd7af7ea18d9b122a34fd2a9ef58d90) | 5326515 | 103,497 |
+| set network_domain | [e2fe7c57…](https://stellar.expert/explorer/testnet/tx/e2fe7c570662c205e1822778a1cf27b6e8df28b8bea4cb9d985bcb9301c368de) | 5326517 | 71,079 |
+| enable drought methodology | [6148eda5…](https://stellar.expert/explorer/testnet/tx/6148eda5859b8bd7416a5ce7c24ed543ea533102b490a7d0f547c3d8137f353b) | 5326521 | 53,667 |
+| write policy 1 into the fixture | [ed583bfc…](https://stellar.expert/explorer/testnet/tx/ed583bfce348945ee0be4c6fe3e1ec5c9fec7737b85a20a81538cbd4457b9b44) | 5326523 | 4,217,972 |
+| submit_drought_determination (Owed) | [5d431d91…](https://stellar.expert/explorer/testnet/tx/5d431d918de7b13c3e2be0fb9d7447b6a5168955c5a49afce584d511af39734d) | 5326528 | 14,941,596 |
+| mark_funded | [2a0e2b7f…](https://stellar.expert/explorer/testnet/tx/2a0e2b7f46068af3f30feab9f95c16c1e00edd17271c18f73ff19c7e95059be7) | 5326532 | 582,765 |
+| mark_settled | [899d7cd8…](https://stellar.expert/explorer/testnet/tx/899d7cd89fc7ef741d188c367007b86cfaba576089c34588ea56ccf1435d2541) | 5326534 | 583,075 |
+| reset policy 1 to Active (for the replay test) | [a7ad7014…](https://stellar.expert/explorer/testnet/tx/a7ad701491b54bbc624997c1f7972775251b44af703537f3e3f70c2dba916687) | 5326539 | 5,933 |
+| Adapter-E2 create | [8321fec7…](https://stellar.expert/explorer/testnet/tx/8321fec7c7b9814e7b8cccb9479280b290ee9a769b52633eb072b14970b152ca) | 5326541 | 2,268,360 |
+| Adapter-E2.set_payout_receiver | [8a66316e…](https://stellar.expert/explorer/testnet/tx/8a66316e2fd092417e1b604a7ecd524aa81dcff4fda6a8fa7bdeb106a3d16b39) | 5326545 | 71,356 |
+| PayoutReceiver-E.set_settlement_adapter(Adapter-E2) | [4e1cae0b…](https://stellar.expert/explorer/testnet/tx/4e1cae0b543f8410b0874fda239b26311e35b4f597452275e06d3bd07ae02b20) | 5326549 | 4,852 |
 
-#### Lane E: evidence lane
+## Per SOW deliverable
 
-| step | source | tx (stellar.expert) | ledger | fee_charged (stroops) | XLM |
-|---|---|---|---|---:|---:|
-| TestnetPolicyFixture: upload wasm | alice (admin) | [84b1336683d51297…](https://stellar.expert/explorer/testnet/tx/84b1336683d51297ed5d06a020c94fa020780278f33669f5c696f0d28c765c83) | 5277283 | 62,766,461 | 6.2766 |
-| TestnetPolicyFixture: create contract | alice (admin) | [8c26dfb4e3b14c28…](https://stellar.expert/explorer/testnet/tx/8c26dfb4e3b14c2818cb8839d87f08b17f18cf5ffb2b3fef9c6d00708989facd) | 5277286 | 1,062,985 | 0.1063 |
-| SettlementAdapter-E: create contract | alice (admin) | [8d90247ed59b9f74…](https://stellar.expert/explorer/testnet/tx/8d90247ed59b9f7479e2615c7e3858363efcbd3f26c358d8da25120415d3db86) | 5277290 | 2,079,009 | 0.2079 |
-| PayoutReceiver-E: create contract | alice (admin) | [df41e5d69db85f79…](https://stellar.expert/explorer/testnet/tx/df41e5d69db85f7908cf0cacb46317466f3ba457748c5ac600c3abf8e697da1b) | 5277292 | 2,196,011 | 0.2196 |
-| Adapter-E.set_payout_receiver(PR-E) | alice (admin) | [d35d17a57e3456b5…](https://stellar.expert/explorer/testnet/tx/d35d17a57e3456b51fba7da56b4b6adb3c03800e50b7a6546f8247d333e10ae3) | 5277297 | 65,732 | 0.0066 |
-| Fixture grant Oracle(2) to PR-E | alice (admin) | [ff1116453fe9600a…](https://stellar.expert/explorer/testnet/tx/ff1116453fe9600a7e937899a5789a40283ecf90ec0fce81bb25d7c28785ea34) | 5277299 | 948,535 | 0.0949 |
-| PR-E grant Relayer(4) | alice (admin) | [87aeb661dffb53e6…](https://stellar.expert/explorer/testnet/tx/87aeb661dffb53e686a9e934c9c7aff59cc91911516068f98f6f240941f554a9) | 5277302 | 976,358 | 0.0976 |
-| Adapter-E grant Funder(7) to backend | alice (admin) | [79e7a0150923e37c…](https://stellar.expert/explorer/testnet/tx/79e7a0150923e37c36dd593024b7f93926166438848c4c6a180efc4db5a08e8b) | 5277304 | 976,809 | 0.0977 |
-| PR-E.set_authorized_signer (throwaway key) | alice (admin) | [5aa98a18a4110568…](https://stellar.expert/explorer/testnet/tx/5aa98a18a4110568e9d2c9cb1785767af216df5be87c476f0c415dc12afa4e88) | 5277308 | 95,170 | 0.0095 |
-| PR-E.set_network_domain | alice (admin) | [654c1aa49b9018ac…](https://stellar.expert/explorer/testnet/tx/654c1aa49b9018ac15bea867a482515bee225f38d2fa67ca9041830301cad17a) | 5277310 | 65,430 | 0.0065 |
-| PR-E.set_methodology_enabled(drought) | alice (admin) | [eb7b3d8b8991e806…](https://stellar.expert/explorer/testnet/tx/eb7b3d8b8991e806f2c39c14f8ea33b3cf92c57fddece7e575c8f574ec0fc87a) | 5277313 | 49,529 | 0.0050 |
-| Fixture.set_policy (inject policy 1, Active) | alice (admin) | [6e1f4874b2af0a2f…](https://stellar.expert/explorer/testnet/tx/6e1f4874b2af0a2f3b7be7e8c2ddca85a23d50ac02e53eb687ddfe7051270664) | 5277315 | 3,865,375 | 0.3865 |
-| **PR-E.submit_drought_determination: signature verified, obligation 1 recorded (Owed)** | relayer | [f9b264928429b780…](https://stellar.expert/explorer/testnet/tx/f9b264928429b780e68a4bedd24adb796925f0b5b25496e683fd93981f32e06b) | 5277317 | 13,833,269 | 1.3833 |
-| **Adapter-E.mark_funded(1, ref) by backend (Funder): Funded** | backend | [207b90efcdbe0d05…](https://stellar.expert/explorer/testnet/tx/207b90efcdbe0d0567e9dec85f8fb4660e06abe5461afd5477b71aa10241e24f) | 5277334 | 534,770 | 0.0535 |
-| **Adapter-E.mark_settled(1, ref) by backend (Funder): Settled** | backend | [2975028c7078b886…](https://stellar.expert/explorer/testnet/tx/2975028c7078b8864ecbfb80e0a8c021898ff48667270aa0c964d369d3bbedcb) | 5277339 | 535,078 | 0.0535 |
-| Fixture.set_policy (re-inject Active, for the 310 replay test) | alice (admin) | [f808d5713050ec41…](https://stellar.expert/explorer/testnet/tx/f808d5713050ec4105bf5e65b7b9a592f2328436f5f71c98f02b3e62cf76d9eb) | 5277345 | 5,933 | 0.0006 |
-| SettlementAdapter-E2 (swap target): create contract | alice (admin) | [897e460b30d5c8e6…](https://stellar.expert/explorer/testnet/tx/897e460b30d5c8e61dd2d90b26dede90a80b0231e728d7583c6f9f79e5262971) | 5277350 | 2,080,003 | 0.2080 |
-| Adapter-E2.set_payout_receiver(PR-E) | alice (admin) | [5d29aa7f2a6b851e…](https://stellar.expert/explorer/testnet/tx/5d29aa7f2a6b851ea0b559dab0cc1e8a107edafa1e31049a7a9b6d75ab50b1cf) | 5277352 | 65,764 | 0.0066 |
-| PR-E.set_settlement_adapter(Adapter-E2) | alice (admin) | [ad67a36e0b99365d…](https://stellar.expert/explorer/testnet/tx/ad67a36e0b99365dfa3e31e3663d53c2741f4d9b7d6636577910f15d45f69208) | 5277356 | 4,862 | 0.0005 |
-| **subtotal** | | | | **92,207,083** | **9.2207** |
+**Deliverable 1: contracts on Stellar testnet, a network_domain, and a Soroban-format signer.** The four contracts above are live, wired and checked, and they run the attested `v0.1.0` code. The network_domain is set. The live PayoutReceiver takes determinations only from the Lit PKP, given as a 65-byte SEC-1 public key; the contract recovers the signer from a 64-byte signature and a recovery id. The signature path was exercised on-chain in [5d431d91…](https://stellar.expert/explorer/testnet/tx/5d431d918de7b13c3e2be0fb9d7447b6a5168955c5a49afce584d511af39734d) with a test key, on the same PayoutReceiver code.
 
-All 41 transactions succeeded (Horizon `successful: true`). Total fee_charged: **3,583,979,413 stroops = 358.3979 XLM**.
+**Deliverable 2: the SettlementAdapter.** Live at [CCAALDRQWXFAIOS7NMYCGJL2QKKTIKSJSX5DXFDTMIJWHV5FMGKOKQF5](https://stellar.expert/explorer/testnet/contract/CCAALDRQWXFAIOS7NMYCGJL2QKKTIKSJSX5DXFDTMIJWHV5FMGKOKQF5), source in `crates/settlement-adapter`. It replaces the old Treasury, which held insurers' money. The adapter holds nothing. It is a public record of what each insurer owes after a verified drought, and of whether that debt has been paid. Only the PayoutReceiver can create a debt, and only after verifying a signed determination. Only the Funder can mark it funded or settled, and it must attach a reference to the off-chain payment. The insurer that owes the debt cannot mark it settled.
 
-**Notes on fees:**
-- The four wasm uploads cost 15.3 to 27.1 XLM each.
-- The single largest item is the keeper's first `extend_contract_ttl`: **262.7 XLM**, for 4 instances plus 4 code entries from about 7 days to 30 days of TTL. It matches the 370.5 XLM measured for the Treasury-era five-contract stack in PR #7.
-- The claim path itself is cheap: determination plus obligation record 1.38 XLM, `mark_funded` 0.053 XLM, `mark_settled` 0.054 XLM.
-- These are testnet resource fees. MIGRATION_NOTES §10's mainnet rent table is still not re-measured.
+**Deliverable 3: end-to-end on testnet.** In order: [create_policy](https://stellar.expert/explorer/testnet/tx/a735c342214893a2fbed937e91c3467fa00beb9f014af35fa21c45a71a46fef0) and [activate_policy](https://stellar.expert/explorer/testnet/tx/8db8e2576a31672b529c5c83cc1dc60a7a7b83e27444017a52b9c027bef32e09) on the live PolicyManager; the [signed determination recording obligation 1 as Owed](https://stellar.expert/explorer/testnet/tx/5d431d918de7b13c3e2be0fb9d7447b6a5168955c5a49afce584d511af39734d); [mark_funded](https://stellar.expert/explorer/testnet/tx/2a0e2b7f46068af3f30feab9f95c16c1e00edd17271c18f73ff19c7e95059be7); [mark_settled](https://stellar.expert/explorer/testnet/tx/899d7cd89fc7ef741d188c367007b86cfaba576089c34588ea56ccf1435d2541). The integration tests for the same flow are in [crates/integration-tests](https://github.com/Microcrop-Protocol/microcrop-soroban/tree/master/crates/integration-tests).
 
-## Plain language, per SOW deliverable
+## What this run does not show
 
-**Deliverable 1: contracts on Stellar, a network domain, and a Soroban-format signer.**
-- MicroCrop's four Stellar contracts are live on testnet and wired together. A checker confirmed every link, role and setting, and that the deployed code is exactly the code built from the branch.
-- The **network domain** is a 32-byte fingerprint of the testnet network (`cee0302d…d472`). Every determination is signed over it, so a testnet signature can never be replayed on mainnet.
-- The contract only accepts a determination signed with a secp256k1 key in the format the Soroban host verifies: the 65-byte SEC-1 public key, a 64-byte signature and a recovery id. The contract recovers the key itself.
-- In this run, a throwaway key in that format signed a real 2022 drought season and the contract accepted it. The contract's own digest view matched the off-chain encoder byte for byte.
-- **Separately proven, not repeated here:** the user's real Lit PKP signs a Stellar drought determination whose digest equals the live contract's `drought_determination_digest` byte for byte. This was recorded in the earlier oracle and PR #7 work (`crop-drought-rdi-1.0` with `chain:'stellar'`, 2026-10-19). This run deliberately did not use the PKP, so the production signer was never configured on or exposed to an evidence contract. On 2026-10-21 the Lane P PayoutReceiver (the production stack, not the evidence lane) was switched to the PKP; see the status update.
+1. **A payout on the live sale.** `activate_policy` starts cover at the moment of activation, and a drought determination needs a complete 110-day season inside the cover. The earliest the live policy can be assessed is about 2027-02-09, if its TTL is kept alive and testnet isn't reset first. That is why the payout path ran on the second set, where the fixture writes the policy in directly instead of selling it.
+2. **A PKP-signed determination on-chain.** The live PayoutReceiver is set to the PKP, but nothing has been submitted to it yet, for the reason above. The second set used a test key so that the production signer was never attached to a test contract.
+3. **The insurer marking its own payment.** The code doesn't allow it: only the Funder can mark. The run shows the insurer's attempt failing.
+4. **A real payment behind Settled.** The reference hashes here are of labels, not of M-Pesa receipts. The chain records the Funder's statement; it cannot see the off-chain payment.
+5. **The backend driving the flow.** The backend writer and keeper for these contracts are merged in microcrop-core ([#97](https://github.com/Microcrop-Protocol/microcrop-core/pull/97), [#98](https://github.com/Microcrop-Protocol/microcrop-core/pull/98)), but this run was driven from the CLI. Pointing the backend at these addresses is a configuration step still to do.
 
-**Deliverable 2: the SettlementAdapter.**
-- **Address:** Lane P [CAAVFAC6ML3ZR5DZHQUKKG5WEJJ7PANQ2XHZJ3PXP3AMBZVWUCEQVCV3](https://stellar.expert/explorer/testnet/contract/CAAVFAC6ML3ZR5DZHQUKKG5WEJJ7PANQ2XHZJ3PXP3AMBZVWUCEQVCV3). It is the same code as Lane E's [CDBDMGQ62OSIQBPQKCDGS3DGG5Z5EBWN6O2UPWSL25GUJ4D4CX7KXRHQ](https://stellar.expert/explorer/testnet/contract/CDBDMGQ62OSIQBPQKCDGS3DGG5Z5EBWN6O2UPWSL25GUJ4D4CX7KXRHQ), which holds the settled obligation.
-- **Source:** [settlement-adapter/src/lib.rs @ c7a4065](https://github.com/Microcrop-Protocol/microcrop-soroban/blob/c7a4065d826eeaf0821ef48dfcd3383b9ff668fe/crates/settlement-adapter/src/lib.rs).
-- **What it does:** it replaces the old custodial Treasury. It never holds money: its balances are zero and its code cannot call a token. It keeps a public, tamper-evident ledger of what each insurer owes each farmer after a verified drought, and tracks each debt from Owed to Funded to Settled.
-- **Who can change it:** only the PayoutReceiver can create a debt, and only after verifying a signed determination. Only the paying agent (the Funder role) can mark it funded or settled, and it must attach a reference hash of the off-chain payment. Nobody else can, including the insurer that owes it.
+## Reproducing
 
-**Deliverable 3: end-to-end transactions.** In order:
-- [create_policy](https://stellar.expert/explorer/testnet/tx/37f622bbe7cb679fab551a96310ec3444a66a02d3ccc98986cb30faaa41e7f72) and [activate_policy](https://stellar.expert/explorer/testnet/tx/e3fa3cff0395f2b01eedcd8d80afd937ca1a4a6ac1d1d03f63170f63c3c63e51) on the real PolicyManager;
-- the [signed determination, verified on-chain, recording obligation #1 as Owed](https://stellar.expert/explorer/testnet/tx/f9b264928429b780e68a4bedd24adb796925f0b5b25496e683fd93981f32e06b);
-- [mark_funded](https://stellar.expert/explorer/testnet/tx/207b90efcdbe0d0567e9dec85f8fb4660e06abe5461afd5477b71aa10241e24f);
-- [mark_settled](https://stellar.expert/explorer/testnet/tx/2975028c7078b8864ecbfb80e0a8c021898ff48667270aa0c964d369d3bbedcb) (status Settled).
+```bash
+ADMIN_KEY=alice BACKEND_ADDR=$(stellar keys address backend) RELAYER_ADDR=$(stellar keys address relayer) \
+AUTHORIZED_SIGNER_PUBKEY=0x04a2f05a…7d19 \
+  ./scripts/deploy.sh --network testnet --release v0.1.0 --state-dir deployments/v0.1.0
 
-The sale and the payout determination are on two different PolicyManagers, for the reason given below.
+BACKEND_ADDR=… RELAYER_ADDR=… AUTHORIZED_SIGNER_PUBKEY=0x04a2f05a…7d19 \
+  ./scripts/verify-deployment.sh --network testnet --release v0.1.0 --state-dir deployments/v0.1.0
 
-## What was not shown, and why
+ADMIN_KEY=alice BACKEND_KEY=backend RELAYER_KEY=relayer \
+  ./scripts/testnet-evidence.sh --network testnet \
+  --lane-p-state deployments/v0.1.0/testnet.json --state-dir deployments/v0.1.0/evidence
+```
 
-1. **A positive determination on the real PolicyManager's own sale.**
-   - `activate_policy` sets the cover start to now. A drought determination needs a full 110-day season inside the cover, and must be assessed within an hour of submission.
-   - The earliest positive result for policy 1 on Lane P is therefore about 2027-02-06, if the keeper keeps the TTLs alive and testnet is not reset first. Testnet resets roughly quarterly.
-   - Today, the real sale's determination correctly stops at #327.
-   - The positive path ran on Lane E, where a testnet-only fixture **injects** the policy (it is not a sale), against the identical PayoutReceiver and SettlementAdapter wasm.
-2. **The org signing `mark_funded` / `mark_settled`.**
-   - This is no longer allowed by the code (review fix `70af932`, Funder-only marks). Backend-onboarded org addresses are also keyless (sha256-derived), so they could never sign anyway.
-   - The org's attempt is shown failing with #1, and the Funder made both marks.
-3. **The Lit PKP signing for these contracts.** It was deliberately not used in this run (throwaway key only). Its digest compatibility is the separately proven fact cited under Deliverable 1, not re-run here. Since 2026-10-21 Lane P's PayoutReceiver accepts only the PKP, but no PKP-signed determination has been submitted to it yet: its sale cannot be assessed before the season ends.
-4. **A real M-Pesa receipt behind `mark_settled`.**
-   - The reference hashes here are sha256 of evidence labels, not of a real payout.
-   - "Settled" is an attestation by the Funder; the chain cannot prove the off-chain payment happened.
-5. **Backend integration (spec §8).** Built in [microcrop-core PR #97](https://github.com/Microcrop-Protocol/microcrop-core/pull/97) and [PR #98](https://github.com/Microcrop-Protocol/microcrop-core/pull/98) (both merged 2026-10-19), but not used for this run: the CLI drove these transactions, not a backend job.
-6. **The host-side refusal of a forged PayoutReceiver authorization.**
-   - On testnet the CLI cannot even build that transaction, because no key exists for a contract address.
-   - The host's own refusal is proven only in the unit test `record_needs_the_receivers_own_authorization`.
-7. **SEP-55 build attestation.** None existed at the time of the run. The release workflow has since been merged (PR #9), but no release has been tagged yet, and these deployments were built locally. The wasm-hash equality in verify section 7 is a stand-in: it ties the deployment to a local build at `c7a4065`, not to a published release artifact.
+The evidence script deploys the second set from `target/wasm32v1-none/release/*.optimized.wasm`. For this run those files were the `v0.1.0` release assets, copied in. The script's hash check fails if they are anything else.
 
-## Bug found while running (script only, not contract code)
-
-**`scripts/testnet-evidence.sh` exits silently on any read-only call.**
-- **Cause:** line 130:
-  ```bash
-  LAST_HASH="$(printf '%s' "$LAST_OUT" | grep -o 'Signing transaction: [0-9a-f]*' | tail -1 | awk '{print $3}')"
-  ```
-  Under `set -euo pipefail`, a `--send no` view has no "Signing transaction" line. `grep` exits 1, the pipeline fails, the assignment fails, and the script exits with no message.
-- **Effect:** the first run stopped right after the determination was submitted, at `find_obligation`. Lane P's view call survived only because it ends in `|| true`.
-- **Workaround for this run:** a patched copy with `{ grep … || true; }`, resumed from the state file; it finished Lane E.
-- **Fixed on this branch** in commit `aa77266`.
-- **Side effect on the report:** the second (traced) run re-wrote the report header, so `evidence/evidence.md` has only the Lane E part from the resumed run. Run 1's Lane P table is in `evidence/evidence.run1.md`, and everything is restated above.
-
-## Stellar skill checklist items this run demonstrates on-chain
-
-From `stellar-dev/skills/smart-contracts/security.md` § Checklists → Contract:
-
-| checklist item | shown by |
-|---|---|
-| All privileged functions require appropriate authorization, loaded from storage | #500 for every non-PR `record_obligation`; #1 for org, stranger and farmer marks; Funder role granted and checked from storage (verify §3) |
-| Every layer using an address's authority re-auths it | `record_obligation` requires the PayoutReceiver's own auth; a forged caller cannot be signed (CLI) or authorized (unit test) |
-| Initialization only once / `__constructor` | all contracts were deployed with constructor args in the same transaction (deploy txs above) |
-| External calls allowlisted; return values sanity-checked | #328 on an adapter bound elsewhere; the swap is accepted only after the handshake; the obligation fields equal the determination (digest, amount, org, PR) |
-| Arithmetic checked; input ranges validated | #506 on a zero reference; amount equals 4200 bp × SI exactly |
-| Critical TTLs extended proactively | keeper tx `8307be7e…`; verify §6 shows 29 d on every instance and code entry |
-| Events for auditable state changes | ObligationRecorded / Funded / Settled, SettlementAdapterUpdated, ObligationRequested, all captured from RPC |
-| Deployed WASM traceable to its source | partially: wasm hash equals the local build at a pushed commit; no SEP-55 attestation yet (flag 1) |
-| Emergency controls (pause) for value-bearing contracts | not applicable to the adapter (holds nothing, as shown above); the PR pause is unchanged |
-
-testing.md: this is the "testnet rehearsal" and "real WASM" layer. The contracts under test are the optimized release wasm on a real network, not native rlib registrations.
-
-## Raw logs
-
-The raw run logs, event dumps (`getEvents`) and the per-transaction table with ledgers and fees are kept by the team and available on request. Every transaction above can be checked independently on stellar.expert.
+Run logs and event dumps are kept by the team and available on request. Every transaction above can be checked on stellar.expert.
