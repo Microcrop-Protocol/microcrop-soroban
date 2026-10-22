@@ -5,7 +5,7 @@ The four contracts are faithfully re-implemented in Rust, compile to `wasm32v1-n
 WASM, and pass their unit and integration suites (202 tests, plus 1 ignored real-WASM
 lane that passes after a wasm build). Treasury-era testnet deployments exist (2026-10,
 `deploy-v2`); Option B has not been deployed yet. The contracts are not integrated with the
-off-chain stack and have no mainnet deployment. An AI-assisted Soroban review (2026-10) found 11
+off-chain stack and have no mainnet deployment. An in-house Soroban review (2026-10) found 11
 issues; all are fixed on this code (see
 [§6](#6-audit-fixes-2026-10--where-the-port-now-departs-from-the-solidity)), but that review
 is not a substitute for an independent audit.
@@ -275,18 +275,24 @@ preparation build into a real migration.
       testnet `cee0302d…ecd472`, mainnet `7ac33997…45a979`. It does what `block.chainid` did
       (binds a determination to one network) and both sides compute it from a public constant,
       so no magic number has to be shipped. Set by `scripts/deploy.sh`; overridable.
-- [ ] **The Lit drought action does not yet sign the Soroban drought preimage** (spec Part 3,
-      `microcrop-lit-oracle`: `src/chain/stellar-drought.shared.js`, `chain`/`networkDomain`
-      jsParams in `lit-actions/drought-oracle.js`, `drought.ts`, `drought-scope.ts`). Until it
-      ships and its new CID is re-registered (`scripts/rebuild-group.ts`, master key), the
-      production PKP cannot sign anything this PayoutReceiver accepts. The JS encoder must
-      reproduce `drought_golden_vectors` byte for byte. Until then the drought orchestrator
-      must skip policies with `chain === 'stellar'`: it passes the Base domain, so a Stellar
-      policy would get a valid Base signature for the Base policy with the same numeric id.
-      Note the contract stores the PKP's 65-byte SEC-1 PUBLIC KEY, not its 0x address.
-- [ ] **Backend / indexer / relayer integration** untouched — the EVM stack (ethers.js
-      listeners, Ponder indexer, relayer) still targets Base. Ledger events, XDR decoding,
-      and Stellar RPC are not wired.
+- [x] ~~**The Lit drought action does not yet sign the Soroban drought preimage.**~~ DONE —
+      `microcrop-lit-oracle` `5b9cbfb` (2026-10-18) added `src/chain/stellar-drought.shared.js`
+      and the `chain = "stellar"` branch of `lit-actions/drought-oracle.js`, cross-checked
+      against this repo's `drought_golden_vectors`. Note the contract stores the PKP's 65-byte
+      SEC-1 PUBLIC KEY, not its 0x address.
+- [ ] **The production PKP has not signed a Soroban determination.** The action's CID changed
+      with that commit, so the group must be re-registered (`scripts/rebuild-group.ts`, master
+      key) before the production PKP signs the new code, and no envelope has been submitted to
+      the live PayoutReceiver. Until a Stellar policy can be signed, the drought orchestrator
+      must skip `chain === 'stellar'` policies on the old code path: it passes the Base domain,
+      so a Stellar policy would get a valid Base signature for the Base policy with the same
+      numeric id.
+- [x] ~~**Backend / indexer / relayer integration** untouched.~~ DONE — the Stellar writer,
+      settlement worker and keeper are merged in `microcrop-core`
+      (`microcrop-backend/src/blockchain/stellar/*`, `src/workers/stellar-settlement.worker.js`,
+      `src/workers/stellar-keeper.worker.js`). They sit behind `STELLAR_SETTLEMENT_ENABLED`,
+      which defaults to false, and are not configured against the v0.1.0 addresses. Operator
+      guide: `microcrop-core/microcrop-backend/docs/SOROBAN_INTEGRATION.md`.
 
 - [ ] **Each methodology is a frozen constant in its own preimage.** The drought path is a
       second entrypoint with its own layout (§9); which methodologies are accepted is an admin
@@ -617,9 +623,9 @@ submit_drought_determination  (all checks of §9, unchanged)
        checked field by field, else ObligationNotRecorded (329)
   -> pm.mark_as_claimed, pm.increment_claim_count
   -> events DeterminationVerified, DamageReportReceived, ObligationRequested
-off-chain: the backend off-ramps the payout (M-Pesa) as paying agent
-  -> adapter.mark_funded(funder, id, sha256(order reference))     when the order is accepted
-  -> adapter.mark_settled(funder, id, sha256(receipt ref))        when the receipt arrives
+off-chain: the partner pays the farmer in local currency and files a settlement report
+  -> adapter.mark_funded(funder, id, sha256(partner report ref))   settled in part
+  -> adapter.mark_settled(funder, id, sha256(partner report ref))  settled in full
 ```
 
 The transaction is atomic: an adapter error (500 unbound, 502 conflict, 3 not configured)
@@ -639,8 +645,9 @@ holds their key. Even so, the adapter does not let an org mark its own obligatio
 org is the party that owes the money, so an org-signed `Settled` would be a self-waive, and
 once an org held a real key it could race the Funder's real settlement into a 505. Every
 transition is made by `Role::Funder`, held by the backend account.
-`Funded` and `Settled` are therefore the paying agent's attestations, identified by a
-reference hash of the off-chain record (no phone number or name ever goes on-chain). The
+`Funded` and `Settled` are therefore MicroCrop's attestation, as Funder, that the partner
+reported paying the farmer, identified by a reference hash of that report (no phone number or
+name ever goes on-chain). MicroCrop moves no money on Stellar. The
 events, the reference hashes and the revocable role are the audit trail; nothing on-chain
 proves money moved.
 
@@ -699,8 +706,8 @@ refuses (118). Earlier testnet runs (`deploy-v2`) hit exactly #327, #326, #322 a
 Hence the two evidence lanes: Lane P (real contracts, stops at #327 before signature
 recovery) and Lane E (identical WASM on the fixture, a real 2022 ERA5 season signed by a
 throwaway key). Testnet resets roughly quarterly may intervene before 110 days; a durable
-production-lane proof may need mainnet with a tiny sum insured. A real M-Pesa receipt behind
-`mark_settled` needs a real payout.
+production-lane proof may need mainnet with a tiny sum insured. A `Settled` backed by a real
+partner payment needs a real payout.
 
 **Stellar skill checklists** (`stellar-dev` smart-contracts skill, `security.md` and
 `testing.md`). Satisfied by this design:
@@ -768,12 +775,15 @@ production-lane proof may need mainnet with a tiny sum insured. A real M-Pesa re
 
 **Open decisions (product owner).**
 
-- **D-B1, who pays and when.** Default here: MicroCrop off-ramps as paying agent as soon as
-  the obligation is `Owed`; `Funded` = off-ramp order accepted, `Settled` = M-Pesa receipt.
-  MicroCrop carries the credit exposure until the partner reimburses off-chain. Alternative:
-  hold the off-ramp until the partner remits (`Funded` = remittance confirmed by ops).
-- **D-B2, Tier 1 on Stellar.** A partner-attested trigger (`PartnerSettlementReport` →
-  `mark_settled`) needs Tier 1 sales on Stellar and sign-off to relax the backend's
-  partner-settlement / money-path separation guard.
+- **D-B1, who pays and when.** DECIDED, and implemented in the backend: on Stellar MicroCrop
+  handles no funds. The partner collects the premium and pays the farmer off-platform, then
+  files a settlement report; the marks follow that report (`SETTLED_PARTIAL` → `Funded`,
+  `SETTLED_FULL` → `Settled`, `DECLINED` → nothing). MicroCrop carries no credit exposure and
+  creates no payout row for a Stellar policy. See
+  `microcrop-core/microcrop-backend/docs/SOROBAN_INTEGRATION.md`.
+- **D-B2, Tier 1 on Stellar.** DECIDED: Stellar cover is Tier 1 (DETERMINATION) only, and a
+  Tier 2 org on Stellar is refused `409 STELLAR_REQUIRES_DETERMINATION_TIER`. The partner
+  report reaches `mark_funded` / `mark_settled` through a single audited hook; the backend's
+  money-path separation guard is otherwise intact.
 - **D-B3, mainnet governance.** Multisig for Admin/Upgrader, and a timelock on
   `set_settlement_adapter`, before any mainnet deploy.
